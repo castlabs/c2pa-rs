@@ -34,6 +34,11 @@ use crate::{
 
 const VERSION: u32 = 1;
 
+/// Default maximum number of assertions allowed per manifest.
+/// Shared by [`BuilderSettings`], [`Verify`], [`crate::Claim`], and [`crate::Store`] so that
+/// all enforcement points use the same value.
+pub(crate) const MAX_ASSERTIONS: usize = 50;
+
 thread_local!(
     static SETTINGS: RefCell<Config> =
         RefCell::new(Config::try_from(&Settings::default()).unwrap_or_default());
@@ -379,6 +384,17 @@ pub struct Verify {
     ///
     /// The default value is false.
     pub strict_v1_validation: bool,
+    /// Maximum number of assertions that will be parsed from a single manifest when reading
+    /// or validating an existing C2PA file.
+    ///
+    /// Limits resource consumption when processing untrusted manifests that embed an
+    /// arbitrarily large number of assertions. Parsing is aborted with
+    /// [`Error::TooManyAssertions`] if the assertion count in the file exceeds this limit.
+    ///
+    /// The default value is 50.
+    ///
+    /// [`Error::TooManyAssertions`]: crate::Error::TooManyAssertions
+    pub max_assertions: usize,
 }
 
 impl Default for Verify {
@@ -392,6 +408,7 @@ impl Default for Verify {
             remote_manifest_fetch: true,
             skip_ingredient_conflict_resolution: false,
             strict_v1_validation: false,
+            max_assertions: MAX_ASSERTIONS,
         }
     }
 }

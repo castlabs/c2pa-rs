@@ -252,6 +252,8 @@ const METADATA_F: &str = "metadata";
 const CREATED_ASSERTIONS_F: &str = "created_assertions";
 const GATHERED_ASSERTIONS_F: &str = "gathered_assertions";
 
+use crate::settings::MAX_ASSERTIONS;
+
 /// A `Claim` gathers together all the `Assertion`s about an asset
 /// from an actor at a given time, and may also include one or more
 /// hashes of the asset itself, and a reference to the previous `Claim`.
@@ -1427,6 +1429,14 @@ impl Claim {
         salt_generator: &impl SaltGenerator,
         add_as_created_assertion: bool,
     ) -> Result<C2PAAssertion> {
+        // Enforce the per-manifest assertion limit to prevent resource exhaustion
+        // regardless of how the claim is constructed.
+        if self.assertion_store.len() >= MAX_ASSERTIONS {
+            return Err(Error::TooManyAssertions {
+                max: MAX_ASSERTIONS,
+            });
+        }
+
         // make sure the assertion is valid
         let assertion = assertion_builder.to_assertion()?;
         let assertion_label = assertion.label();
@@ -4069,7 +4079,12 @@ pub mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::{resource_store::UriOrResource, utils::test::create_test_claim};
+    use crate::{
+        assertions::{Action, Actions},
+        resource_store::UriOrResource,
+        settings::MAX_ASSERTIONS,
+        utils::test::create_test_claim,
+    };
 
     #[test]
     fn test_build_claim() {
@@ -4248,5 +4263,32 @@ pub mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_add_assertion_default_limit_in_claim() {
+        let mut claim = Claim::new("test_default_assertion_limit", Some("test"), 2);
+        let actions = Actions::new().add_action(Action::new("c2pa.created"));
+
+        // MAX_ASSERTIONS assertions must succeed with the default limit.
+        for _ in 0..MAX_ASSERTIONS {
+            claim
+                .add_assertion(&actions)
+                .expect("assertion should succeed within the default limit");
+        }
+
+        // The next one must be rejected.
+        let err = claim
+            .add_assertion(&actions)
+            .expect_err("assertion beyond limit should fail with TooManyAssertions");
+        assert!(
+            matches!(
+                err,
+                Error::TooManyAssertions {
+                    max: MAX_ASSERTIONS
+                }
+            ),
+            "expected TooManyAssertions {{ max: {MAX_ASSERTIONS} }}, got {err:?}"
+        );
     }
 }
