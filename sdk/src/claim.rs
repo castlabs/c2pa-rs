@@ -1785,6 +1785,23 @@ impl Claim {
         )
     }
 
+    /// Replace an assertion at a specific instance index.
+    ///
+    /// When multiple assertions share the same `label_root()` (e.g.
+    /// `cawg.identity` with instances 0 and 1), this method targets the
+    /// entry at the given instance instead of always matching the first.
+    pub(crate) fn replace_assertion_by_instance(
+        &mut self,
+        replace_with: Assertion,
+        instance: usize,
+    ) -> Result<()> {
+        self.update_assertion(
+            replace_with,
+            |ca: &ClaimAssertion| ca.instance() == instance,
+            |_: &ClaimAssertion, a: Assertion| Ok(a),
+        )
+    }
+
     /// Redact an assertion from a prior claim.
     /// This will remove the assertion from the JUMBF
     fn redact_assertion(&mut self, assertion_uri: &str) -> Result<()> {

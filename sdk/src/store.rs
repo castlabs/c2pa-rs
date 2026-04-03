@@ -2736,8 +2736,12 @@ impl Store {
     }
 
     /// Write the dynamic assertions to the manifest.
-    /// Note: This assumes each dynamic assertion label is unique (no instance suffixes).
-    /// Multiple dynamic assertions with different labels are supported.
+    ///
+    /// Supports multiple dynamic assertions with the same label (e.g. two
+    /// `cawg.identity` assertions).  Placeholders in the assertion store
+    /// are matched to dynamic assertions in order: the first DA with label
+    /// `L` replaces the first store entry with that `label_root()`, the
+    /// second DA with label `L` replaces the second store entry, etc.
     #[async_generic(async_signature(
         &mut self,
         dyn_assertions: &[Box<dyn AsyncDynamicAssertion>],
@@ -2753,36 +2757,98 @@ impl Store {
             return Ok(false);
         }
 
-        let mut final_assertions = Vec::new();
+        // Resolve de-duplicated labels: when multiple DAs share the same
+        // label, we need to pair them with the correct __N-suffixed store
+        // entries.  The claim's hashed URI list contains the de-duplicated
+        // labels like "cawg.identity" and "cawg.identity__1".
+        let resolved_labels: Vec<String> = {
+            let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
 
-        for da in dyn_assertions.iter() {
-            // Use the dynamic assertion's label directly.
-            // This assumes each dynamic assertion label is unique (no instance suffixes needed).
-            let label = da.label();
+            // Collect assertion labels from the claim's hashed URIs,
+            // grouped by base label (without __N suffix).
+            let mut store_labels_by_base: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
 
+            for uri in pc.assertions().iter() {
+                let full_label = uri
+                    .url()
+                    .rsplit_once('/')
+                    .map(|(_, l)| l.to_string())
+                    .unwrap_or_default();
+                if full_label.is_empty() {
+                    continue;
+                }
+                let base = if let Some(pos) = full_label.find("__") {
+                    full_label[..pos].to_string()
+                } else {
+                    full_label.clone()
+                };
+                store_labels_by_base
+                    .entry(base)
+                    .or_default()
+                    .push(full_label);
+            }
+
+            // Assign resolved labels to DAs in order per base label.
+            let mut base_counters: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            let mut labels = Vec::with_capacity(dyn_assertions.len());
+            for da in dyn_assertions.iter() {
+                let base = da.label();
+                let idx = base_counters.entry(base.clone()).or_insert(0);
+                let resolved = store_labels_by_base
+                    .get(&base)
+                    .and_then(|v| v.get(*idx))
+                    .cloned()
+                    .unwrap_or_else(|| da.label());
+                *idx += 1;
+                labels.push(resolved);
+            }
+            labels
+        };
+
+        // Generate content and replace each placeholder by instance index.
+        let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
+
+        for (da, resolved_label) in dyn_assertions.iter().zip(resolved_labels.iter()) {
             let da_size = da.reserve_size()?;
             let da_data = if _sync {
-                da.content(&label, Some(da_size), preliminary_claim)?
+                da.content(resolved_label, Some(da_size), preliminary_claim)?
             } else {
-                da.content(&label, Some(da_size), preliminary_claim).await?
+                da.content(resolved_label, Some(da_size), preliminary_claim).await?
             };
 
-            match da_data {
+            // Determine the instance index from the resolved label.
+            // "cawg.identity" → instance 0, "cawg.identity__1" → instance 1
+            let instance: usize = if let Some(pos) = resolved_label.find("__") {
+                resolved_label[pos + 2..].parse().unwrap_or(0)
+            } else {
+                0
+            };
+
+            // Build the replacement assertion using the BASE label (without
+            // __N) — the assertion store uses the base label internally and
+            // tracks the instance separately in ClaimAssertion.
+            let base_label = if let Some(pos) = resolved_label.find("__") {
+                &resolved_label[..pos]
+            } else {
+                resolved_label.as_str()
+            };
+
+            let assertion = match da_data {
                 DynamicAssertionContent::Cbor(data) => {
-                    final_assertions.push(UserCbor::new(&label, data).to_assertion()?);
+                    UserCbor::new(base_label, data).to_assertion()?
                 }
                 DynamicAssertionContent::Json(data) => {
-                    final_assertions.push(User::new(&label, &data).to_assertion()?);
+                    User::new(base_label, &data).to_assertion()?
                 }
-                DynamicAssertionContent::Binary(format, data) => {
-                    //final_assertions.push(EmbeddedData::to_binary_assertion(&EmbeddedData::new(&label, format, data))?);
+                DynamicAssertionContent::Binary(_format, _data) => {
+                    continue;
                 }
-            }
-        }
+            };
 
-        let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
-        for assertion in final_assertions {
-            pc.replace_assertion(assertion)?;
+            // Replace the placeholder at the specific instance index.
+            pc.replace_assertion_by_instance(assertion, instance)?;
         }
 
         // clear the provenance claim data since the contents are now different
