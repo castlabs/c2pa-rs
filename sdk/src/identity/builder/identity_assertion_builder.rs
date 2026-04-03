@@ -111,7 +111,17 @@ impl DynamicAssertion for IdentityAssertionBuilder {
                     a.url()
                 };
 
+                // Strip __N de-duplication suffix (e.g. "c2pa.soft-binding__1"
+                // → "c2pa.soft-binding") so that a single entry in
+                // referenced_assertions matches all instances of that label.
+                let base_label = if let Some(pos) = label.find("__") {
+                    label[..pos].to_string()
+                } else {
+                    label.clone()
+                };
+
                 self.referenced_assertions.contains(&label)
+                    || self.referenced_assertions.contains(&base_label)
             })
             .cloned()
             .collect();
@@ -222,7 +232,17 @@ impl AsyncDynamicAssertion for AsyncIdentityAssertionBuilder {
                     a.url()
                 };
 
+                // Strip __N de-duplication suffix (e.g. "c2pa.soft-binding__1"
+                // → "c2pa.soft-binding") so that a single entry in
+                // referenced_assertions matches all instances of that label.
+                let base_label = if let Some(pos) = label.find("__") {
+                    label[..pos].to_string()
+                } else {
+                    label.clone()
+                };
+
                 self.referenced_assertions.contains(&label)
+                    || self.referenced_assertions.contains(&base_label)
             })
             .cloned()
             .collect();
