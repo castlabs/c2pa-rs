@@ -33,6 +33,7 @@ c2pa = { path = "../sdk", version = "0.78.8", default-features = false, features
     "file_io",
     "pdf",
 ] }
+base64 = "0.22.1"
 libc = "0.2"
 scopeguard = "1.2.0"
 serde = { version = "1.0", features = ["derive"] }

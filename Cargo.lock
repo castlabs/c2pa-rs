@@ -601,6 +601,7 @@ dependencies = [
 name = "c2pa-c-ffi"
 version = "0.78.8"
 dependencies = [
+ "base64",
  "c2pa",
  "cbindgen",
  "libc",

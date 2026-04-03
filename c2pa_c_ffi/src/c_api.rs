@@ -20,9 +20,11 @@ use std::{
 #[cfg(feature = "file_io")]
 use c2pa::Ingredient;
 use c2pa::{
-    assertions::DataHash, identity::validator::CawgValidator, Builder as C2paBuilder,
-    CallbackSigner, Context, ProgressPhase, Reader as C2paReader, Settings as C2paSettings,
-    SigningAlg,
+    assertions::DataHash,
+    dynamic_assertion::{DynamicAssertion, DynamicAssertionContent, PartialClaim},
+    identity::validator::CawgValidator,
+    Builder as C2paBuilder, CallbackSigner, Context, ProgressPhase, Reader as C2paReader,
+    Settings as C2paSettings, Signer, SigningAlg,
 };
 use tokio::runtime::Builder;
 
@@ -2680,6 +2682,239 @@ pub unsafe extern "C" fn c2pa_signer_reserve_size(signer_ptr: *mut C2paSigner) -
 #[no_mangle]
 pub unsafe extern "C" fn c2pa_signer_free(signer_ptr: *const C2paSigner) {
     cimpl_free!(signer_ptr);
+}
+
+// ---------------------------------------------------------------------------
+// DynamicAssertion FFI support
+// ---------------------------------------------------------------------------
+
+/// Callback type for dynamic assertion content generation.
+///
+/// # Parameters
+/// * `context`  – opaque user pointer passed through unchanged.
+/// * `label`    – NULL-terminated assertion label (UTF-8).
+/// * `reserve_size` – reserved size in bytes (may be 0).
+/// * `partial_claim_json` – NULL-terminated JSON array of assertion hashed URIs.
+///   Each element: `{"url":"…","alg":"sha256","hash":"<base64>"}`.
+/// * `out_data`        – buffer to write CBOR assertion content into.
+/// * `out_data_max_len` – capacity of `out_data`.
+///
+/// # Returns
+/// Positive value = actual bytes written to `out_data`.
+/// Negative value = error (assertion will not be included).
+pub type DynamicAssertionCallback = unsafe extern "C" fn(
+    context: *const (),
+    label: *const c_char,
+    reserve_size: usize,
+    partial_claim_json: *const c_char,
+    out_data: *mut c_uchar,
+    out_data_max_len: usize,
+) -> isize;
+
+/// A `DynamicAssertion` backed by a C function pointer.
+struct FfiDynamicAssertion {
+    label: String,
+    reserve: usize,
+    context: *const (),
+    callback: DynamicAssertionCallback,
+}
+
+// SAFETY: The C caller guarantees the callback and context are thread-safe.
+unsafe impl Send for FfiDynamicAssertion {}
+unsafe impl Sync for FfiDynamicAssertion {}
+
+impl DynamicAssertion for FfiDynamicAssertion {
+    fn label(&self) -> String {
+        self.label.clone()
+    }
+
+    fn reserve_size(&self) -> c2pa::Result<usize> {
+        Ok(self.reserve)
+    }
+
+    fn content(
+        &self,
+        label: &str,
+        size: Option<usize>,
+        claim: &PartialClaim,
+    ) -> c2pa::Result<DynamicAssertionContent> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        // Serialize PartialClaim to JSON for the callback.
+        let entries: Vec<serde_json::Value> = claim
+            .assertions()
+            .map(|hu| {
+                serde_json::json!({
+                    "url": hu.url(),
+                    "alg": hu.alg().unwrap_or_default(),
+                    "hash": STANDARD.encode(hu.hash()),
+                })
+            })
+            .collect();
+        let json_str = serde_json::to_string(&entries)
+            .map_err(|e| c2pa::Error::OtherError(Box::new(e)))?;
+
+        let label_cstr =
+            std::ffi::CString::new(label).map_err(|e| c2pa::Error::OtherError(Box::new(e)))?;
+        let json_cstr =
+            std::ffi::CString::new(json_str).map_err(|e| c2pa::Error::OtherError(Box::new(e)))?;
+
+        let buf_size = size.unwrap_or(self.reserve);
+        let mut buf: Vec<u8> = vec![0u8; buf_size];
+
+        let written = unsafe {
+            (self.callback)(
+                self.context,
+                label_cstr.as_ptr(),
+                buf_size,
+                json_cstr.as_ptr(),
+                buf.as_mut_ptr(),
+                buf_size,
+            )
+        };
+
+        if written < 0 {
+            return Err(c2pa::Error::BadParam(
+                "DynamicAssertion callback returned an error".into(),
+            ));
+        }
+
+        buf.truncate(written as usize);
+        Ok(DynamicAssertionContent::Cbor(buf))
+    }
+}
+
+/// Storage for raw FFI dynamic assertion parameters (Clone-able).
+#[derive(Clone)]
+struct FfiDynamicAssertionParams {
+    label: String,
+    reserve: usize,
+    context: *const (),
+    callback: DynamicAssertionCallback,
+}
+
+unsafe impl Send for FfiDynamicAssertionParams {}
+unsafe impl Sync for FfiDynamicAssertionParams {}
+
+impl FfiDynamicAssertionParams {
+    fn to_assertion(&self) -> Box<dyn DynamicAssertion> {
+        Box::new(FfiDynamicAssertion {
+            label: self.label.clone(),
+            reserve: self.reserve,
+            context: self.context,
+            callback: self.callback,
+        })
+    }
+}
+
+/// Revised signer wrapper that stores clonable params.
+struct FfiDynamicSignerV2 {
+    inner: Box<dyn crate::maybe_send_sync::C2paSignerObject>,
+    ffi_assertions: Vec<FfiDynamicAssertionParams>,
+}
+
+impl Signer for FfiDynamicSignerV2 {
+    fn sign(&self, data: &[u8]) -> c2pa::Result<Vec<u8>> {
+        self.inner.sign(data)
+    }
+    fn alg(&self) -> SigningAlg {
+        self.inner.alg()
+    }
+    fn certs(&self) -> c2pa::Result<Vec<Vec<u8>>> {
+        self.inner.certs()
+    }
+    fn reserve_size(&self) -> usize {
+        self.inner.reserve_size()
+    }
+    fn time_authority_url(&self) -> Option<String> {
+        self.inner.time_authority_url()
+    }
+    fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
+        self.inner.timestamp_request_headers()
+    }
+    fn timestamp_request_body(&self, message: &[u8]) -> c2pa::Result<Vec<u8>> {
+        self.inner.timestamp_request_body(message)
+    }
+    fn send_timestamp_request(&self, message: &[u8]) -> Option<c2pa::Result<Vec<u8>>> {
+        self.inner.send_timestamp_request(message)
+    }
+    fn ocsp_val(&self) -> Option<Vec<u8>> {
+        self.inner.ocsp_val()
+    }
+    fn direct_cose_handling(&self) -> bool {
+        self.inner.direct_cose_handling()
+    }
+    fn dynamic_assertions(&self) -> Vec<Box<dyn DynamicAssertion>> {
+        let mut all = self.inner.dynamic_assertions();
+        for params in &self.ffi_assertions {
+            all.push(params.to_assertion());
+        }
+        all
+    }
+}
+
+/// Registers a dynamic assertion callback on a signer.
+///
+/// The signer is wrapped so that `dynamic_assertions()` returns an additional
+/// `DynamicAssertion` that calls back to the provided C function during signing.
+///
+/// This enables external code (e.g. Python) to produce CAWG identity assertions
+/// or other dynamic content that depends on the `PartialClaim` (assertion hashes).
+///
+/// # Parameters
+/// * `signer_ptr` – a valid `C2paSigner` pointer (consumed and replaced).
+/// * `context`    – opaque pointer forwarded to the callback.
+/// * `callback`   – function invoked during signing to produce assertion content.
+/// * `label`      – NULL-terminated assertion label (e.g. `"cawg.identity"`).
+/// * `reserve_size` – bytes to reserve for the assertion placeholder.
+///
+/// # Returns
+/// 0 on success, negative on error.
+///
+/// # Safety
+/// `signer_ptr` must be a valid, tracked `C2paSigner`. After this call the original
+/// pointer is still valid but the inner signer has been replaced with a wrapper.
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_signer_add_dynamic_assertion(
+    signer_ptr: *mut C2paSigner,
+    context: *const c_void,
+    callback: DynamicAssertionCallback,
+    label: *const c_char,
+    reserve_size: usize,
+) -> c_int {
+    let signer = deref_mut_or_return_int!(signer_ptr, C2paSigner);
+    let label = cstr_or_return_int!(label);
+    let context = context as *const ();
+
+    let params = FfiDynamicAssertionParams {
+        label,
+        reserve: reserve_size,
+        context,
+        callback,
+    };
+
+    // Take the current signer out and wrap it.
+    // We need to swap the inner signer with the wrapped version.
+    let old_inner = std::mem::replace(
+        &mut signer.signer,
+        // Temporary placeholder — will be replaced immediately.
+        Box::new(CallbackSigner::new(
+            |_ctx: *const (), _data: &[u8]| Err(c2pa::Error::CoseSignature),
+            SigningAlg::Es256,
+            "",
+        )),
+    );
+
+    // Check if the signer is already a FfiDynamicSignerV2 — if so, just add to it.
+    // Otherwise wrap it.
+    // Since we can't downcast trait objects, we always wrap. Multiple wraps are fine.
+    let wrapper = FfiDynamicSignerV2 {
+        inner: old_inner,
+        ffi_assertions: vec![params],
+    };
+
+    signer.signer = Box::new(wrapper);
+    0
 }
 
 #[no_mangle]
