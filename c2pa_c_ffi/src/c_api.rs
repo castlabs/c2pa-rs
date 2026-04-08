@@ -22,7 +22,7 @@ use c2pa::Ingredient;
 use c2pa::{
     assertions::DataHash,
     dynamic_assertion::{DynamicAssertion, DynamicAssertionContent, PartialClaim},
-    identity::validator::CawgValidator,
+    identity::validator::{CawgValidator, CawgValidatorWithSettings},
     Builder as C2paBuilder, CallbackSigner, Context, ProgressPhase, Reader as C2paReader,
     Settings as C2paSettings, Signer, SigningAlg,
 };
@@ -1142,7 +1142,13 @@ fn post_validate(result: Result<C2paReader, c2pa::Error>) -> Result<C2paReader, 
                 Err(err) => return Err(c2pa::Error::OtherError(Box::new(err))),
             };
 
-            match runtime.block_on(reader.post_validate_async(&CawgValidator {})) {
+            // Use the Reader's Settings so that cawg_trust.user_anchors
+            // (configured by the caller via Context) are available during
+            // CAWG X.509 identity assertion trust verification.
+            let validator = CawgValidatorWithSettings {
+                settings: reader.settings().clone(),
+            };
+            match runtime.block_on(reader.post_validate_async(&validator)) {
                 Ok(_) => Ok(reader),
                 Err(err) => Err(err),
             }

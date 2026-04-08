@@ -20,6 +20,7 @@ use serde_json::Value;
 use crate::{
     dynamic_assertion::{AsyncPostValidator, PartialClaim},
     identity::IdentityAssertion,
+    settings::Settings,
     status_tracker::StatusTracker,
     Context, ManifestAssertion,
 };
@@ -46,6 +47,41 @@ impl AsyncPostValidator for CawgValidator {
             tracker.push_current_uri(uri.to_string());
             let result = identity_assertion
                 .validate_partial_claim(partial_claim, tracker, settings)
+                .await
+                .ok();
+            tracker.pop_current_uri();
+            return Ok(result);
+        };
+        Ok(None)
+    }
+}
+
+/// Validates a CAWG identity assertion using caller-provided [`Settings`].
+///
+/// Unlike [`CawgValidator`] (which falls back to default settings), this
+/// variant uses the trust anchors from the Reader's [`Context`], ensuring
+/// that custom `cawg_trust.user_anchors` are consulted during X.509
+/// identity certificate trust verification.
+pub struct CawgValidatorWithSettings {
+    pub settings: Settings,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl AsyncPostValidator for CawgValidatorWithSettings {
+    async fn validate(
+        &self,
+        label: &str,
+        assertion: &ManifestAssertion,
+        uri: &str,
+        partial_claim: &PartialClaim,
+        tracker: &mut StatusTracker,
+    ) -> crate::Result<Option<Value>> {
+        if label == "cawg.identity" || label.starts_with("cawg.identity__") {
+            let identity_assertion: IdentityAssertion = assertion.to_assertion()?;
+            tracker.push_current_uri(uri.to_string());
+            let result = identity_assertion
+                .validate_partial_claim(partial_claim, tracker, &self.settings)
                 .await
                 .ok();
             tracker.pop_current_uri();

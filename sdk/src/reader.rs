@@ -42,6 +42,7 @@ use crate::{
     jumbf_io, log_item,
     manifest::StoreOptions,
     manifest_store_report::ManifestStoreReport,
+    settings::Settings,
     status_tracker::StatusTracker,
     store::Store,
     utils::hash_utils::hash_to_b64,
@@ -178,6 +179,11 @@ impl Reader {
     /// # Ok(())
     /// # }
     /// ```
+    /// Returns a reference to the [`Settings`] associated with this Reader's context.
+    pub fn settings(&self) -> &Settings {
+        self.context.settings()
+    }
+
     pub fn from_shared_context(context: &Arc<Context>) -> Self {
         Self {
             context: Arc::clone(context),
