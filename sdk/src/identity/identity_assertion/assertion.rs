@@ -38,8 +38,9 @@ use crate::{
     },
     jumbf::labels::to_assertion_uri,
     log_current_item, log_item,
+    settings::Settings,
     status_tracker::StatusTracker,
-    Context, Manifest, Reader,
+    Manifest, Reader,
 };
 
 /// This struct represents the raw content of the identity assertion.
@@ -294,8 +295,8 @@ impl IdentityAssertion {
         &self,
         partial_claim: &PartialClaim,
         status_tracker: &mut StatusTracker,
+        settings: &Settings,
     ) -> Result<serde_json::Value, ValidationError<String>> {
-        let settings = Context::new().settings().clone();
         self.check_padding(status_tracker)?;
 
         self.signer_payload

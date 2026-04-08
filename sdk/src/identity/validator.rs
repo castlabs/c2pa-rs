@@ -21,7 +21,7 @@ use crate::{
     dynamic_assertion::{AsyncPostValidator, PartialClaim},
     identity::IdentityAssertion,
     status_tracker::StatusTracker,
-    ManifestAssertion,
+    Context, ManifestAssertion,
 };
 
 /// Validates a CAWG identity assertion.
@@ -38,10 +38,14 @@ impl AsyncPostValidator for CawgValidator {
         tracker: &mut StatusTracker,
     ) -> crate::Result<Option<Value>> {
         if label == "cawg.identity" || label.starts_with("cawg.identity__") {
+            // Fallback to default Context settings for external callers that
+            // don't have a Reader-provided Settings reference.
+            let ctx = Context::new();
+            let settings = ctx.settings();
             let identity_assertion: IdentityAssertion = assertion.to_assertion()?;
             tracker.push_current_uri(uri.to_string());
             let result = identity_assertion
-                .validate_partial_claim(partial_claim, tracker)
+                .validate_partial_claim(partial_claim, tracker, settings)
                 .await
                 .ok();
             tracker.pop_current_uri();

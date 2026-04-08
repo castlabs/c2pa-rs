@@ -604,7 +604,7 @@ impl Manifest {
                     } else {
                         let identity_assertion: IdentityAssertion = ma.to_assertion()?;
                         identity_assertion
-                            .validate_partial_claim(&partial_claim, validation_log)
+                            .validate_partial_claim(&partial_claim, validation_log, settings)
                             .await
                             .ok()
                     };
