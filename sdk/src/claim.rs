@@ -1876,7 +1876,6 @@ impl Claim {
         let sig = claim.signature_val().clone();
         let additional_bytes: Vec<u8> = Vec::new();
         let data = claim.data()?;
-
         // use the signature uri as the current uri while validating the signature info
         validation_log.push_current_uri(to_signature_uri(claim.label()));
 
