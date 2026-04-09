@@ -489,10 +489,10 @@ impl Manifest {
                 Err(e) => return Err(e),
             };
             let assertion = claim_assertion.assertion();
-            let label = claim_assertion.label();
+            let instance_label = claim_assertion.label();
             let base_label = assertion.label();
             let created = claim_assertion.assertion_type() == ClaimAssertionType::Created;
-            debug!("assertion = {}", &label);
+            debug!("assertion = {}", &instance_label);
             match base_label.as_ref() {
                 base if base.starts_with(labels::ACTIONS) => {
                     let mut actions = Actions::from_assertion(assertion)?;
@@ -540,7 +540,7 @@ impl Manifest {
                 }
                 base if base.starts_with(labels::INGREDIENT) => {
                     // note that we use the original label here, not the base label
-                    let assertion_uri = to_assertion_uri(claim.label(), &label);
+                    let assertion_uri = to_assertion_uri(claim.label(), &instance_label);
                     let ingredient = Ingredient::from_ingredient_uri(
                         store,
                         manifest_label,
@@ -590,7 +590,7 @@ impl Manifest {
                         partial_claim.add_assertion(a);
                     }
 
-                    let uri = to_assertion_uri(manifest_label, label);
+                    let uri = to_assertion_uri(manifest_label, &instance_label);
                     validation_log.push_current_uri(&uri);
                     let value: Option<serde_json::Value> = if _sync {
                         crate::log_item!(
@@ -621,7 +621,7 @@ impl Manifest {
                     match assertion.decode_data() {
                         AssertionData::Cbor(_) => {
                             let value = assertion.as_json_object()?;
-                            let ma = ManifestAssertion::new(label, value)
+                            let ma = ManifestAssertion::new(base_label.to_string(), value)
                                 .set_instance(claim_assertion.instance())
                                 .set_created(created);
 
@@ -629,7 +629,7 @@ impl Manifest {
                         }
                         AssertionData::Json(_) => {
                             let value = assertion.as_json_object()?;
-                            let ma = ManifestAssertion::new(label, value)
+                            let ma = ManifestAssertion::new(base_label.to_string(), value)
                                 .set_instance(claim_assertion.instance())
                                 .set_kind(ManifestAssertionKind::Json)
                                 .set_created(created);

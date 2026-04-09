@@ -1106,11 +1106,12 @@ impl Reader {
 
             // Process assertions for current manifest
             for assertion in manifest.assertions().iter() {
+                let full_label = assertion.label_with_instance();
                 let assertion_uri =
-                    crate::jumbf::labels::to_assertion_uri(&current_label, assertion.label());
+                    crate::jumbf::labels::to_assertion_uri(&current_label, &full_label);
                 let result = if _sync {
                     validator.validate(
-                        assertion.label(),
+                        &full_label,
                         assertion,
                         &assertion_uri,
                         &partial_claim,
@@ -1119,7 +1120,7 @@ impl Reader {
                 } else {
                     validator
                         .validate(
-                            assertion.label(),
+                            &full_label,
                             assertion,
                             &assertion_uri,
                             &partial_claim,

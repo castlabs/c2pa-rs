@@ -72,7 +72,7 @@ impl ManifestAssertion {
     /// This is a c2pa spec internal standard format
     pub fn label_with_instance(&self) -> String {
         match self.instance {
-            Some(i) if i > 1 => format!("{}__{}", self.label, i),
+            Some(i) if i > 0 => format!("{}__{}", self.label, i),
             _ => self.label.to_owned(),
         }
     }
