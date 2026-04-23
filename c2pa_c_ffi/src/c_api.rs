@@ -2207,6 +2207,111 @@ pub unsafe extern "C" fn c2pa_manifest_bytes_free(manifest_bytes_ptr: *const c_u
     cimpl_free!(manifest_bytes_ptr);
 }
 
+/// Sign a fragmented BMFF asset set (init segment + media fragments).
+///
+/// Wraps [`c2pa::Builder::sign_fragmented_files`]. The output directory
+/// is populated with signed copies of the init segment (embedded JUMBF)
+/// plus fragment copies containing merkle-tree placeholders. After
+/// signing, the embedded manifest bytes are read back from the
+/// produced init segment and returned via the out-parameter.
+///
+/// # Parameters
+///
+/// * `builder_ptr` - pointer to a Builder with a manifest definition set.
+/// * `signer_ptr` - pointer to a Signer.
+/// * `asset_path` - null-terminated UTF-8 C string pointing to the init
+///   segment on disk. c2pa-rs accepts a glob pattern here for multi-init
+///   renditions; for StardustProof this is always a single init path.
+/// * `fragments_glob` - null-terminated UTF-8 C string with a filename
+///   glob (relative to the init segment's directory) matching the media
+///   fragments (e.g. `seg-*.m4s`).
+/// * `output_dir` - null-terminated UTF-8 C string with the output
+///   directory path. Created if it does not exist. c2pa-rs writes to
+///   `<output_dir>/<input_parent_dir_name>/...`; callers that want a
+///   flat layout must post-process.
+/// * `manifest_bytes_ptr` - out-pointer that receives the embedded
+///   manifest bytes on success. The returned bytes MUST be released by
+///   calling [`c2pa_free`].
+///
+/// # Safety
+///
+/// Reads from NULL-terminated C strings. `builder_ptr` and `signer_ptr`
+/// must point to valid, non-freed C2paBuilder / C2paSigner instances.
+///
+/// # Returns
+///
+/// The length of the manifest bytes on success, or `-1` on error.
+#[cfg(feature = "file_io")]
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_builder_sign_fragmented(
+    builder_ptr: *mut C2paBuilder,
+    signer_ptr: *mut C2paSigner,
+    asset_path: *const c_char,
+    fragments_glob: *const c_char,
+    output_dir: *const c_char,
+    manifest_bytes_ptr: *mut *const c_uchar,
+) -> i64 {
+    let builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
+    let c2pa_signer = deref_mut_or_return_int!(signer_ptr, C2paSigner);
+    let asset_path = cstr_or_return_int!(asset_path);
+    let fragments_glob = cstr_or_return_int!(fragments_glob);
+    let output_dir = cstr_or_return_int!(output_dir);
+    ptr_or_return_int!(manifest_bytes_ptr);
+
+    let asset_path_buf: std::path::PathBuf = asset_path.into();
+    let fragments_glob_buf: std::path::PathBuf = fragments_glob.into();
+    let output_dir_buf: std::path::PathBuf = output_dir.into();
+
+    // Run the fragmented sign. c2pa-rs creates
+    // <output_dir>/<asset_path.parent.file_name>/<asset_path.file_name>
+    // as the signed init and copies each matching fragment into the
+    // same subdirectory.
+    let sign_result = builder.sign_fragmented_files(
+        c2pa_signer.signer.as_ref(),
+        &asset_path_buf,
+        &fragments_glob_buf,
+        &output_dir_buf,
+    );
+    ok_or_return_int!(sign_result);
+
+    // Locate the signed init segment inside the c2pa-rs output layout.
+    let input_dir_name = match asset_path_buf.parent().and_then(|p| p.file_name()) {
+        Some(name) => name.to_owned(),
+        None => {
+            CimplError::other("asset_path has no parent directory").set_last();
+            return -1;
+        }
+    };
+    let init_file_name = match asset_path_buf.file_name() {
+        Some(name) => name.to_owned(),
+        None => {
+            CimplError::other("asset_path has no file name").set_last();
+            return -1;
+        }
+    };
+    let signed_init_path = output_dir_buf.join(&input_dir_name).join(&init_file_name);
+
+    // Read back the embedded JUMBF manifest bytes.
+    let manifest_bytes = match c2pa::jumbf_io::load_jumbf_from_file(&signed_init_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            CimplError::other(format!(
+                "failed to read back manifest from signed init {}: {}",
+                signed_init_path.display(),
+                e
+            ))
+            .set_last();
+            return -1;
+        }
+    };
+
+    let len = manifest_bytes.len() as i64;
+    if !manifest_bytes_ptr.is_null() {
+        *manifest_bytes_ptr = to_c_bytes(manifest_bytes);
+    }
+    len
+}
+
 /// Creates a hashed placeholder from a Builder.
 /// The placeholder is used to reserve size in an asset for later signing.
 ///
@@ -2889,8 +2994,8 @@ impl DynamicAssertion for FfiDynamicAssertion {
                 })
             })
             .collect();
-        let json_str = serde_json::to_string(&entries)
-            .map_err(|e| c2pa::Error::OtherError(Box::new(e)))?;
+        let json_str =
+            serde_json::to_string(&entries).map_err(|e| c2pa::Error::OtherError(Box::new(e)))?;
 
         let label_cstr =
             std::ffi::CString::new(label).map_err(|e| c2pa::Error::OtherError(Box::new(e)))?;
