@@ -12,7 +12,7 @@
 // each license.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::OpenOptions,
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
@@ -398,8 +398,11 @@ where
     let ts = TiffStructure::load(input)?;
 
     let tiff_tree: Arena<ImageFileDirectory> = if let Some(ifd) = ts.first_ifd.clone() {
+        let first_offset = ifd.offset;
         let (mut tiff_tree, page_0) = Arena::with_data(ifd);
         let mut current_token = page_0;
+        let mut visited_offsets: HashSet<u64> = HashSet::new();
+        visited_offsets.insert(first_offset);
 
         // get the pages
         loop {
@@ -502,7 +505,9 @@ where
 
             // move to next page
             if let Some(next_ifd_offset) = tiff_tree[current_token].data.next_ifd_offset {
-                // move to next page
+                if !visited_offsets.insert(next_ifd_offset) {
+                    return Err(Error::InvalidAsset("Cyclic IFD chain detected".to_string()));
+                }
                 input.seek(SeekFrom::Start(next_ifd_offset))?;
                 let next_ifd =
                     TiffStructure::read_ifd(input, ts.byte_order, ts.big_tiff, IfdType::Page)?;
@@ -1369,6 +1374,14 @@ impl<T: Read + Write + Seek> TiffCloner<T> {
                 | IFDEntryType::Double
                 | IFDEntryType::Long8
                 | IFDEntryType::Ifd8 => {
+                    // Each element is 8 bytes wide. Use checked_mul to prevent u64 overflow
+                    // when a crafted BigTIFF supplies a malicious value_count (e.g.
+                    // 0x2000000000000001 * 8 wraps past u64::MAX in release builds and
+                    // panics in debug builds).
+                    let num_bytes_8 = cnt
+                        .checked_mul(8)
+                        .ok_or_else(|| Error::InvalidAsset("value out of range".to_string()))?;
+
                     // move to start of data
                     asset_reader.seek(SeekFrom::Start(decode_offset(
                         entry.value_offset,
@@ -1376,7 +1389,7 @@ impl<T: Read + Write + Seek> TiffCloner<T> {
                         self.big_tiff,
                     )?))?;
 
-                    asset_reader.read_to_vec(cnt * 8)?
+                    asset_reader.read_to_vec(num_bytes_8)?
                 }
             };
 
@@ -1965,6 +1978,54 @@ pub mod tests {
     }
 
     #[test]
+    fn cyclic_ifd_self_loop_returns_error() {
+        // 14-byte little-endian TIFF: IFD at offset 8 has next-offset = 8.
+        // Chain: A → A
+        #[rustfmt::skip]
+        let crafted_tiff: &[u8] = &[
+            0x49, 0x49, // byte order: little-endian
+            0x2A, 0x00, // magic: 42
+            0x08, 0x00, 0x00, 0x00, // first IFD at offset 8
+            0x00, 0x00, // IFD entry count: 0
+            0x08, 0x00, 0x00, 0x00, // next IFD offset: 8 (self-loop)
+        ];
+        let mut cursor = Cursor::new(crafted_tiff);
+        let result = map_tiff(&mut cursor);
+        assert!(result.is_err(), "self-loop IFD must return an error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Cyclic IFD chain"),
+            "unexpected error message: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn cyclic_ifd_two_node_cycle_returns_error() {
+        // 20-byte little-endian TIFF with two IFDs forming a cycle.
+        // Chain: A (offset 8) → B (offset 14) → A (offset 8)
+        #[rustfmt::skip]
+        let crafted_tiff: &[u8] = &[
+            0x49, 0x49, // byte order: little-endian
+            0x2A, 0x00, // magic: 42
+            0x08, 0x00, 0x00, 0x00, // first IFD at offset 8
+            // IFD A at offset 8
+            0x00, 0x00, // entry count: 0
+            0x0E, 0x00, 0x00, 0x00, // next IFD offset: 14 (IFD B)
+            // IFD B at offset 14
+            0x00, 0x00, // entry count: 0
+            0x08, 0x00, 0x00, 0x00, // next IFD offset: 8 (back to IFD A)
+        ];
+        let mut cursor = Cursor::new(crafted_tiff);
+        let result = map_tiff(&mut cursor);
+        assert!(result.is_err(), "A→B→A IFD cycle must return an error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Cyclic IFD chain"),
+            "unexpected error message: {err_msg}"
+        );
+    }
+
+    #[test]
     fn test_read_write_manifest() {
         let data = "some data";
 
@@ -2142,6 +2203,65 @@ pub mod tests {
 
         let tiff_io = TiffIO {};
 
+        let locations = tiff_io.get_object_locations_from_stream(&mut stream);
+        assert!(matches!(locations, Err(Error::InvalidAsset(_))));
+    }
+
+    /// Regression test for integer overflow in `clone_ifd_entries` for 8-byte element types.
+    ///
+    /// IFD entry types Rational, SRational, Double, Long8, SLong8, and Ifd8 are all 8 bytes
+    /// wide per element. Before the fix, the byte count was computed as `cnt * 8` with no
+    /// overflow guard. A crafted BigTIFF carrying `value_count = 0x2000000000000001` causes
+    /// `0x2000000000000001 * 8 = 0x10000000000000008`, which wraps past u64::MAX:
+    ///   - debug builds: immediate panic (exit code 101)
+    ///   - release builds: silent truncation to 0x8, producing wrong results
+    ///
+    /// The fix adds `checked_mul(8)` — matching the pattern already used for every other
+    /// multi-byte type — and returns `Error::InvalidAsset` instead of overflowing.
+    ///
+    /// The binary blob below is the same crafted BigTIFF as in `test_overflow_clone_ifd_entries`
+    /// but with entry_type changed from 0x04 (Long, ×4) to 0x05 (Rational, ×8) and
+    /// value_count set to 0x2000000000000001 (overflows ×8).
+    #[test]
+    fn test_overflow_clone_ifd_entries_rational_type() {
+        let data = [
+            0x49, 0x49, 0x2b, 0x00, 0x08, 0x00, 0x00, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x49,
+            0x49, 0x2a, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0xf9, 0x00,
+            0x00, 0x00, 0x00, 0x05, 0x00, 0x07, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            // entry — type 0x05 (Rational, 8 bytes/element), count overflows × 8
+            //
+            0x00, 0x00, // entry_tag
+            0x05, 0x00, // entry_type: Rational (was 0x04 Long)
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x20, // value_count = 0x2000000000000001
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // value_offset
+            //
+            // entry
+            //
+            0x00, 0x00, // entry_tag
+            0x05, 0x00, // entry_type: Rational (was 0x04 Long)
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x20, // value_count = 0x2000000000000001
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // value_offset
+            //
+            // ...
+            //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00,
+        ];
+
+        let mut stream = Cursor::new(&data);
+        let tiff_io = TiffIO {};
+
+        // Before the fix: this would panic (exit 101) in debug or silently overflow in release.
+        // After the fix: must return Err(Error::InvalidAsset) without any panic.
         let locations = tiff_io.get_object_locations_from_stream(&mut stream);
         assert!(matches!(locations, Err(Error::InvalidAsset(_))));
     }
