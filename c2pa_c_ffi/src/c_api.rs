@@ -1407,6 +1407,98 @@ pub unsafe fn c2pa_reader_from_file(path: *const c_char) -> *mut C2paReader {
     box_tracked!(ok_or_return_null!(post_validate(result)))
 }
 
+/// Creates and verifies a C2paReader from a fragmented BMFF asset set
+/// (init segment + media fragments).
+///
+/// Wraps [`c2pa::Reader::from_fragmented_files`]. This is the read-side
+/// counterpart to [`c2pa_builder_sign_fragmented`] and is used to
+/// validate signed DASH/HLS segmented asset sets (CMAF / `.m4s` / `.cmfv`).
+///
+/// # Parameters
+///
+/// * `asset_path` - null-terminated UTF-8 C string pointing at the init
+///   segment on disk (e.g. `init.m4s`).
+/// * `fragments` - pointer to an array of `fragments_count` null-terminated
+///   UTF-8 C strings, each pointing at a media fragment file on disk
+///   (e.g. `seg-0001.m4s`). Order does not matter; c2pa-rs resolves
+///   fragment ordering internally from the BMFF box tree.
+/// * `fragments_count` - number of entries in the `fragments` array. May
+///   be zero if the init segment alone carries the full manifest (rare).
+///
+/// # Errors
+///
+/// Returns NULL if there were errors, otherwise returns a pointer to a
+/// freshly allocated C2paReader. The error string can be retrieved by
+/// calling `c2pa_error`.
+///
+/// # Safety
+///
+/// Reads from NULL-terminated C strings. The `fragments` pointer must
+/// point to a valid array of `fragments_count` C string pointers. The
+/// returned value MUST be released by calling `c2pa_free` and is no
+/// longer valid after that call.
+///
+/// # Example
+///
+/// ```c
+/// const char* fragments[] = {"seg-0001.m4s", "seg-0002.m4s"};
+/// C2paReader* reader = c2pa_reader_from_fragmented_files(
+///     "init.m4s", fragments, 2);
+/// if (reader == NULL) {
+///     char* err = c2pa_error();
+///     printf("Error: %s\n", err);
+///     c2pa_string_free(err);
+/// } else {
+///     char* json = c2pa_reader_json(reader);
+///     // ...
+///     c2pa_string_free(json);
+///     c2pa_reader_free(reader);
+/// }
+/// ```
+#[cfg(feature = "file_io")]
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_reader_from_fragmented_files(
+    asset_path: *const c_char,
+    fragments: *const *const c_char,
+    fragments_count: usize,
+) -> *mut C2paReader {
+    let asset_path = cstr_or_return_null!(asset_path);
+
+    // Guard the fragments pointer. A zero count is allowed (init-only
+    // manifests) and paired with any fragments pointer value, including
+    // null, but a positive count demands a non-null array pointer.
+    if fragments_count > 0 && fragments.is_null() {
+        CimplError::other("fragments pointer is null but fragments_count > 0").set_last();
+        return std::ptr::null_mut();
+    }
+
+    // Convert the C string array into Vec<PathBuf>.
+    let mut fragment_paths: Vec<std::path::PathBuf> = Vec::with_capacity(fragments_count);
+    for i in 0..fragments_count {
+        let entry_ptr = *fragments.add(i);
+        if entry_ptr.is_null() {
+            CimplError::other(format!("fragments[{}] is a null pointer", i)).set_last();
+            return std::ptr::null_mut();
+        }
+        let c_str = std::ffi::CStr::from_ptr(entry_ptr);
+        let rust_str = match c_str.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                CimplError::other(format!("fragments[{}] is not valid UTF-8", i)).set_last();
+                return std::ptr::null_mut();
+            }
+        };
+        fragment_paths.push(std::path::PathBuf::from(rust_str));
+    }
+
+    // Use the context-aware reader path so thread-local settings (trust
+    // anchors, CAWG config, ...) propagate cleanly, matching the modern
+    // `c2pa_reader_from_*` behavior.
+    let reader = C2paReader::from_context(Context::default());
+    let result = reader.with_fragmented_files(std::path::Path::new(&asset_path), &fragment_paths);
+    box_tracked!(ok_or_return_null!(post_validate(result)))
+}
+
 /// Creates and verifies a C2paReader from an asset stream with the given format and manifest data.
 ///
 /// Parameters
