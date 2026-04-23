@@ -29,7 +29,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use c2pa::{
-    format_from_path, identity::validator::CawgValidator, settings::Settings, Builder,
+    format_from_path, identity::validator::CawgValidatorWithSettings, settings::Settings, Builder,
     ClaimGeneratorInfo, Context as C2paContext, Error, Ingredient, ManifestDefinition, Reader,
     Signer,
 };
@@ -559,16 +559,27 @@ fn verify_fragmented(
 }
 
 // run cawg validation if supported
-fn validate_cawg(reader: &mut Reader) -> Result<()> {
+//
+// Uses [`CawgValidatorWithSettings`] so the `cawg_trust` section of the
+// caller-provided [`Settings`] (populated from `--settings <toml>` by
+// `configure_sdk`) is actually honored during CAWG X.509 identity
+// assertion certificate validation. Without this, c2patool would fall
+// back to default-trust [`CawgValidator`] and report
+// `signingCredential.untrusted` on every cawg.identity URL whose
+// end-entity certificate chains to a non-default CA.
+fn validate_cawg(reader: &mut Reader, settings: &Settings) -> Result<()> {
+    let validator = CawgValidatorWithSettings {
+        settings: settings.clone(),
+    };
     #[cfg(not(target_os = "wasi"))]
     {
         Runtime::new()?
-            .block_on(reader.post_validate_async(&CawgValidator {}))
+            .block_on(reader.post_validate_async(&validator))
             .map_err(anyhow::Error::from)
     }
     #[cfg(target_os = "wasi")]
     {
-        block_on(reader.post_validate_async(&CawgValidator {})).map_err(anyhow::Error::from)
+        block_on(reader.post_validate_async(&validator)).map_err(anyhow::Error::from)
     }
 }
 
@@ -855,7 +866,7 @@ fn main() -> Result<()> {
                 let mut reader = Reader::from_shared_context(&context)
                     .with_file(&output)
                     .map_err(special_errs)?;
-                validate_cawg(&mut reader)?;
+                validate_cawg(&mut reader, &settings)?;
                 print_reader(&reader, args.detailed, args.crjson)?;
             }
         } else {
@@ -886,7 +897,7 @@ fn main() -> Result<()> {
             let mut reader = Reader::from_shared_context(&context)
                 .with_file(&args.path)
                 .map_err(special_errs)?;
-            validate_cawg(&mut reader)?;
+            validate_cawg(&mut reader, &settings)?;
             reader.to_folder(&output)?;
             let report = reader.to_string();
             if args.detailed {
@@ -908,17 +919,17 @@ fn main() -> Result<()> {
     {
         let mut stores = verify_fragmented(&args.path, fg, &context)?;
         if stores.len() == 1 {
-            validate_cawg(&mut stores[0])?;
+            validate_cawg(&mut stores[0], &settings)?;
             println!("{}", stores[0]);
         } else {
             for store in &mut stores {
-                validate_cawg(store)?;
+                validate_cawg(store, &settings)?;
             }
             println!("{} Init manifests validated", stores.len());
         }
     } else {
         let mut reader = reader_from_args(&args, &context)?;
-        validate_cawg(&mut reader)?;
+        validate_cawg(&mut reader, &settings)?;
         print_reader(&reader, args.detailed, args.crjson)?;
     }
 
