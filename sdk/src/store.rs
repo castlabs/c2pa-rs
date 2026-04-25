@@ -2796,7 +2796,8 @@ impl Store {
             let da_data = if _sync {
                 da.content(resolved_label, Some(da_size), preliminary_claim)?
             } else {
-                da.content(resolved_label, Some(da_size), preliminary_claim).await?
+                da.content(resolved_label, Some(da_size), preliminary_claim)
+                    .await?
             };
 
             // Determine the instance index from the resolved label.
@@ -2830,6 +2831,28 @@ impl Store {
 
             // Replace the placeholder at the specific instance index.
             pc.replace_assertion_by_instance(assertion, instance)?;
+
+            // Refresh the preliminary_claim snapshot so subsequent dynamic
+            // assertion callbacks see the *real* post-replacement hash for
+            // any DA whose placeholder we just replaced.
+            //
+            // CAWG Identity Assertion 1.1 §5.1.1 mandates that the `hash`
+            // value for a referenced assertion be known prior to presenting
+            // the referencing identity assertion's `signer_payload` for
+            // signature. Without this refresh, a DA registered later in the
+            // list (e.g. a publisher cawg.x509.cose identity assertion that
+            // references an earlier cawg.identity_claims_aggregation
+            // assertion in its signer_payload.referenced_assertions[]) would
+            // see the placeholder hash, not the real hash, and verifiers
+            // would observe a hash mismatch.
+            //
+            // See CAWG §1.4 Example 3 ("nested identity assertions") for the
+            // intended use case. This is a spec-conformance fix; without it
+            // c2pa-rs cannot support inter-identity-assertion references.
+            *preliminary_claim = PartialClaim::default();
+            for assertion_uri in pc.assertions() {
+                preliminary_claim.add_assertion(assertion_uri);
+            }
         }
 
         // clear the provenance claim data since the contents are now different
@@ -8307,6 +8330,192 @@ pub mod tests {
 
         assert!(!report.has_any_error());
         // std::fs::write("target/test.jpg", result).unwrap();
+    }
+
+    /// Verifies the inter-dynamic-assertion referenced_assertions hash fix.
+    ///
+    /// When two DAs are registered, the second DA's `partial_claim` argument
+    /// MUST contain the *real* (post-replacement) hash of the first DA's
+    /// content, not the placeholder hash. Required by CAWG Identity Assertion
+    /// 1.1 §5.1.1 (the `hash` value for a referenced assertion must be known
+    /// prior to presenting the referencing identity assertion's signer_payload
+    /// for signature) and §1.4 Example 3 (nested identity assertions).
+    ///
+    /// Without the `preliminary_claim` refresh in `write_dynamic_assertions`
+    /// (added in this same commit), the second callback would see the
+    /// zero-filled placeholder hash and any cryptographic signature it
+    /// produced over that hash would mismatch the actual assertion bytes
+    /// that c2pa-rs writes into the manifest.
+    #[test]
+    fn test_dynamic_assertions_inter_da_hash_visibility() {
+        use std::sync::{Arc, Mutex};
+
+        let context = crate::context::Context::new();
+
+        #[derive(Serialize)]
+        struct TestAssertion {
+            tag: String,
+        }
+
+        // First DA — produces deterministic content C1.
+        // Returns CBOR of `{ "tag": "first-da-content" }`.
+        #[derive(Debug)]
+        struct FirstDa {}
+
+        impl DynamicAssertion for FirstDa {
+            fn label(&self) -> String {
+                "com.example.first".to_string()
+            }
+            fn reserve_size(&self) -> Result<usize> {
+                let a = TestAssertion {
+                    tag: "first-da-content".to_string(),
+                };
+                Ok(c2pa_cbor::to_vec(&a)?.len())
+            }
+            fn content(
+                &self,
+                _label: &str,
+                _size: Option<usize>,
+                _claim: &PartialClaim,
+            ) -> Result<DynamicAssertionContent> {
+                let a = TestAssertion {
+                    tag: "first-da-content".to_string(),
+                };
+                Ok(DynamicAssertionContent::Cbor(c2pa_cbor::to_vec(&a)?))
+            }
+        }
+
+        // Second DA — captures the partial_claim it sees so the test can
+        // assert the first DA's real hash is visible.
+        #[derive(Debug)]
+        struct SecondDa {
+            captured: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        }
+
+        impl DynamicAssertion for SecondDa {
+            fn label(&self) -> String {
+                "com.example.second".to_string()
+            }
+            fn reserve_size(&self) -> Result<usize> {
+                let a = TestAssertion {
+                    tag: "second-da-content".to_string(),
+                };
+                Ok(c2pa_cbor::to_vec(&a)?.len())
+            }
+            fn content(
+                &self,
+                _label: &str,
+                _size: Option<usize>,
+                claim: &PartialClaim,
+            ) -> Result<DynamicAssertionContent> {
+                let mut captured = self.captured.lock().unwrap();
+                for u in claim.assertions() {
+                    captured.push((u.url(), u.hash().to_vec()));
+                }
+                let a = TestAssertion {
+                    tag: "second-da-content".to_string(),
+                };
+                Ok(DynamicAssertionContent::Cbor(c2pa_cbor::to_vec(&a)?))
+            }
+        }
+
+        // Signer that exposes both DAs in registration order.
+        struct TwoDaSigner {
+            inner: Box<dyn Signer>,
+            captured: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        }
+
+        impl crate::Signer for TwoDaSigner {
+            fn sign(&self, data: &[u8]) -> crate::error::Result<Vec<u8>> {
+                self.inner.sign(data)
+            }
+            fn alg(&self) -> SigningAlg {
+                self.inner.alg()
+            }
+            fn certs(&self) -> crate::Result<Vec<Vec<u8>>> {
+                self.inner.certs()
+            }
+            fn reserve_size(&self) -> usize {
+                self.inner.reserve_size()
+            }
+            fn time_authority_url(&self) -> Option<String> {
+                self.inner.time_authority_url()
+            }
+            fn ocsp_val(&self) -> Option<Vec<u8>> {
+                self.inner.ocsp_val()
+            }
+            fn dynamic_assertions(
+                &self,
+            ) -> Vec<Box<dyn crate::dynamic_assertion::DynamicAssertion>> {
+                vec![
+                    Box::new(FirstDa {}),
+                    Box::new(SecondDa {
+                        captured: Arc::clone(&self.captured),
+                    }),
+                ]
+            }
+        }
+
+        let captured: Arc<Mutex<Vec<(String, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let signer = TwoDaSigner {
+            inner: test_signer(SigningAlg::Ps256),
+            captured: Arc::clone(&captured),
+        };
+
+        let file_buffer = include_bytes!("../tests/fixtures/earth_apollo17.jpg").to_vec();
+        let mut buf_io = Cursor::new(file_buffer);
+        let mut store = Store::from_context(&context);
+        let claim1 = create_test_claim().unwrap();
+        store.commit_claim(claim1).unwrap();
+        let result: Vec<u8> = Vec::new();
+        let mut result_stream = Cursor::new(result);
+        store
+            .save_to_stream("jpeg", &mut buf_io, &mut result_stream, &signer, &context)
+            .unwrap();
+
+        // Compute what the first DA's real assertion hash *should* be.
+        // Replicate the same logic c2pa-rs uses: build a UserCbor assertion
+        // using the DA's CBOR bytes, then run `Claim::calc_assertion_box_hash`
+        // with the same salt + algorithm. We can't easily reach into the
+        // private hash machinery from here, so we instead read back the
+        // signed manifest and pull the first DA's hashed URI from it.
+        result_stream.rewind().unwrap();
+        let mut report = StatusTracker::default();
+        let new_store =
+            Store::from_stream("image/jpeg", &mut result_stream, &mut report, &context).unwrap();
+        assert!(!report.has_any_error());
+
+        let new_pc = new_store.provenance_claim().unwrap();
+        let mut first_real_hash: Option<Vec<u8>> = None;
+        for u in new_pc.assertions() {
+            if u.url().contains("com.example.first") {
+                first_real_hash = Some(u.hash().to_vec());
+                break;
+            }
+        }
+        let first_real_hash =
+            first_real_hash.expect("first DA hashed URI must exist in finalized manifest");
+
+        // Verify SecondDa saw the first DA's real hash, not a placeholder
+        // (which would be a hash of zero-filled CBOR).
+        let captured_guard = captured.lock().unwrap();
+        let mut found_real = false;
+        for (url, hash) in captured_guard.iter() {
+            if url.contains("com.example.first") {
+                assert_eq!(
+                    hash, &first_real_hash,
+                    "SecondDa's partial_claim must contain FirstDa's real \
+                     post-replacement hash, not the placeholder. URL={url}"
+                );
+                found_real = true;
+            }
+        }
+        assert!(
+            found_real,
+            "SecondDa never saw a hashed URI for com.example.first in its \
+             partial_claim — registration ordering may be wrong, or the \
+             snapshot refresh is not happening"
+        );
     }
 
     #[c2pa_test_async]
