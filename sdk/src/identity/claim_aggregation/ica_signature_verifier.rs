@@ -390,7 +390,8 @@ impl IcaSignatureVerifier {
             "web" => {
                 let did_doc = did_web::resolve(&primary_did).await?;
 
-                let Some(vm1) = did_doc.verification_relationships.assertion_method.first() else {
+                let Some(vm_or_ref) = did_doc.verification_relationships.assertion_method.first()
+                else {
                     return Err(ValidationError::SignatureError(
                         IcaValidationError::InvalidDidDocument(
                             "DID document doesn't contain an assertionMethod entry".to_string(),
@@ -398,12 +399,38 @@ impl IcaSignatureVerifier {
                     ));
                 };
 
-                let super::w3c_vc::did_doc::ValueOrReference::Value(vm1) = vm1 else {
-                    return Err(ValidationError::SignatureError(
-                        IcaValidationError::InvalidDidDocument(
-                            "DID document's assertionMethod is not a value".to_string(),
-                        ),
-                    ));
+                // DID Core §5.3 allows assertionMethod entries to be
+                // either an inline verificationMethod object (the
+                // `Value` variant) OR a string DID URL fragment that
+                // references an entry in the document's
+                // `verificationMethod` array (the `Reference`
+                // variant). The string-reference form is the
+                // canonical / idiomatic shape per the spec; most
+                // DID document generators emit it that way to avoid
+                // duplicating large key blobs across multiple
+                // verification relationships.
+                //
+                // Resolve a Reference by id-matching against the
+                // top-level `verification_method` array, then fall
+                // through to the same publicKeyJwk extraction.
+                let vm1 = match vm_or_ref {
+                    super::w3c_vc::did_doc::ValueOrReference::Value(vm) => vm,
+                    super::w3c_vc::did_doc::ValueOrReference::Reference(ref_id) => {
+                        let ref_id_str = ref_id.as_str();
+                        let Some(resolved) = did_doc
+                            .verification_method
+                            .iter()
+                            .find(|vm| vm.id.as_str() == ref_id_str)
+                        else {
+                            return Err(ValidationError::SignatureError(
+                                IcaValidationError::InvalidDidDocument(format!(
+                                    "DID document's assertionMethod references {ref_id_str:?} \
+                                     but no verificationMethod entry with that id was found"
+                                )),
+                            ));
+                        };
+                        resolved
+                    }
                 };
 
                 let Some(jwk_prop) = vm1.properties.get("publicKeyJwk") else {
