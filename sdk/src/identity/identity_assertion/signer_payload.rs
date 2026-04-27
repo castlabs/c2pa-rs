@@ -67,6 +67,28 @@ impl SignerPayload {
                 url == ref_assertion.url()
             }) {
                 if claim_assertion.hash() != ref_assertion.hash() {
+                    // The hash declared in the identity assertion's
+                    // signer_payload.referenced_assertions[] does not match
+                    // the hash recorded for the same JUMBF URL in the claim.
+                    // The signer therefore could not have signed over the
+                    // assertion bytes that ended up in the manifest — log the
+                    // mismatch as a failure on the status_tracker BEFORE
+                    // returning the Err so post-validators (e.g.
+                    // CawgValidatorWithSettings) that swallow the Err via
+                    // `.ok()` still surface the failure to the caller via
+                    // the validation log. Without this log call, a manifest
+                    // containing a malformed identity assertion would be
+                    // silently accepted as valid (no failure code, no
+                    // success code).
+                    log_current_item!(
+                        "referenced assertion hash does not match claim",
+                        "SignerPayload::check_against_partial_claim"
+                    )
+                    .validation_status("cawg.identity.assertion.mismatch")
+                    .failure(
+                        status_tracker,
+                        ValidationError::<E>::AssertionMismatch(ref_assertion.url().to_owned()),
+                    )?;
                     return Err(ValidationError::AssertionMismatch(
                         ref_assertion.url().to_owned(),
                     ));
@@ -147,6 +169,20 @@ impl SignerPayload {
                 url == ref_assertion.url()
             }) {
                 if claim_assertion.hash() != ref_assertion.hash() {
+                    // See the matching comment in check_against_partial_claim
+                    // above for full rationale: log the mismatch on the
+                    // status_tracker before returning the Err so a caller
+                    // that swallows the Err via `.ok()` still surfaces the
+                    // failure to validation log consumers.
+                    log_current_item!(
+                        "referenced assertion hash does not match claim",
+                        "SignerPayload::check_against_manifest"
+                    )
+                    .validation_status("cawg.identity.assertion.mismatch")
+                    .failure(
+                        status_tracker,
+                        ValidationError::<E>::AssertionMismatch(ref_assertion.url().to_owned()),
+                    )?;
                     return Err(ValidationError::AssertionMismatch(
                         ref_assertion.url().to_owned(),
                     ));
@@ -239,7 +275,12 @@ mod tests {
     #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    use crate::{identity::SignerPayload, HashedUri};
+    use crate::{
+        dynamic_assertion::PartialClaim,
+        identity::{SignerPayload, ValidationError},
+        status_tracker::{LogKind, StatusTracker},
+        HashedUri,
+    };
 
     #[test]
     #[cfg_attr(
@@ -261,5 +302,96 @@ mod tests {
         };
 
         assert_eq!(signer_payload, signer_payload.clone());
+    }
+
+    /// Regression: when an identity assertion's
+    /// `signer_payload.referenced_assertions[]` contains a hash that does
+    /// not match the corresponding entry in the claim's hashed URI list,
+    /// `check_against_partial_claim` MUST log a
+    /// `cawg.identity.assertion.mismatch` failure on the status_tracker
+    /// before returning the Err.
+    ///
+    /// Without this log call, callers that swallow the Err via `.ok()`
+    /// (e.g. the post-validator
+    /// `CawgValidatorWithSettings::validate` in `identity/validator.rs`)
+    /// would silently accept manifests with malformed identity
+    /// assertions — no `cawg.identity.assertion.mismatch` failure code
+    /// AND no `cawg.identity.well-formed` success code would appear in
+    /// the validation results, making the malformed manifest
+    /// indistinguishable from a valid one.
+    ///
+    /// Reproduces the org-flow self-reference bug observed before the
+    /// emitter-side fix: the publisher cawg.x509.cose identity assertion's
+    /// signer_payload referenced its own JUMBF URL with a stale
+    /// placeholder hash that did not match the real hash recorded in the
+    /// claim. Verifiers reported `validation_state = "Trusted"` despite
+    /// the malformed reference.
+    #[test]
+    fn check_against_partial_claim_logs_failure_on_hash_mismatch() {
+        // Build a claim with one hashed URI for c2pa.hash.data.
+        let url = "self#jumbf=c2pa.assertions/c2pa.hash.data".to_owned();
+        let claim_uri = HashedUri::new(
+            url.clone(),
+            Some("sha256".to_owned()),
+            &hex!("53d1b2cf4e6d9a97ed9281183fa5d836c32751b9d2fca724b40836befee7d67f"),
+        );
+        let mut partial_claim = PartialClaim::default();
+        partial_claim.add_assertion(&claim_uri);
+
+        // Build a SignerPayload whose referenced_assertions[] points at
+        // the same URL but with a DIFFERENT hash. (Real-world cause:
+        // the signer captured a placeholder hash before c2pa-rs wrote
+        // the real assertion bytes into the claim.)
+        let bad_ref = HashedUri::new(
+            url.clone(),
+            Some("sha256".to_owned()),
+            &hex!("0000000000000000000000000000000000000000000000000000000000000000"),
+        );
+        let signer_payload = SignerPayload {
+            referenced_assertions: vec![bad_ref],
+            roles: vec!["cawg.publisher".to_owned()],
+            sig_type: "cawg.x509.cose".to_owned(),
+        };
+
+        let mut tracker = StatusTracker::default();
+        let result =
+            signer_payload.check_against_partial_claim::<String>(&partial_claim, &mut tracker);
+
+        // The function must return Err.
+        match result {
+            Err(ValidationError::AssertionMismatch(u)) => {
+                assert_eq!(u, url);
+            }
+            other => panic!("expected AssertionMismatch err, got {other:?}"),
+        }
+
+        // AND it must have logged a Failure with the
+        // `cawg.identity.assertion.mismatch` validation_status onto the
+        // status_tracker BEFORE returning. Without this, post-validators
+        // that swallow the Err with `.ok()` would silently accept the
+        // malformed manifest.
+        let logged: Vec<_> = tracker.logged_items().iter().collect();
+        let mismatch_failures: Vec<_> = logged
+            .iter()
+            .filter(|li| {
+                matches!(li.kind, LogKind::Failure)
+                    && li.validation_status.as_deref() == Some("cawg.identity.assertion.mismatch")
+            })
+            .collect();
+        assert_eq!(
+            mismatch_failures.len(),
+            1,
+            "expected exactly one cawg.identity.assertion.mismatch failure logged, \
+             got {} log items: {:?}",
+            logged.len(),
+            logged
+                .iter()
+                .map(|li| (
+                    format!("{:?}", li.kind),
+                    li.validation_status.clone(),
+                    li.description.clone(),
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 }
