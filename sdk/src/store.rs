@@ -2792,11 +2792,49 @@ impl Store {
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
 
         for (da, resolved_label) in dyn_assertions.iter().zip(resolved_labels.iter()) {
+            // Build a per-call view of `preliminary_claim` that excludes the
+            // assertion URI corresponding to this DA's own slot.
+            //
+            // A DynamicAssertion cannot meaningfully reference its own JUMBF
+            // URI:
+            //
+            //   * Its content (and therefore its hash) is not yet computed
+            //     at callback time, so the URI can only resolve to the
+            //     placeholder hash that was inserted before this loop ran.
+            //     The placeholder hash is meaningless to a verifier.
+            //   * The placeholder hash is the only entry in `preliminary_claim`
+            //     that the post-replacement refresh below cannot fix — the
+            //     assertion content is precisely what this callback is in
+            //     the middle of producing.
+            //
+            // Excluding the own slot at the c2pa-rs layer makes the DA
+            // pipeline's contract crisp: every URI a DA sees in its
+            // `partial_claim` either (a) carries a real, post-replacement
+            // hash (entries from earlier DAs in this loop, plus all
+            // non-DA assertions written by the claim builder before this
+            // loop), or (b) carries a placeholder hash for a DA scheduled
+            // to run later (where the real hash genuinely cannot be known
+            // yet). The own slot is always category (b) and structurally
+            // unavoidable, so we filter it out so DA implementations don't
+            // have to remember to do it themselves. Self-references are an
+            // anti-pattern in any reference-graph construct; CAWG Identity
+            // Assertion 1.1 §5.1.1 makes this explicit for identity
+            // assertions ("an identity assertion MUST NOT refer to
+            // itself"), and no construct in C2PA core defines a useful
+            // self-reference, so a filtered view is correct in general.
+            let own_url_suffix = format!("/{resolved_label}");
+            let mut callback_view = PartialClaim::default();
+            for assertion_uri in preliminary_claim.assertions() {
+                if !assertion_uri.url().ends_with(&own_url_suffix) {
+                    callback_view.add_assertion(assertion_uri);
+                }
+            }
+
             let da_size = da.reserve_size()?;
             let da_data = if _sync {
-                da.content(resolved_label, Some(da_size), preliminary_claim)?
+                da.content(resolved_label, Some(da_size), &callback_view)?
             } else {
-                da.content(resolved_label, Some(da_size), preliminary_claim)
+                da.content(resolved_label, Some(da_size), &callback_view)
                     .await?
             };
 
@@ -2836,19 +2874,23 @@ impl Store {
             // assertion callbacks see the *real* post-replacement hash for
             // any DA whose placeholder we just replaced.
             //
-            // CAWG Identity Assertion 1.1 §5.1.1 mandates that the `hash`
-            // value for a referenced assertion be known prior to presenting
-            // the referencing identity assertion's `signer_payload` for
-            // signature. Without this refresh, a DA registered later in the
-            // list (e.g. a publisher cawg.x509.cose identity assertion that
-            // references an earlier cawg.identity_claims_aggregation
-            // assertion in its signer_payload.referenced_assertions[]) would
-            // see the placeholder hash, not the real hash, and verifiers
-            // would observe a hash mismatch.
+            // Without this refresh, a DA registered later in the list sees
+            // the placeholder hash for any earlier DA's slot rather than
+            // the real hash that c2pa-rs has now written into the
+            // provenance claim. Subsequent callbacks therefore cannot
+            // construct a correct hashed-URI reference to an earlier DA's
+            // emitted content. This is a generic correctness property of
+            // the DA pipeline — it has nothing to do with which kind of
+            // assertion the DAs produce.
             //
-            // See CAWG §1.4 Example 3 ("nested identity assertions") for the
-            // intended use case. This is a spec-conformance fix; without it
-            // c2pa-rs cannot support inter-identity-assertion references.
+            // The canonical practical example is CAWG Identity Assertion
+            // 1.1 (§1.4 Example 3 "nested identity assertions" + §5.1.1
+            // requiring the referenced hash to be known prior to signing),
+            // where a publisher cawg.x509.cose identity assertion's
+            // signer_payload.referenced_assertions[] points at a sibling
+            // cawg.identity_claims_aggregation assertion. Any future DA
+            // construct with similar inter-DA references benefits from the
+            // same fix.
             *preliminary_claim = PartialClaim::default();
             for assertion_uri in pc.assertions() {
                 preliminary_claim.add_assertion(assertion_uri);
@@ -8332,20 +8374,32 @@ pub mod tests {
         // std::fs::write("target/test.jpg", result).unwrap();
     }
 
-    /// Verifies the inter-dynamic-assertion referenced_assertions hash fix.
+    /// Verifies two correctness properties of the dynamic-assertion pipeline:
     ///
-    /// When two DAs are registered, the second DA's `partial_claim` argument
-    /// MUST contain the *real* (post-replacement) hash of the first DA's
-    /// content, not the placeholder hash. Required by CAWG Identity Assertion
-    /// 1.1 §5.1.1 (the `hash` value for a referenced assertion must be known
-    /// prior to presenting the referencing identity assertion's signer_payload
-    /// for signature) and §1.4 Example 3 (nested identity assertions).
+    ///   1. **Inter-DA hash visibility.** When two DAs are registered, the
+    ///      second DA's `partial_claim` argument MUST contain the *real*
+    ///      (post-replacement) hash of the first DA's emitted content, not
+    ///      the zero-filled placeholder hash. This is a generic correctness
+    ///      property of the DA pipeline; without it, no DA can construct a
+    ///      meaningful hashed-URI reference to an earlier-emitted sibling.
     ///
-    /// Without the `preliminary_claim` refresh in `write_dynamic_assertions`
-    /// (added in this same commit), the second callback would see the
-    /// zero-filled placeholder hash and any cryptographic signature it
-    /// produced over that hash would mismatch the actual assertion bytes
-    /// that c2pa-rs writes into the manifest.
+    ///   2. **No self-reference in the callback view.** The second DA's
+    ///      `partial_claim` MUST NOT contain its own slot's URL. A DA
+    ///      cannot meaningfully reference its own JUMBF URI — its content
+    ///      (and therefore its hash) is not yet computed at callback time,
+    ///      so the entry could only carry the placeholder. Filtering the
+    ///      own slot at the c2pa-rs layer makes the contract crisp and
+    ///      removes a footgun every DA implementation would otherwise have
+    ///      to handle. (CAWG Identity Assertion 1.1 §5.1.1 makes the
+    ///      no-self-reference rule explicit for identity assertions.)
+    ///
+    /// CAWG nested identity assertions (§1.4 Example 3 / §5.1.1) is the
+    /// canonical practical example that motivated both fixes: a publisher
+    /// `cawg.x509.cose` identity assertion's `signer_payload.referenced_assertions[]`
+    /// points at a sibling `cawg.identity_claims_aggregation` assertion
+    /// (property 1) and MUST NOT point at itself (property 2). Both
+    /// properties hold for any other DA scheme that wants to perform
+    /// inter-DA hash-binding.
     #[test]
     fn test_dynamic_assertions_inter_da_hash_visibility() {
         use std::sync::{Arc, Mutex};
@@ -8515,6 +8569,129 @@ pub mod tests {
             "SecondDa never saw a hashed URI for com.example.first in its \
              partial_claim — registration ordering may be wrong, or the \
              snapshot refresh is not happening"
+        );
+
+        // Property 2: SecondDa MUST NOT see its own slot's URL in the
+        // partial_claim view passed to its callback. The own slot would
+        // structurally always carry a placeholder hash, so its inclusion
+        // would be a footgun.
+        let saw_self = captured_guard
+            .iter()
+            .any(|(url, _hash)| url.contains("com.example.second"));
+        assert!(
+            !saw_self,
+            "SecondDa's partial_claim contained its own URL — a DA must not \
+             see itself in the callback view (placeholder hash would always \
+             be misleading)"
+        );
+    }
+
+    /// Verifies that a single DA does NOT see its own slot's URL in its
+    /// `partial_claim`. This is the simplest case of the no-self-reference
+    /// invariant — exercised independently of the inter-DA hash-visibility
+    /// test above so a regression in either property is unambiguous.
+    #[test]
+    fn test_dynamic_assertion_does_not_see_own_slot() {
+        use std::sync::{Arc, Mutex};
+
+        let context = crate::context::Context::new();
+
+        #[derive(Serialize)]
+        struct TestAssertion {
+            tag: String,
+        }
+
+        #[derive(Debug)]
+        struct LonelyDa {
+            captured_urls: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl DynamicAssertion for LonelyDa {
+            fn label(&self) -> String {
+                "com.example.lonely".to_string()
+            }
+            fn reserve_size(&self) -> Result<usize> {
+                let a = TestAssertion {
+                    tag: "lonely-da-content".to_string(),
+                };
+                Ok(c2pa_cbor::to_vec(&a)?.len())
+            }
+            fn content(
+                &self,
+                _label: &str,
+                _size: Option<usize>,
+                claim: &PartialClaim,
+            ) -> Result<DynamicAssertionContent> {
+                let mut captured = self.captured_urls.lock().unwrap();
+                for u in claim.assertions() {
+                    captured.push(u.url());
+                }
+                let a = TestAssertion {
+                    tag: "lonely-da-content".to_string(),
+                };
+                Ok(DynamicAssertionContent::Cbor(c2pa_cbor::to_vec(&a)?))
+            }
+        }
+
+        struct LonelyDaSigner {
+            inner: Box<dyn Signer>,
+            captured_urls: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl crate::Signer for LonelyDaSigner {
+            fn sign(&self, data: &[u8]) -> crate::error::Result<Vec<u8>> {
+                self.inner.sign(data)
+            }
+            fn alg(&self) -> SigningAlg {
+                self.inner.alg()
+            }
+            fn certs(&self) -> crate::Result<Vec<Vec<u8>>> {
+                self.inner.certs()
+            }
+            fn reserve_size(&self) -> usize {
+                self.inner.reserve_size()
+            }
+            fn time_authority_url(&self) -> Option<String> {
+                self.inner.time_authority_url()
+            }
+            fn ocsp_val(&self) -> Option<Vec<u8>> {
+                self.inner.ocsp_val()
+            }
+            fn dynamic_assertions(
+                &self,
+            ) -> Vec<Box<dyn crate::dynamic_assertion::DynamicAssertion>> {
+                vec![Box::new(LonelyDa {
+                    captured_urls: Arc::clone(&self.captured_urls),
+                })]
+            }
+        }
+
+        let captured_urls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let signer = LonelyDaSigner {
+            inner: test_signer(SigningAlg::Ps256),
+            captured_urls: Arc::clone(&captured_urls),
+        };
+
+        let file_buffer = include_bytes!("../tests/fixtures/earth_apollo17.jpg").to_vec();
+        let mut buf_io = Cursor::new(file_buffer);
+        let mut store = Store::from_context(&context);
+        let claim1 = create_test_claim().unwrap();
+        store.commit_claim(claim1).unwrap();
+        let result: Vec<u8> = Vec::new();
+        let mut result_stream = Cursor::new(result);
+        store
+            .save_to_stream("jpeg", &mut buf_io, &mut result_stream, &signer, &context)
+            .unwrap();
+
+        let urls = captured_urls.lock().unwrap();
+        assert!(!urls.is_empty(), "LonelyDa callback was never invoked");
+        let saw_self = urls.iter().any(|u| u.contains("com.example.lonely"));
+        assert!(
+            !saw_self,
+            "LonelyDa's partial_claim contained its own URL: {:?}",
+            urls.iter()
+                .filter(|u| u.contains("com.example.lonely"))
+                .collect::<Vec<_>>()
         );
     }
 
