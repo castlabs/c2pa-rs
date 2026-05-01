@@ -1491,11 +1491,17 @@ pub unsafe extern "C" fn c2pa_reader_from_fragmented_files(
         fragment_paths.push(std::path::PathBuf::from(rust_str));
     }
 
-    // Use the context-aware reader path so thread-local settings (trust
-    // anchors, CAWG config, ...) propagate cleanly, matching the modern
-    // `c2pa_reader_from_*` behavior.
-    let reader = C2paReader::from_context(Context::default());
-    let result = reader.with_fragmented_files(std::path::Path::new(&asset_path), &fragment_paths);
+    // Use c2pa-rs's deprecated convenience that reads
+    // ``get_thread_local_settings()`` internally. This honors a prior
+    // ``c2pa::load_settings(...)`` from the Python side -- which is how the
+    // consumer demo's ``read_manifest_fragmented`` injects the keystore CA
+    // trust list. The non-deprecated alternative
+    // ``Reader::from_context(context).with_fragmented_files(...)`` is the
+    // long-term API; switch over once a future c2pa-rs change lets the FFI
+    // accept a ``*const C2paSettings`` parameter without a breaking ABI bump.
+    #[allow(deprecated)]
+    let result =
+        c2pa::Reader::from_fragmented_files(std::path::Path::new(&asset_path), &fragment_paths);
     box_tracked!(ok_or_return_null!(post_validate(result)))
 }
 
