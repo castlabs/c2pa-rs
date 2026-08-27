@@ -73,12 +73,13 @@ pub fn validate_live_video(
     // validate segments under a guessed fallback method — the segments' actual method (and
     // any VSI session keys) can't be trusted to have been read correctly from an untrusted
     // manifest, so per-segment errors from here on would be confusing rather than useful.
-    if tracker
-        .logged_items()
-        .iter()
-        .any(|i| i.validation_status.as_deref() == Some(LIVEVIDEO_INIT_INVALID))
-    {
-        bail!("Live video validation failed: init segment manifest is not valid/trusted");
+    if tracker.logged_items().iter().any(|i| {
+        matches!(
+            i.validation_status.as_deref(),
+            Some(LIVEVIDEO_INIT_INVALID | LIVEVIDEO_SESSIONKEY_INVALID)
+        )
+    }) {
+        bail!("Live video validation failed: init segment layout or manifest is invalid");
     }
 
     match &method {
@@ -142,31 +143,20 @@ pub fn validate_live_video(
     }
 }
 
-/// Returns a description of the first non-passed *trust/signature* validation status on
+/// Returns a description of the first non-passed signature, trust, or hard-binding status on
 /// `reader`, if any.
 ///
 /// A `Reader` built via `with_stream` can return `Ok` even when the manifest's signature is
 /// invalid or its certificate is untrusted — the SDK logs those as validation statuses rather
 /// than hard errors, so a successful `Result` alone does not mean the manifest is trustworthy.
 ///
-/// Only codes in the `signingCredential.*`, `claimSignature.*`, and `timeStamp.*` namespaces are
-/// considered: these are what determine whether the manifest's signature is valid and its signer
-/// trusted (per §19.7.1's "not cryptographically valid and trusted" requirement). Other failed
-/// statuses (e.g. `assertion.action.malformed`) reflect a content/assertion authoring issue in an
-/// otherwise trustworthy manifest and must not block live video continuity validation.
+/// Invalid hard bindings are fatal because accepting session keys or continuity assertions from a
+/// manifest that is not bound to the init/media bytes would authenticate the wrong asset.
 fn reader_trust_failure(reader: &Reader) -> Option<String> {
-    const TRUST_STATUS_PREFIXES: &[&str] =
-        &["signingCredential.", "claimSignature.", "timeStamp."];
-
     reader
         .validation_status()?
         .iter()
-        .find(|status| {
-            !status.passed()
-                && TRUST_STATUS_PREFIXES
-                    .iter()
-                    .any(|prefix| status.code().starts_with(prefix))
-        })
+        .find(|status| !status.passed() && is_live_manifest_integrity_status(status.code()))
         .map(|status| {
             format!(
                 "{}{}",
@@ -177,6 +167,21 @@ fn reader_trust_failure(reader: &Reader) -> Option<String> {
                     .unwrap_or_default()
             )
         })
+}
+
+fn is_live_manifest_integrity_status(code: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "signingCredential.",
+        "claimSignature.",
+        "timeStamp.",
+        "claim.hardBindings.",
+        "assertion.hashedURI.",
+        "assertion.dataHash.",
+        "assertion.bmffHash.",
+        "assertion.boxesHash.",
+    ];
+    code == "assertion.multipleHardBindings"
+        || PREFIXES.iter().any(|prefix| code.starts_with(prefix))
 }
 
 /// Detects the validation method from the init segment manifest.
@@ -195,7 +200,13 @@ fn detect_validation_method(
     let reader =
         match Reader::from_shared_context(context).with_stream(&format, Cursor::new(init_data)) {
             Ok(r) => r,
-            Err(_) => return ValidationMethod::ManifestBox,
+            Err(error) => {
+                let _ = live_validator.fail_init_manifest(
+                    format!("initialization segment has no readable C2PA manifest: {error}"),
+                    tracker,
+                );
+                return ValidationMethod::ManifestBox;
+            }
         };
 
     if let Some(reason) = reader_trust_failure(&reader) {
@@ -209,12 +220,27 @@ fn detect_validation_method(
 
     let manifest = match reader.active_manifest() {
         Some(m) => m,
-        None => return ValidationMethod::ManifestBox,
+        None => {
+            let _ = live_validator
+                .fail_init_manifest("initialization segment has no active manifest", tracker);
+            return ValidationMethod::ManifestBox;
+        }
     };
 
     match manifest.find_assertion::<SessionKeys>(SessionKeys::LABEL) {
         Ok(session_keys) => {
-            let manifest_id = manifest.label().unwrap_or_default().to_string();
+            let manifest_id = match manifest.label() {
+                Some(id) if id.starts_with("urn:c2pa:") && id.len() > "urn:c2pa:".len() => {
+                    id.to_string()
+                }
+                _ => {
+                    let _ = live_validator.fail_init_manifest(
+                        "initialization manifest label must be a non-empty urn:c2pa: identifier",
+                        tracker,
+                    );
+                    return ValidationMethod::VerifiableSegmentInfo;
+                }
+            };
             let ee_cert_der = extract_ee_cert_der(manifest);
 
             let failures_before = tracker.logged_items().len();
@@ -233,7 +259,29 @@ fn detect_validation_method(
 
             ValidationMethod::VerifiableSegmentInfo
         }
-        Err(_) => ValidationMethod::ManifestBox,
+        Err(error) => {
+            let has_session_keys = manifest
+                .assertions()
+                .iter()
+                .any(|assertion| assertion.label().starts_with(SessionKeys::LABEL));
+            if has_session_keys {
+                let _ = live_validator.fail_session_keys(
+                    format!("malformed c2pa.session-keys assertion: {error}"),
+                    tracker,
+                );
+                ValidationMethod::VerifiableSegmentInfo
+            } else {
+                if let Some(manifest_id) = manifest.label() {
+                    let _ = live_validator.register_manifest_box_init(manifest_id, tracker);
+                } else {
+                    let _ = live_validator.fail_init_manifest(
+                        "initialization manifest has no C2PA URN label",
+                        tracker,
+                    );
+                }
+                ValidationMethod::ManifestBox
+            }
+        }
     }
 }
 
@@ -326,7 +374,8 @@ fn validate_segment_manifest_box(
     // than raising them as errors), so a successful `Result` alone does not mean the segment
     // is valid — check whether a new failure was logged too.
     let failures_before = collect_live_video_failures(tracker).len();
-    let result = live_validator.validate_media_segment(&segment_data, &manifest_id, &assertion, tracker);
+    let result =
+        live_validator.validate_media_segment(&segment_data, &manifest_id, &assertion, tracker);
     let has_new_failure = collect_live_video_failures(tracker).len() > failures_before;
 
     match result {
@@ -479,6 +528,22 @@ mod tests {
         assert_eq!(failures[1].0, "livevideo.assertion.invalid");
     }
 
+    #[test]
+    fn hard_binding_failures_are_manifest_integrity_failures() {
+        for code in [
+            "claim.hardBindings.missing",
+            "assertion.multipleHardBindings",
+            "assertion.hashedURI.mismatch",
+            "assertion.bmffHash.mismatch",
+            "assertion.bmffHash.malformed",
+        ] {
+            assert!(is_live_manifest_integrity_status(code), "missed {}", code);
+        }
+        assert!(!is_live_manifest_integrity_status(
+            "assertion.action.malformed"
+        ));
+    }
+
     /// Per §19.7.1, an `mdat` box in an initialization segment is a hard failure
     /// (`livevideo.init.invalid`) that must propagate as an error, even when there are no
     /// media segments to separately fail on.
@@ -495,11 +560,11 @@ mod tests {
             validate_live_video(&Arc::new(C2paContext::new()), &init, Path::new("seg_*.m4s"));
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not valid/trusted"));
+        assert!(result.unwrap_err().to_string().contains("init segment"));
     }
 
     #[test]
-    fn validate_live_video_fails_when_segment_has_no_manifest() {
+    fn validate_live_video_rejects_unsigned_init_before_segments() {
         let dir = tempfile::tempdir().unwrap();
 
         let init_data = make_bmff_box(b"ftyp");
@@ -514,6 +579,6 @@ mod tests {
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("1/1"));
+        assert!(msg.contains("init segment"));
     }
 }

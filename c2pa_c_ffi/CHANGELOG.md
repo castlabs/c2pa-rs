@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+* Add an experimental, feature-gated stateful C API for local Ed25519 C2PA
+  live-video VSI signing. The Milestone 1 profile supports one CMAF track per
+  representation and requires a signed initialization segment.
+
 ## [0.88.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-c-ffi-v0.87.0...c2pa-c-ffi-v0.88.0)
 _11 June 2026_
 

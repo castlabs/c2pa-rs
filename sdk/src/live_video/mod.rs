@@ -16,23 +16,26 @@
 //! Implements two validation methods:
 //!
 //! - **Section 19.3** (per-segment C2PA Manifest Box): each segment carries its own C2PA
-//!   Manifest with a [`LiveVideoSegment`] assertion. Use [`LiveVideoValidator::validate_media_segment`].
+//!   Manifest with a [`crate::assertions::LiveVideoSegment`] assertion. Use
+//!   [`crate::live_video::LiveVideoValidator::validate_media_segment`].
 //!
 //! - **Section 19.4** (Verifiable Segment Info): the init segment manifest contains a
 //!   [`crate::assertions::SessionKeys`] assertion; each media segment carries a COSE_Sign1 in
-//!   an `emsg` box. Use [`LiveVideoValidator::validate_session_keys`] and
-//!   [`LiveVideoValidator::validate_verifiable_segment_info`].
+//!   an `emsg` box. Use [`crate::live_video::LiveVideoValidator::validate_session_keys`] and
+//!   [`crate::live_video::LiveVideoValidator::validate_verifiable_segment_info`].
 //!
 //! # Signing
 //!
-//! Use [`LiveVideoSigner`] to sign an init segment and a sequence of media segments.
+//! Use [`crate::live_video::LiveVideoSigner`] to sign an init segment and a sequence of media
+//! segments.
 //!
 //! # Validation
 //!
-//! Use [`LiveVideoValidator`] to validate a signed live video stream.
+//! Use [`crate::live_video::LiveVideoValidator`] to validate a signed live video stream.
 //!
 //! See [C2PA Technical Specification - Live Video](https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#live-video).
 
+mod bmff;
 pub(crate) mod cose_key;
 mod segment_manifest_validation;
 mod session_key_validation;
@@ -44,23 +47,95 @@ pub use ed25519_dalek::SigningKey as Ed25519SessionKey;
 pub use signing::LiveVideoSigner;
 pub use vsi_signing::{moof_sequence_number, LiveVideoVsiSigner};
 
+use self::cose_key::kid_from_cose_key;
 use crate::{
     assertions::{LiveVideoSegment, SessionKey, SessionKeys},
     error::{Error, Result},
     log_item,
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
-        LIVEVIDEO_INIT_INVALID, LIVEVIDEO_MANIFEST_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
+        LIVEVIDEO_INIT_INVALID, LIVEVIDEO_MANIFEST_INVALID, LIVEVIDEO_SEGMENT_INVALID,
+        LIVEVIDEO_SESSIONKEY_INVALID,
     },
 };
-
-use self::cose_key::kid_from_cose_key;
 
 /// Builds a [`crate::Context`] from thread-local settings, for callers ([`LiveVideoSigner`],
 /// [`LiveVideoVsiSigner`]) that don't yet take an explicit `Context`.
 pub(super) fn context_from_thread_local_settings() -> Result<crate::Context> {
     let settings = crate::settings::get_thread_local_settings();
     crate::Context::new().with_settings(settings)
+}
+
+/// Normalizes a live manifest definition to the C2PA 2.4 declaration required by section 19.
+/// A conflicting caller-provided value is rejected rather than silently overwritten.
+pub(super) fn prepare_live_manifest_json(manifest_json: &str) -> Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(manifest_json)
+        .map_err(|e| Error::BadParam(format!("invalid manifest JSON: {e}")))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| Error::BadParam("manifest JSON must be an object".to_string()))?;
+
+    if let Some(version) = object
+        .get("claim_version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        if version != 2 {
+            return Err(Error::BadParam(
+                "live video requires claim_version 2 for C2PA 2.4".to_string(),
+            ));
+        }
+    }
+
+    let infos = object
+        .entry("claim_generator_info")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| {
+            Error::BadParam("claim_generator_info must be an array for live video".to_string())
+        })?;
+    if infos.is_empty() {
+        infos.push(serde_json::json!({
+            "name": crate::NAME,
+            "version": crate::VERSION,
+        }));
+    }
+
+    let first = infos[0].as_object_mut().ok_or_else(|| {
+        Error::BadParam("the first claim_generator_info entry must be an object".to_string())
+    })?;
+    match first.get("specVersion") {
+        Some(serde_json::Value::String(version)) if version == "2.4" => {}
+        Some(_) => {
+            return Err(Error::BadParam(
+                "live video claim_generator_info specVersion conflicts with required value 2.4"
+                    .to_string(),
+            ));
+        }
+        None => {
+            first.insert(
+                "specVersion".to_string(),
+                serde_json::Value::String("2.4".to_string()),
+            );
+        }
+    }
+
+    serde_json::to_string(&value)
+        .map_err(|e| Error::BadParam(format!("failed to serialize live manifest JSON: {e}")))
+}
+
+pub(super) fn is_manifest_integrity_failure(code: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "signingCredential.",
+        "claimSignature.",
+        "timeStamp.",
+        "claim.hardBindings.",
+        "assertion.hashedURI.",
+        "assertion.dataHash.",
+        "assertion.bmffHash.",
+        "assertion.boxesHash.",
+    ];
+    code == crate::validation_results::validation_codes::HARD_BINDINGS_MULTIPLE
+        || PREFIXES.iter().any(|prefix| code.starts_with(prefix))
 }
 
 /// C2PA UUID identifying a `uuid` box that contains a C2PA Manifest Store.
@@ -108,6 +183,11 @@ pub struct LiveVideoValidator {
     ///
     /// [`validate_session_keys`]: LiveVideoValidator::validate_session_keys
     expected_manifest_id: Option<String>,
+    manifest_box_init_id: Option<String>,
+    init_track_id: Option<u32>,
+    init_timescale: Option<u32>,
+    init_default_sample_duration: Option<u32>,
+    seen_emsg_ids: std::collections::HashSet<u32>,
 }
 
 impl LiveVideoValidator {
@@ -116,6 +196,11 @@ impl LiveVideoValidator {
             previous_segment: None,
             session_keys: Vec::new(),
             expected_manifest_id: None,
+            manifest_box_init_id: None,
+            init_track_id: None,
+            init_timescale: None,
+            init_default_sample_duration: None,
+            seen_emsg_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -123,16 +208,39 @@ impl LiveVideoValidator {
     ///
     /// [§19.7.1]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#_live_video_validation_process
     pub fn validate_init_segment(
-        &self,
+        &mut self,
         segment_data: &[u8],
         tracker: &mut StatusTracker,
     ) -> Result<()> {
+        self.previous_segment = None;
+        self.session_keys.clear();
+        self.expected_manifest_id = None;
+        self.manifest_box_init_id = None;
+        self.init_track_id = None;
+        self.init_timescale = None;
+        self.init_default_sample_duration = None;
+        self.seen_emsg_ids.clear();
+
         if segment_manifest_validation::segment_contains_box_type(segment_data, MDAT_BOX_TYPE) {
             fail_validation(
                 "initialization segment must not contain an mdat box",
                 LIVEVIDEO_INIT_INVALID,
                 tracker,
             )?;
+        }
+        match bmff::parse_init_segment(segment_data) {
+            Ok(info) => {
+                self.init_track_id = Some(info.track_id);
+                self.init_timescale = Some(info.timescale);
+                self.init_default_sample_duration = info.default_sample_duration;
+            }
+            Err(error) => {
+                fail_validation(
+                    format!("invalid initialization segment layout or track timing: {error}"),
+                    LIVEVIDEO_INIT_INVALID,
+                    tracker,
+                )?;
+            }
         }
         Ok(())
     }
@@ -164,6 +272,33 @@ impl LiveVideoValidator {
         fail_validation(description, LIVEVIDEO_INIT_INVALID, tracker)
     }
 
+    /// Records a malformed or unverifiable `c2pa.session-keys` assertion.
+    pub fn fail_session_keys(
+        &self,
+        description: impl Into<String>,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        fail_validation(description, LIVEVIDEO_SESSIONKEY_INVALID, tracker)
+    }
+
+    /// Registers the trusted signed-init manifest as the predecessor of the first §19.3 media
+    /// segment.
+    pub fn register_manifest_box_init(
+        &mut self,
+        manifest_id: &str,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if !manifest_id.starts_with("urn:c2pa:") || manifest_id.len() == "urn:c2pa:".len() {
+            return fail_validation(
+                "initialization manifest label must be a non-empty urn:c2pa: identifier",
+                LIVEVIDEO_INIT_INVALID,
+                tracker,
+            );
+        }
+        self.manifest_box_init_id = Some(manifest_id.to_string());
+        Ok(())
+    }
+
     /// Validates a media segment using the per-segment C2PA Manifest Box method ([§19.3]).
     ///
     /// [§19.3]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#using_c2pa_manifest_box
@@ -183,6 +318,23 @@ impl LiveVideoValidator {
 
         self.validate_segment_has_c2pa_or_emsg(segment_data, tracker)?;
         self.validate_continuity_rules(assertion, manifest_id, tracker)?;
+
+        if self.previous_segment.is_none() {
+            match (
+                self.manifest_box_init_id.as_deref(),
+                assertion.previous_manifest_id.as_deref(),
+            ) {
+                (Some(expected), Some(actual)) if expected == actual => {}
+                (Some(_), _) => {
+                    fail_validation(
+                        "first media segment previousManifestId must reference the signed initialization manifest",
+                        LIVEVIDEO_SEGMENT_INVALID,
+                        tracker,
+                    )?;
+                }
+                (None, _) => {}
+            }
+        }
 
         if let Some(previous) = &self.previous_segment {
             self.validate_sequence_number(assertion, previous, tracker)?;
@@ -224,6 +376,16 @@ impl LiveVideoValidator {
         ee_cert_der: Option<&[u8]>,
         tracker: &mut StatusTracker,
     ) -> Result<()> {
+        self.session_keys.clear();
+        self.expected_manifest_id = None;
+
+        if !manifest_id.starts_with("urn:c2pa:") || manifest_id.len() == "urn:c2pa:".len() {
+            return fail_validation(
+                "session-keys manifest ID must be a non-empty urn:c2pa: identifier",
+                LIVEVIDEO_SESSIONKEY_INVALID,
+                tracker,
+            );
+        }
         if assertion.keys.is_empty() {
             return fail_validation(
                 "session-keys assertion must contain at least one key",
@@ -243,10 +405,28 @@ impl LiveVideoValidator {
         };
 
         let mut verified_keys = Vec::with_capacity(assertion.keys.len());
+        let mut seen_kids = std::collections::HashSet::new();
         for key in &assertion.keys {
-            if kid_from_cose_key(&key.key).is_none() {
+            let Some(kid) = kid_from_cose_key(&key.key).filter(|kid| !kid.is_empty()) else {
                 return fail_validation(
-                    "session key COSE_Key must include a kid (key identifier)",
+                    "session key COSE_Key must include a non-empty kid (key identifier)",
+                    LIVEVIDEO_SESSIONKEY_INVALID,
+                    tracker,
+                );
+            };
+            if !seen_kids.insert(kid) {
+                return fail_validation(
+                    "session key COSE_Key kid values must be unique",
+                    LIVEVIDEO_SESSIONKEY_INVALID,
+                    tracker,
+                );
+            }
+
+            if cose_key::signing_alg_from_cose_key(&key.key).is_none()
+                || cose_key::cose_key_to_der(&key.key).is_none()
+            {
+                return fail_validation(
+                    "session COSE_Key has an unsupported or inconsistent algorithm/public key",
                     LIVEVIDEO_SESSIONKEY_INVALID,
                     tracker,
                 );
@@ -283,9 +463,21 @@ impl LiveVideoValidator {
         tracker: &mut StatusTracker,
     ) -> Result<()> {
         self.require_session_keys(tracker)?;
-        let parsed = self.extract_and_parse_vsi(segment_data, tracker)?;
+        let (parsed, event) = self.extract_and_parse_vsi(segment_data, tracker)?;
         let session_key = self.resolve_session_key(&parsed.sign1, tracker)?;
         let seq_num = parsed.segment_info_map.sequence_number;
+        let media_info =
+            match bmff::parse_media_segment(segment_data, self.init_default_sample_duration) {
+                Ok(info) => info,
+                Err(error) => {
+                    fail_validation(
+                        format!("invalid Milestone 1 media segment layout or timing: {error}"),
+                        LIVEVIDEO_SEGMENT_INVALID,
+                        tracker,
+                    )?;
+                    return Ok(());
+                }
+            };
 
         // See the comment in `validate_media_segment`: `fail_validation` logs a failure but
         // still returns `Ok(())` under the default tracker, so these `?` calls do not
@@ -293,7 +485,60 @@ impl LiveVideoValidator {
         // become the trusted continuity baseline for the next one.
         let failures_before = tracker.filter_errors().count();
 
+        if event.presentation_time_delta != 0 {
+            fail_validation(
+                "VSI emsg presentation_time_delta must be zero",
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            )?;
+        }
+        if event.timescale == 0 || self.init_timescale != Some(event.timescale) {
+            fail_validation(
+                "VSI emsg timescale must be non-zero and match the initialization track timescale",
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            )?;
+        }
+        if event.event_duration != media_info.duration_ticks {
+            fail_validation(
+                "VSI emsg event_duration must cover the complete media segment",
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            )?;
+        }
+        if self.seen_emsg_ids.contains(&event.id) {
+            fail_validation(
+                "VSI emsg id must be unique within the live session",
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            )?;
+        }
+        if event.id == 0 {
+            fail_validation(
+                "VSI emsg id must be nonzero",
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            )?;
+        }
+
         self.validate_vsi_manifest_id(&parsed.segment_info_map.manifest_id, tracker)?;
+        if seq_num != u64::from(media_info.sequence_number) {
+            fail_validation(
+                "VSI sequenceNumber must match moof/mfhd.sequence_number",
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            )?;
+        }
+        if self
+            .init_track_id
+            .is_some_and(|track_id| track_id != media_info.track_id)
+        {
+            fail_validation(
+                "media segment tfhd track_ID does not match the initialization track_ID",
+                LIVEVIDEO_SEGMENT_INVALID,
+                tracker,
+            )?;
+        }
         self.validate_vsi_sequence_bounds(seq_num, &session_key, tracker)?;
         self.validate_vsi_key_validity(&session_key, &parsed.sign1, tracker)?;
         self.validate_vsi_signature(&parsed.sign1, &session_key, tracker)?;
@@ -309,6 +554,7 @@ impl LiveVideoValidator {
             stream_id: String::new(),
             manifest_id: parsed.segment_info_map.manifest_id.clone(),
         });
+        self.seen_emsg_ids.insert(event.id);
 
         Ok(())
     }
@@ -317,6 +563,34 @@ impl LiveVideoValidator {
 impl Default for LiveVideoValidator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn live_manifest_injects_spec_version_without_overwriting_generator() {
+        let json = prepare_live_manifest_json(
+            r#"{"claim_generator_info":[{"name":"caller","version":"1"}],"assertions":[]}"#,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let info = &value["claim_generator_info"][0];
+        assert_eq!(info["name"], "caller");
+        assert_eq!(info["specVersion"], "2.4");
+    }
+
+    #[test]
+    fn live_manifest_rejects_conflicting_spec_version() {
+        let error = prepare_live_manifest_json(
+            r#"{"claim_generator_info":[{"name":"caller","specVersion":"2.3"}]}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("conflicts"));
     }
 }
 

@@ -90,7 +90,7 @@ mod cbindgen_fix {
 }
 
 type C2paContextBuilder = Context;
-type C2paContext = Arc<Context>;
+pub(crate) type C2paContext = Arc<Context>;
 
 /// Progress phase constants passed to C progress callbacks.
 /// These mirror [`c2pa::ProgressPhase`] variants.

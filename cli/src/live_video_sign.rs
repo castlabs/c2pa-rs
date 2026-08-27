@@ -13,6 +13,7 @@
 
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -29,12 +30,12 @@ use c2pa::{
 /// in natural (numeric-aware) filename order. Signed files are written to `output_dir` preserving
 /// file names.
 ///
-/// If `init_path` is provided, the init segment is also signed and written to `output_dir`.
-/// Per §19.2.3, signing the init segment is optional.
+/// The initialization segment is signed first and written to `output_dir`, as required by
+/// §19.2.3. Its manifest becomes the first continuity link for media-segment signing.
 pub fn sign_live_video(
     segments_dir: &Path,
     segments_glob: &Path,
-    init_path: Option<&Path>,
+    init_path: &Path,
     previous_segment_path: Option<&Path>,
     manifest_json: &str,
     output_dir: &Path,
@@ -46,17 +47,38 @@ pub fn sign_live_video(
     let mut live_signer = LiveVideoSigner::from_manifest_json(manifest_json)
         .context("Failed to initialize live video signer from manifest")?;
 
-    if let Some(prev_path) = previous_segment_path {
-        let format = format_from_path(prev_path).unwrap_or_else(|| "video/mp4".to_string());
-        let prev_data = fs::read(prev_path)
-            .with_context(|| format!("Failed to read previous segment: {prev_path:?}"))?;
-        live_signer
-            .resume_from_segment(&prev_data, &format)
-            .with_context(|| format!("Failed to read manifest ID from: {prev_path:?}"))?;
+    if previous_segment_path.is_some() {
+        bail!(
+            "--previous-segment is not supported for the hardened §19.3 profile; persist the updated manifest state instead"
+        );
     }
-
-    if let Some(init) = init_path {
-        sign_init_segment(init, output_dir, &live_signer, signer)?;
+    let signed_init_path = output_path_for(init_path, output_dir)?;
+    if signed_init_path.exists() {
+        let has_published_media = fs::read_dir(output_dir)?
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry.path() != signed_init_path
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
+            });
+        if has_published_media {
+            bail!(
+                "multi-invocation §19.3 signing is not supported by the hardened Milestone 1 profile"
+            );
+        }
+        let signed_init_data = fs::read(&signed_init_path).with_context(|| {
+            format!(
+                "Failed to read signed init segment from output dir: {signed_init_path:?}. \
+                 Run without --previous-segment first to sign the init segment."
+            )
+        })?;
+        let init_format = format_from_path(init_path).unwrap_or_else(|| "video/mp4".to_string());
+        live_signer
+            .restore_init_segment(&signed_init_data, &init_format)
+            .with_context(|| {
+                format!("Failed to restore signed init segment: {signed_init_path:?}")
+            })?;
+    } else {
+        sign_init_segment(init_path, output_dir, &mut live_signer, signer)?;
     }
 
     let segment_paths = crate::live_video_common::collect_segments(segments_dir, segments_glob)?;
@@ -70,26 +92,11 @@ pub fn sign_live_video(
     }
 
     let mut signed_count = 0usize;
-    let mut failed_count = 0usize;
-
     for segment_path in &segment_paths {
-        match sign_segment(segment_path, output_dir, &mut live_signer, signer) {
-            Ok(output_path) => {
-                println!("Segment signed: {output_path:?}");
-                signed_count += 1;
-            }
-            Err(e) => {
-                eprintln!("Segment FAIL [{segment_path:?}]: {e}");
-                failed_count += 1;
-            }
-        }
-    }
-
-    if failed_count > 0 {
-        bail!(
-            "Live video signing failed: {failed_count}/{} segment(s) failed",
-            segment_paths.len()
-        )
+        let output_path = sign_segment(segment_path, output_dir, &mut live_signer, signer)
+            .with_context(|| format!("Segment FAIL [{segment_path:?}]"))?;
+        println!("Segment signed: {output_path:?}");
+        signed_count += 1;
     }
 
     println!("\n{signed_count} segment(s) signed successfully.");
@@ -99,7 +106,7 @@ pub fn sign_live_video(
 fn sign_init_segment(
     init_path: &Path,
     output_dir: &Path,
-    live_signer: &LiveVideoSigner,
+    live_signer: &mut LiveVideoSigner,
     signer: &dyn Signer,
 ) -> Result<()> {
     let init_data = fs::read(init_path)
@@ -109,7 +116,7 @@ fn sign_init_segment(
         .sign_init_segment(&init_data, &format, signer)
         .with_context(|| format!("Failed to sign init segment: {init_path:?}"))?;
     let output_path = output_path_for(init_path, output_dir)?;
-    fs::write(&output_path, &signed_init)
+    write_atomic(&output_path, &signed_init)
         .with_context(|| format!("Failed to write signed init segment: {output_path:?}"))?;
     println!("Init signed: {output_path:?}");
     Ok(())
@@ -131,7 +138,7 @@ fn sign_segment(
         .with_context(|| format!("Failed to sign segment: {segment_path:?}"))?;
 
     let output_path = output_path_for(segment_path, output_dir)?;
-    fs::write(&output_path, &signed_bytes)
+    write_atomic(&output_path, &signed_bytes)
         .with_context(|| format!("Failed to write signed segment: {output_path:?}"))?;
 
     Ok(output_path)
@@ -142,6 +149,21 @@ fn output_path_for(input_path: &Path, output_dir: &Path) -> Result<PathBuf> {
         .file_name()
         .context("input path has no file name")?;
     Ok(output_dir.join(file_name))
+}
+
+fn write_atomic(output_path: &Path, data: &[u8]) -> Result<()> {
+    let parent = output_path
+        .parent()
+        .context("output path has no parent directory")?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(data)?;
+    temp.as_file().sync_all()?;
+    temp.persist_noclobber(output_path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("live-video output already exists: {output_path:?}"))?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Signs a sequence of media segments using the Verifiable Segment Info method (§19.4).
@@ -199,12 +221,6 @@ pub fn sign_live_video_vsi(
         // Resuming an existing session: restore state from previously signed outputs.
         // Re-signing the init would produce a new UUID, breaking manifestId continuity
         // across segments per §19.4.
-        let prev_data = fs::read(prev_path)
-            .with_context(|| format!("Failed to read previous segment: {prev_path:?}"))?;
-        vsi_signer
-            .resume_from_segment(&prev_data)
-            .with_context(|| format!("Failed to resume from segment: {prev_path:?}"))?;
-
         let signed_init_path = output_path_for(init_path, output_dir)?;
         let signed_init_data = fs::read(&signed_init_path).with_context(|| {
             format!(
@@ -218,9 +234,28 @@ pub fn sign_live_video_vsi(
             .with_context(|| {
                 format!("Failed to restore manifest ID from signed init: {signed_init_path:?}")
             })?;
+
+        let prev_data = fs::read(prev_path)
+            .with_context(|| format!("Failed to read previous segment: {prev_path:?}"))?;
+        vsi_signer
+            .resume_from_segment(&prev_data)
+            .with_context(|| format!("Failed to resume from segment: {prev_path:?}"))?;
     } else {
-        // First invocation: sign the init segment and capture its manifest ID.
-        sign_vsi_init_segment(init_path, output_dir, &mut vsi_signer, signer)?;
+        let signed_init_path = output_path_for(init_path, output_dir)?;
+        if signed_init_path.exists() {
+            let signed_init_data = fs::read(&signed_init_path).with_context(|| {
+                format!("Failed to read existing signed init segment: {signed_init_path:?}")
+            })?;
+            let format = format_from_path(init_path).unwrap_or_else(|| "video/mp4".to_string());
+            vsi_signer
+                .restore_manifest_id_from_signed_init(&signed_init_data, &format)
+                .with_context(|| {
+                    format!("Failed to restore existing signed init: {signed_init_path:?}")
+                })?;
+        } else {
+            // First invocation: sign the init segment and capture its manifest ID.
+            sign_vsi_init_segment(init_path, output_dir, &mut vsi_signer, signer)?;
+        }
     }
 
     if segment_paths.is_empty() {
@@ -232,26 +267,11 @@ pub fn sign_live_video_vsi(
     }
 
     let mut signed_count = 0usize;
-    let mut failed_count = 0usize;
-
     for segment_path in &segment_paths {
-        match sign_vsi_segment(segment_path, output_dir, &mut vsi_signer) {
-            Ok(output_path) => {
-                println!("Segment signed (VSI): {output_path:?}");
-                signed_count += 1;
-            }
-            Err(e) => {
-                eprintln!("Segment FAIL [{segment_path:?}]: {e}");
-                failed_count += 1;
-            }
-        }
-    }
-
-    if failed_count > 0 {
-        bail!(
-            "VSI signing failed: {failed_count}/{} segment(s) failed",
-            segment_paths.len()
-        )
+        let output_path = sign_vsi_segment(segment_path, output_dir, &mut vsi_signer)
+            .with_context(|| format!("Segment FAIL [{segment_path:?}]"))?;
+        println!("Segment signed (VSI): {output_path:?}");
+        signed_count += 1;
     }
 
     println!("\n{signed_count} segment(s) signed successfully (VSI).");
@@ -271,7 +291,7 @@ fn sign_vsi_init_segment(
         .sign_init_segment(&init_data, &format, signer)
         .with_context(|| format!("Failed to sign init segment: {init_path:?}"))?;
     let output_path = output_path_for(init_path, output_dir)?;
-    fs::write(&output_path, &signed_init)
+    write_atomic(&output_path, &signed_init)
         .with_context(|| format!("Failed to write signed init segment: {output_path:?}"))?;
     println!("Init signed (VSI): {output_path:?}");
     Ok(())
@@ -290,7 +310,7 @@ fn sign_vsi_segment(
         .with_context(|| format!("Failed to sign segment: {segment_path:?}"))?;
 
     let output_path = output_path_for(segment_path, output_dir)?;
-    fs::write(&output_path, &signed_bytes)
+    write_atomic(&output_path, &signed_bytes)
         .with_context(|| format!("Failed to write signed segment: {output_path:?}"))?;
 
     Ok(output_path)
@@ -310,8 +330,9 @@ fn load_ed25519_session_key(path: &Path) -> Result<Ed25519SessionKey> {
     Ok(Ed25519SessionKey::from_bytes(&seed))
 }
 
-/// Infers `minSequenceNumber` from `first_segment`'s own `moof/mfhd.sequence_number`, falling
-/// back to 1 if there's no segment yet or it has no `moof` box. `sign_media_segment` cross-checks
+/// Infers `minSequenceNumber` from `first_segment`'s own `moof/mfhd.sequence_number`. The value
+/// defaults to 1 only when there is no media segment to sign; malformed segment timing is rejected.
+/// `sign_media_segment` cross-checks
 /// every segment's own `mfhd.sequence_number` against the signer's counter (§19.4.1) and errors
 /// on drift, so this must match the very first segment that's about to be signed.
 fn infer_min_sequence_number(first_segment: Option<&PathBuf>) -> Result<u64> {
@@ -319,9 +340,13 @@ fn infer_min_sequence_number(first_segment: Option<&PathBuf>) -> Result<u64> {
         return Ok(1);
     };
     let data = fs::read(path).with_context(|| format!("Cannot read segment: {path:?}"))?;
-    Ok(c2pa::live_video::moof_sequence_number(&data)
+    c2pa::live_video::moof_sequence_number(&data)
         .map(u64::from)
-        .unwrap_or(1))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot infer minSequenceNumber: segment has malformed or unsupported Milestone 1 moof/mfhd/traf timing: {path:?}"
+            )
+        })
 }
 
 #[cfg(test)]

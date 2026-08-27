@@ -286,7 +286,7 @@ enum Commands {
     },
 
     /// Validate a live video stream against C2PA section 19 (Live Video) rules
-    /// (https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#live-video).
+    /// (<https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#live-video>).
     ///
     /// The path argument is the initialization segment. The validation method is detected
     /// automatically from the init segment's manifest: if it contains a `c2pa.session-keys`
@@ -318,13 +318,9 @@ enum Commands {
     /// Segments are discovered via `--segments_glob` and processed in natural (numeric-aware)
     /// filename order. Signed files are written to `--output`.
     ///
-    /// Signing the init segment is optional (per §19.2.3). Pass `--init` to sign it too.
+    /// The initialization segment is required and is always signed.
     ///
-    /// Example (segments only):
-    ///
-    ///   c2patool /streams/live -m manifest.json -o output/ --segments_glob "segment_*.m4s"
-    ///
-    /// Example (with init segment):
+    /// Example:
     ///
     ///   c2patool /streams/live -m manifest.json -o output/ --segments_glob "segment_*.m4s" --init init.mp4
     ///
@@ -346,13 +342,14 @@ enum Commands {
         #[arg(long = "manifest", short = 'm')]
         manifest: PathBuf,
 
-        /// Optional path to an init segment to sign (§19.2.3). Resolved relative to the path
-        /// argument if not absolute.
+        /// Path to the initialization segment. Resolved relative to the path argument if not
+        /// absolute. The signed init carries the C2PA UUID box required by §19.2.3.
         #[arg(long = "init")]
-        init: Option<PathBuf>,
+        init: PathBuf,
 
-        /// Optional path to the last signed media segment from a previous invocation.
-        /// Used to resume the continuity chain across separate process runs.
+        /// Optional path to the last signed VSI media segment from a previous invocation.
+        /// Used to resume a §19.4 continuity chain across separate process runs. The hardened
+        /// Milestone 1 §19.3 profile instead requires persisted manifest state.
         ///
         /// When using --method vsi, providing this flag skips re-signing the init segment.
         /// The already-signed init must be present in the output directory (written by the
@@ -1201,17 +1198,13 @@ fn main() -> Result<()> {
                 Err(err) => return Err(err.into()),
             };
 
+            let init_path = if init.is_absolute() {
+                init.clone()
+            } else {
+                path.join(init)
+            };
+
             if method == "vsi" {
-                let init_path = match init.as_deref() {
-                    Some(p) => {
-                        if p.is_absolute() {
-                            p.to_path_buf()
-                        } else {
-                            path.join(p)
-                        }
-                    }
-                    None => bail!("--init is required when using --method vsi"),
-                };
                 let session_key_path = session_key
                     .as_deref()
                     .ok_or_else(|| anyhow!("--session-key is required when using --method vsi"))?;
@@ -1228,17 +1221,10 @@ fn main() -> Result<()> {
                 );
             }
 
-            let init_path = init.as_deref().map(|p| {
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    path.join(p)
-                }
-            });
             return live_video_sign::sign_live_video(
                 path,
                 segments_glob,
-                init_path.as_deref(),
+                &init_path,
                 previous_segment.as_deref(),
                 &manifest_json,
                 output,

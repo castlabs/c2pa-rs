@@ -82,3 +82,6 @@ deprecated_with_note = "C2PA_DEPRECATED_MSG({})"
 [export]
 # Exclude internal functions from C API
 exclude = ["cimpl_free"]
+
+[defines]
+"feature = unstable_live_video" = "C2PA_UNSTABLE_LIVE_VIDEO"

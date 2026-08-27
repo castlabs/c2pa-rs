@@ -16,6 +16,8 @@ mod c2pa_stream;
 mod cimpl;
 mod c_api;
 mod error;
+#[cfg(feature = "unstable_live_video")]
+mod live_video;
 mod maybe_send_sync;
 mod signer_info;
 
@@ -29,4 +31,6 @@ pub use c_api::*;
 pub use cimpl::cimpl_error::CimplError;
 pub use cimpl::*;
 pub use error::{Error, Result};
+#[cfg(feature = "unstable_live_video")]
+pub use live_video::*;
 pub use signer_info::SignerInfo;

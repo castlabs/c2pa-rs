@@ -21,6 +21,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 default = ["c2pa/openssl", "http", "add_thumbnails"]
 file_io = ["c2pa/file_io"]
 rust_native_crypto = ["c2pa/rust_native_crypto"]
+unstable_live_video = ["c2pa/unstable_live_video", "dep:zeroize"]
 # HTTP and thumbnails: not enabled by default because reqwest pulls in wasm-bindgen-futures
 # (incompatible with -Z build-std=panic_abort on wasm32-unknown-emscripten).
 # Enable for native builds when you need HTTP or thumbnails.
@@ -37,6 +38,7 @@ libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0.18"
+zeroize = { version = "1.8", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.52", features = ["rt-multi-thread", "rt"] }

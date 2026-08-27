@@ -13,17 +13,16 @@
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
+use super::{fail_validation, LiveVideoValidator, SegmentState, C2PA_UUID, UUID_BOX_TYPE};
 use crate::{
     assertions::{ContinuityMethod, LiveVideoSegment},
     error::{Error, Result},
+    live_video::verifiable_segment_info::extract_vsi_payload_from_segment,
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
         LIVEVIDEO_ASSERTION_INVALID, LIVEVIDEO_CONTINUITY_METHOD_INVALID, LIVEVIDEO_SEGMENT_INVALID,
     },
 };
-
-use super::{fail_validation, LiveVideoValidator, SegmentState, C2PA_UUID, UUID_BOX_TYPE};
-use crate::live_video::verifiable_segment_info::extract_vsi_payload_from_segment;
 
 impl LiveVideoValidator {
     pub(super) fn validate_segment_has_c2pa_or_emsg(
@@ -53,9 +52,9 @@ impl LiveVideoValidator {
         previous: &SegmentState,
         tracker: &mut StatusTracker,
     ) -> Result<()> {
-        if assertion.sequence_number <= previous.sequence_number {
+        if previous.sequence_number.checked_add(1) != Some(assertion.sequence_number) {
             fail_validation(
-                "sequenceNumber must be strictly greater than the previous segment's",
+                "sequenceNumber must advance exactly by one from the previous segment",
                 LIVEVIDEO_ASSERTION_INVALID,
                 tracker,
             )?;
@@ -172,6 +171,13 @@ fn segment_contains_c2pa_uuid_box(data: &[u8]) -> bool {
         match read_box_header(&mut cursor) {
             Ok((box_type, box_size)) => {
                 if box_type == UUID_BOX_TYPE {
+                    let header_len = cursor
+                        .stream_position()
+                        .unwrap_or(box_start)
+                        .saturating_sub(box_start);
+                    if box_size != u64::MAX && box_size < header_len.saturating_add(16) {
+                        break;
+                    }
                     let mut uuid_bytes = [0u8; 16];
                     if cursor.read_exact(&mut uuid_bytes).is_ok() && uuid_bytes == C2PA_UUID {
                         return true;
@@ -203,10 +209,21 @@ fn read_box_header<R: Read + Seek>(reader: &mut R) -> Result<(u32, u64)> {
         reader
             .read_exact(&mut large_size_bytes)
             .map_err(|_| Error::NotFound)?;
-        u64::from_be_bytes(large_size_bytes)
+        let large_size = u64::from_be_bytes(large_size_bytes);
+        if large_size < 16 {
+            return Err(Error::BadParam(
+                "BMFF large-size box is smaller than its header".to_string(),
+            ));
+        }
+        large_size
     } else if size == 0 {
         u64::MAX
     } else {
+        if size < 8 {
+            return Err(Error::BadParam(
+                "BMFF box is smaller than its header".to_string(),
+            ));
+        }
         size as u64
     };
 
@@ -231,12 +248,13 @@ mod tests {
 
     #[test]
     fn init_segment_without_mdat_is_valid() {
-        let validator = LiveVideoValidator::new();
-        let segment = make_uuid_box(true);
+        let mut validator = LiveVideoValidator::new();
+        let segment =
+            include_bytes!("../../tests/fixtures/bunny/bunny_791182bps/BigBuckBunny_2s_init.mp4");
         let mut tracker = aggregate_tracker();
 
         validator
-            .validate_init_segment(&segment, &mut tracker)
+            .validate_init_segment(segment, &mut tracker)
             .unwrap();
 
         let failures: Vec<_> = tracker
@@ -254,8 +272,10 @@ mod tests {
 
     #[test]
     fn init_segment_with_mdat_fails() {
-        let validator = LiveVideoValidator::new();
-        let mut segment = make_uuid_box(true);
+        let mut validator = LiveVideoValidator::new();
+        let mut segment =
+            include_bytes!("../../tests/fixtures/bunny/bunny_791182bps/BigBuckBunny_2s_init.mp4")
+                .to_vec();
         segment.extend(make_mdat_box());
         let mut tracker = aggregate_tracker();
 

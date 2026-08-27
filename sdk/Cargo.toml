@@ -257,6 +257,7 @@ jumbf = "0.7.0"
 c2pa_macros = { path = "../macros" }
 mockall = "0.14.0"
 jsonschema = { version = "0.45.1", default-features = false }
+p256 = { version = "0.13.2", features = ["ecdsa"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
 wasm-bindgen-test = "0.3.72"

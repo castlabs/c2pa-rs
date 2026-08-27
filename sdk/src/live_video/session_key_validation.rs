@@ -12,7 +12,14 @@
 // each license.
 
 use c2pa_raw_crypto::validator_for_signing_alg;
+use coset::TaggedCborSerializable;
 
+use super::{
+    cose_key::{cose_key_to_der, kid_from_cose_key, signing_alg_from_cose_key},
+    fail_validation,
+    verifiable_segment_info::{extract_vsi_emsg_from_segment, parse_vsi, ParsedVsi, VsiEmsg},
+    LiveVideoValidator,
+};
 use crate::{
     assertions::SessionKey,
     error::{Error, Result},
@@ -20,15 +27,6 @@ use crate::{
     validation_results::validation_codes::{
         LIVEVIDEO_ASSERTION_INVALID, LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
     },
-};
-
-use coset::TaggedCborSerializable;
-
-use super::{
-    cose_key::{cose_key_to_der, kid_from_cose_key, signing_alg_from_cose_key},
-    fail_validation,
-    verifiable_segment_info::{extract_vsi_payload_from_segment, parse_vsi, ParsedVsi},
-    LiveVideoValidator,
 };
 
 impl LiveVideoValidator {
@@ -47,10 +45,10 @@ impl LiveVideoValidator {
         &self,
         segment_data: &[u8],
         tracker: &mut StatusTracker,
-    ) -> Result<ParsedVsi> {
-        let vsi_bytes = match extract_vsi_payload_from_segment(segment_data) {
-            Some(bytes) => bytes,
-            None => {
+    ) -> Result<(ParsedVsi, VsiEmsg)> {
+        let event = match extract_vsi_emsg_from_segment(segment_data) {
+            Ok(Some(event)) => event,
+            Ok(None) => {
                 fail_validation(
                     "segment must contain a VSI emsg box (urn:c2pa:verifiable-segment-info)",
                     LIVEVIDEO_SEGMENT_INVALID,
@@ -58,16 +56,21 @@ impl LiveVideoValidator {
                 )?;
                 return Err(Error::BadParam("livevideo.segment.invalid".into()));
             }
+            Err(error) => {
+                fail_validation(error.to_string(), LIVEVIDEO_SEGMENT_INVALID, tracker)?;
+                return Err(Error::BadParam("livevideo.segment.invalid".into()));
+            }
         };
 
-        parse_vsi(&vsi_bytes).map_err(|_| {
+        let parsed = parse_vsi(&event.message_data).map_err(|_| {
             let _ = fail_validation(
                 "failed to parse SegmentInfoMap from VSI COSE_Sign1 payload",
                 LIVEVIDEO_SEGMENT_INVALID,
                 tracker,
             );
             Error::BadParam("livevideo.segment.invalid".into())
-        })
+        })?;
+        Ok((parsed, event))
     }
 
     pub(super) fn resolve_session_key(
@@ -173,9 +176,10 @@ impl LiveVideoValidator {
         tracker: &mut StatusTracker,
     ) -> Result<()> {
         if let Some(previous) = &self.previous_segment {
-            if seq_num <= previous.sequence_number {
+            let expected = previous.sequence_number.checked_add(1);
+            if expected != Some(seq_num) {
                 return fail_validation(
-                    "VSI sequenceNumber must be strictly greater than the previous segment's",
+                    "VSI sequenceNumber must advance exactly by one from the previous segment",
                     LIVEVIDEO_ASSERTION_INVALID,
                     tracker,
                 );
@@ -235,7 +239,8 @@ impl LiveVideoValidator {
                 && excl.data.as_deref().is_some_and(|data| {
                     data.iter().any(|d| {
                         d.offset == super::verifiable_segment_info::VSI_URI_OFFSET_IN_EMSG
-                            && d.value == super::verifiable_segment_info::VSI_SCHEME_ID_URI.as_bytes()
+                            && d.value
+                                == super::verifiable_segment_info::VSI_SCHEME_ID_URI.as_bytes()
                     })
                 })
         });
@@ -279,7 +284,7 @@ impl LiveVideoValidator {
         key: &SessionKey,
         sign1: &coset::CoseSign1,
     ) -> std::result::Result<(), String> {
-        use chrono::{DateTime, Duration, TimeZone, Utc};
+        use chrono::{DateTime, TimeZone, Utc};
 
         let created_at: DateTime<Utc> =
             key.created_at.0.parse().map_err(|_| {
@@ -289,25 +294,38 @@ impl LiveVideoValidator {
         let validity_seconds = i64::try_from(key.validity_period)
             .map_err(|_| "validityPeriod overflow".to_string())?;
 
-        let expires_at = created_at + Duration::seconds(validity_seconds);
+        let created_at_seconds = created_at.timestamp();
+        let expires_at_seconds = created_at_seconds
+            .checked_add(validity_seconds)
+            .ok_or_else(|| "session key validity period overflows its createdAt".to_string())?;
 
         // Per §19.4.1, the protected header's `iat` claims the segment's actual time of
         // signing. Prefer it over wall-clock time so validation done after the fact (e.g.
         // archival/VOD validation of a recorded live stream) checks the segment against the
         // time it was actually produced, not the time it happens to be validated.
-        let claimed_time = extract_iat(sign1).and_then(|secs| Utc.timestamp_opt(secs, 0).single());
+        let claimed_time = extract_iat(sign1)?
+            .map(|secs| {
+                Utc.timestamp_opt(secs, 0)
+                    .single()
+                    .ok_or_else(|| "session VSI iat is outside the supported range".to_string())
+            })
+            .transpose()?;
+        let uses_iat = claimed_time.is_some();
         let now = claimed_time.unwrap_or_else(Utc::now);
 
-        if now > expires_at {
+        if now.timestamp() < created_at_seconds {
+            return Err(format!(
+                "session key is not yet valid: createdAt={}, {}={now}",
+                key.created_at.0,
+                if uses_iat { "iat" } else { "now" },
+            ));
+        }
+        if now.timestamp() > expires_at_seconds {
             return Err(format!(
                 "session key expired: createdAt={}, validityPeriod={}s, {}={now}",
                 key.created_at.0,
                 key.validity_period,
-                if claimed_time.is_some() {
-                    "iat"
-                } else {
-                    "now"
-                },
+                if uses_iat { "iat" } else { "now" },
             ));
         }
 
@@ -319,8 +337,18 @@ impl LiveVideoValidator {
         sign1: &coset::CoseSign1,
         session_key: &SessionKey,
     ) -> std::result::Result<(), String> {
-        let alg = signing_alg_from_cose_key(&session_key.key)
-            .ok_or_else(|| "unsupported key type/curve in session key".to_string())?;
+        let alg = signing_alg_from_cose_key(&session_key.key).ok_or_else(|| {
+            "unsupported or inconsistent key type, curve, or alg in session COSE_Key".to_string()
+        })?;
+
+        let protected_alg = crate::crypto::cose::signing_alg_from_sign1(sign1)
+            .map_err(|_| "COSE_Sign1 must contain a supported protected alg".to_string())?;
+        if protected_alg != alg || sign1.unprotected.alg.is_some() {
+            return Err(
+                "COSE_Sign1 protected alg must agree with the session COSE_Key and must not be duplicated in the unprotected header"
+                    .to_string(),
+            );
+        }
 
         let public_key_der = cose_key_to_der(&session_key.key)
             .ok_or_else(|| "failed to convert session key to DER".to_string())?;
@@ -375,12 +403,34 @@ impl LiveVideoValidator {
             }
         };
 
+        if sign1.payload.is_some() {
+            return reject_signer_binding(
+                "session key signerBinding payload must be detached",
+                tracker,
+            );
+        }
+
         let Some(alg) = signing_alg_from_cose_key(&key.key) else {
             return reject_signer_binding(
                 "signerBinding: unsupported or missing algorithm in session COSE_Key",
                 tracker,
             );
         };
+        let protected_alg = match crate::crypto::cose::signing_alg_from_sign1(&sign1) {
+            Ok(alg) => alg,
+            Err(_) => {
+                return reject_signer_binding(
+                    "signerBinding must contain a supported protected alg",
+                    tracker,
+                );
+            }
+        };
+        if protected_alg != alg || sign1.unprotected.alg.is_some() {
+            return reject_signer_binding(
+                "signerBinding protected alg must agree with the session COSE_Key and must not be duplicated in the unprotected header",
+                tracker,
+            );
+        }
 
         let Some(session_public_key_der) = cose_key_to_der(&key.key) else {
             return reject_signer_binding(
@@ -429,15 +479,25 @@ fn reject_signer_binding(msg: impl Into<String>, tracker: &mut StatusTracker) ->
 
 /// Extracts the `iat` ("claimed time of signing", §19.4.1/RFC 8392) protected header field, if
 /// present, as a Unix timestamp in seconds.
-fn extract_iat(sign1: &coset::CoseSign1) -> Option<i64> {
-    sign1.protected.header.rest.iter().find_map(|(label, value)| {
-        match label {
-            coset::Label::Text(s) if s == "iat" => {
-                value.as_integer().and_then(|i| i64::try_from(i).ok())
-            }
-            _ => None,
-        }
-    })
+fn extract_iat(sign1: &coset::CoseSign1) -> std::result::Result<Option<i64>, String> {
+    let mut values = sign1
+        .protected
+        .header
+        .rest
+        .iter()
+        .filter(|(label, _)| matches!(label, coset::Label::Text(s) if s == "iat"));
+    let Some((_, value)) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("COSE_Sign1 protected header contains duplicate iat values".to_string());
+    }
+    let integer = value
+        .as_integer()
+        .ok_or_else(|| "COSE_Sign1 protected iat must be an integer NumericDate".to_string())?;
+    let seconds = i64::try_from(integer)
+        .map_err(|_| "COSE_Sign1 protected iat is outside the supported range".to_string())?;
+    Ok(Some(seconds))
 }
 
 /// Extracts raw COSE_Sign1_Tagged bytes from a `signerBinding` CBOR value.
@@ -448,7 +508,7 @@ fn extract_iat(sign1: &coset::CoseSign1) -> Option<i64> {
 /// - `Value::Array` of integers — legacy: flat byte representation of tagged COSE_Sign1 bytes
 /// - `Value::Bytes` — direct CBOR byte string (ideal CBOR-only case)
 /// - `Value::Text` — base64-encoded string (serde_json with base64 for bytes)
-fn extract_signer_binding_bytes(value: &c2pa_cbor::Value) -> Option<Vec<u8>> {
+pub(super) fn extract_signer_binding_bytes(value: &c2pa_cbor::Value) -> Option<Vec<u8>> {
     match value {
         c2pa_cbor::Value::Array(items) if is_cose_sign1_array(items) => {
             // COSE_Sign1 inner array [protected, unprotected, payload, signature].
@@ -531,6 +591,7 @@ mod tests {
         let mut map = std::collections::BTreeMap::new();
         map.insert(cbor_int(1), cbor_int(2)); // kty: EC2
         map.insert(cbor_int(2), c2pa_cbor::Value::Bytes(b"k".to_vec())); // kid
+        map.insert(cbor_int(3), cbor_int(-7)); // alg: ES256
         map.insert(cbor_int(-1), cbor_int(1)); // crv: P-256
         map.insert(cbor_int(-2), c2pa_cbor::Value::Bytes(vec![0; 32]));
         map.insert(cbor_int(-3), c2pa_cbor::Value::Bytes(vec![0; 32]));
@@ -549,10 +610,23 @@ mod tests {
     /// Builds an `emsg` version 0 box with C2PA VSI scheme carrying `message_data`.
     #[cfg(feature = "rust_native_crypto")]
     fn make_vsi_emsg_box(message_data: &[u8]) -> Vec<u8> {
+        make_vsi_emsg_box_with_timing(message_data, 1, 1, 0)
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    fn make_vsi_emsg_box_with_timing(
+        message_data: &[u8],
+        timescale: u32,
+        event_duration: u32,
+        id: u32,
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(b"urn:c2pa:verifiable-segment-info\0");
         body.extend_from_slice(b"fseg\0");
-        body.extend_from_slice(&[0u8; 16]); // timescale + pts_delta + duration + id
+        body.extend_from_slice(&timescale.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&event_duration.to_be_bytes());
+        body.extend_from_slice(&id.to_be_bytes());
         body.extend_from_slice(message_data);
 
         let total_size = (8u32 + 4 + body.len() as u32).to_be_bytes();
@@ -587,7 +661,6 @@ mod tests {
         }
 
         pub fn generate_test_key_pair() -> (p256::ecdsa::SigningKey, c2pa_cbor::Value) {
-            use p256::elliptic_curve::sec1::ToEncodedPoint;
             let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
             let verifying_key = signing_key.verifying_key();
             let point = verifying_key.to_encoded_point(false);
@@ -595,6 +668,7 @@ mod tests {
             let mut map = std::collections::BTreeMap::new();
             map.insert(cbor_int(1), cbor_int(2)); // kty: EC2
             map.insert(cbor_int(2), c2pa_cbor::Value::Bytes(TEST_KID.to_vec()));
+            map.insert(cbor_int(3), cbor_int(-7)); // alg: ES256
             map.insert(cbor_int(-1), cbor_int(1)); // crv: P-256
             map.insert(
                 cbor_int(-2),
@@ -686,7 +760,29 @@ mod tests {
             manifest_id: &str,
             signing_key: &p256::ecdsa::SigningKey,
         ) -> Vec<u8> {
-            let trailer = make_mdat_box();
+            fn bmff_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+                let mut data = Vec::new();
+                data.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+                data.extend_from_slice(box_type);
+                data.extend_from_slice(payload);
+                data
+            }
+
+            fn full_box(box_type: &[u8; 4], flags: u32, payload: &[u8]) -> Vec<u8> {
+                let mut body = vec![0];
+                body.extend_from_slice(&flags.to_be_bytes()[1..]);
+                body.extend_from_slice(payload);
+                bmff_box(box_type, &body)
+            }
+
+            let sequence_number_u32 = u32::try_from(sequence_number).unwrap();
+            let mfhd = full_box(b"mfhd", 0, &sequence_number_u32.to_be_bytes());
+            let mut tfhd_payload = 1u32.to_be_bytes().to_vec();
+            tfhd_payload.extend_from_slice(&1000u32.to_be_bytes());
+            let tfhd = full_box(b"tfhd", 0x000008, &tfhd_payload);
+            let trun = full_box(b"trun", 0, &1u32.to_be_bytes());
+            let traf = bmff_box(b"traf", &[tfhd, trun].concat());
+            let trailer = [bmff_box(b"moof", &[mfhd, traf].concat()), make_mdat_box()].concat();
             let build = |bmff_hash: c2pa_cbor::Value| -> Vec<u8> {
                 let map = SegmentInfoMap {
                     sequence_number,
@@ -694,16 +790,21 @@ mod tests {
                     manifest_id: manifest_id.to_string(),
                     manifest_uri: None,
                 };
-                let mut seg = super::make_vsi_emsg_box(&make_signed_cose_sign1_bytes(
-                    &map,
-                    signing_key,
-                ));
+                let mut seg = super::make_vsi_emsg_box_with_timing(
+                    &make_signed_cose_sign1_bytes(&map, signing_key),
+                    1000,
+                    1000,
+                    sequence_number_u32,
+                );
                 seg.extend_from_slice(&trailer);
                 seg
             };
 
-            let draft = build(super::super::vsi_signing::build_segment_bmff_hash_placeholder().unwrap());
-            let real_hash = super::super::vsi_signing::build_segment_bmff_hash(&draft).unwrap();
+            let draft = build(
+                crate::live_video::vsi_signing::build_segment_bmff_hash_placeholder().unwrap(),
+            );
+            let real_hash =
+                crate::live_video::vsi_signing::build_segment_bmff_hash(&draft).unwrap();
             let signed = build(real_hash);
             assert_eq!(
                 draft.len(),
@@ -717,6 +818,9 @@ mod tests {
             let (signing_key, cose_key) = generate_test_key_pair();
             let ee_cert_der = test_ee_cert_der();
             let mut validator = LiveVideoValidator::new();
+            validator.init_track_id = Some(1);
+            validator.init_timescale = Some(1000);
+            validator.init_default_sample_duration = Some(1000);
             let mut tracker = StatusTracker::default();
             let keys = session_keys_with_cose_key(cose_key, &signing_key, &ee_cert_der);
             validator
@@ -733,8 +837,12 @@ mod tests {
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
 
-        let _ =
-            validator.validate_session_keys(&SessionKeys { keys: vec![] }, "", None, &mut tracker);
+        let _ = validator.validate_session_keys(
+            &SessionKeys { keys: vec![] },
+            "urn:c2pa:test-manifest",
+            None,
+            &mut tracker,
+        );
 
         assert!(tracker
             .logged_items()
@@ -753,7 +861,8 @@ mod tests {
                 ..minimal_session_keys().keys.remove(0)
             }],
         };
-        let _ = validator.validate_session_keys(&keys, "", None, &mut tracker);
+        let _ =
+            validator.validate_session_keys(&keys, "urn:c2pa:test-manifest", None, &mut tracker);
 
         assert!(tracker
             .logged_items()
@@ -777,7 +886,8 @@ mod tests {
                 ..minimal_session_keys().keys.remove(0)
             }],
         };
-        let _ = validator.validate_session_keys(&keys, "", None, &mut tracker);
+        let _ =
+            validator.validate_session_keys(&keys, "urn:c2pa:test-manifest", None, &mut tracker);
 
         assert!(tracker
             .logged_items()
@@ -794,7 +904,12 @@ mod tests {
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
 
-        let _ = validator.validate_session_keys(&minimal_session_keys(), "", None, &mut tracker);
+        let _ = validator.validate_session_keys(
+            &minimal_session_keys(),
+            "urn:c2pa:test-manifest",
+            None,
+            &mut tracker,
+        );
 
         assert!(tracker
             .logged_items()
@@ -882,8 +997,9 @@ mod tests {
     #[cfg(feature = "rust_native_crypto")]
     #[test]
     fn vsi_regressed_sequence_number_fails() {
-        use crate::validation_results::validation_codes::LIVEVIDEO_ASSERTION_INVALID;
         use vsi_crypto_helpers::*;
+
+        use crate::validation_results::validation_codes::LIVEVIDEO_ASSERTION_INVALID;
         let (mut validator, signing_key) = setup_vsi_validator();
         let mut tracker = aggregate_tracker();
 
@@ -1013,6 +1129,7 @@ mod tests {
         let mut map = std::collections::BTreeMap::new();
         map.insert(cbor_int(1), cbor_int(1)); // kty: OKP
         map.insert(cbor_int(2), c2pa_cbor::Value::Bytes(kid.to_vec())); // kid
+        map.insert(cbor_int(3), cbor_int(-8)); // alg: EdDSA
         map.insert(cbor_int(-1), cbor_int(6)); // crv: Ed25519
         map.insert(
             cbor_int(-2),
@@ -1071,7 +1188,12 @@ mod tests {
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
         validator
-            .validate_session_keys(&keys, "", Some(&ee_cert_der), &mut tracker)
+            .validate_session_keys(
+                &keys,
+                "urn:c2pa:test-manifest",
+                Some(&ee_cert_der),
+                &mut tracker,
+            )
             .unwrap();
 
         assert!(!tracker.logged_items().iter().any(|i| {
@@ -1098,7 +1220,12 @@ mod tests {
 
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
-        let _ = validator.validate_session_keys(&keys, "", Some(&ee_cert_der), &mut tracker);
+        let _ = validator.validate_session_keys(
+            &keys,
+            "urn:c2pa:test-manifest",
+            Some(&ee_cert_der),
+            &mut tracker,
+        );
 
         assert!(tracker
             .logged_items()
@@ -1113,11 +1240,12 @@ mod tests {
     fn signer_binding_none_cert_fails_closed() {
         let session_key = generate_ed25519_session_key();
         let cose_key = build_ed25519_cose_key_value(&session_key.verifying_key(), b"k");
-        let keys = session_key_with_ed25519_binding(cose_key, vec![0xDE, 0xAD]);
+        let keys = session_key_with_ed25519_binding(cose_key, vec![0xde, 0xad]);
 
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
-        let _ = validator.validate_session_keys(&keys, "", None, &mut tracker);
+        let _ =
+            validator.validate_session_keys(&keys, "urn:c2pa:test-manifest", None, &mut tracker);
 
         assert!(tracker
             .logged_items()
@@ -1147,7 +1275,12 @@ mod tests {
 
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
-        let _ = validator.validate_session_keys(&keys, "", Some(&other_ee_cert), &mut tracker);
+        let _ = validator.validate_session_keys(
+            &keys,
+            "urn:c2pa:test-manifest",
+            Some(&other_ee_cert),
+            &mut tracker,
+        );
 
         assert!(tracker
             .logged_items()
@@ -1174,7 +1307,12 @@ mod tests {
 
         let mut validator = LiveVideoValidator::new();
         let mut tracker = aggregate_tracker();
-        let _ = validator.validate_session_keys(&keys, "", Some(&ee_cert_der), &mut tracker);
+        let _ = validator.validate_session_keys(
+            &keys,
+            "urn:c2pa:test-manifest",
+            Some(&ee_cert_der),
+            &mut tracker,
+        );
 
         assert!(
             validator.session_keys.is_empty(),
@@ -1196,7 +1334,7 @@ mod tests {
             "binding bytes should not be empty"
         );
         assert_eq!(
-            binding_bytes[0], 0xD2,
+            binding_bytes[0], 0xd2,
             "signerBinding must start with CBOR tag 18 (0xD2), got 0x{:02X}",
             binding_bytes[0]
         );

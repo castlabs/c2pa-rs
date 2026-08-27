@@ -598,6 +598,7 @@ dependencies = [
  "non-empty-string",
  "nonempty-collections",
  "openssl",
+ "p256",
  "pem",
  "pkcs8",
  "png_pong",
@@ -654,6 +655,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

@@ -28,6 +28,7 @@ use crate::SigningAlg;
 // COSE_Key common parameter labels (RFC 9052 §7.1).
 const KTY: i128 = 1;
 const KID: i128 = 2;
+const ALG: i128 = 3;
 
 // COSE_Key type values.
 const KTY_EC2: i128 = 2;
@@ -79,7 +80,7 @@ pub(crate) fn signing_alg_from_cose_key(cose_key: &CborValue) -> Option<SigningA
     let map = as_cbor_int_map(cose_key)?;
     let kty = cbor_to_i128(map.get(&KTY)?)?;
 
-    match kty {
+    let inferred = match kty {
         KTY_EC2 => {
             let crv = cbor_to_i128(map.get(&EC2_CRV)?)?;
             match crv {
@@ -97,7 +98,18 @@ pub(crate) fn signing_alg_from_cose_key(cose_key: &CborValue) -> Option<SigningA
             }
         }
         _ => None,
-    }
+    }?;
+    let Some(declared_value) = map.get(&ALG) else {
+        return Some(inferred);
+    };
+    let declared = match cbor_to_i128(declared_value)? {
+        -7 => SigningAlg::Es256,
+        -35 => SigningAlg::Es384,
+        -36 => SigningAlg::Es512,
+        -8 => SigningAlg::Ed25519,
+        _ => return None,
+    };
+    (declared == inferred).then_some(inferred)
 }
 
 /// Converts a COSE_Key (CBOR Value) to a DER-encoded SubjectPublicKeyInfo byte vector.
@@ -141,12 +153,15 @@ fn ec2_to_der(map: &BTreeMap<i128, &CborValue>) -> Option<Vec<u8>> {
     let x = cbor_as_bytes(map.get(&EC2_X)?)?;
     let y = cbor_as_bytes(map.get(&EC2_Y)?)?;
 
-    let curve_oid = match crv {
-        CRV_P256 => P256_OID,
-        CRV_P384 => P384_OID,
-        CRV_P521 => P521_OID,
+    let (curve_oid, coordinate_len) = match crv {
+        CRV_P256 => (P256_OID, 32),
+        CRV_P384 => (P384_OID, 48),
+        CRV_P521 => (P521_OID, 66),
         _ => return None,
     };
+    if x.len() != coordinate_len || y.len() != coordinate_len {
+        return None;
+    }
 
     // Build SEC1 uncompressed point: 0x04 || x || y
     let mut point = Vec::with_capacity(1 + x.len() + y.len());
@@ -174,6 +189,9 @@ fn okp_to_der(map: &BTreeMap<i128, &CborValue>) -> Option<Vec<u8>> {
     }
 
     let x = cbor_as_bytes(map.get(&OKP_X)?)?;
+    if x.len() != 32 {
+        return None;
+    }
 
     // Build DER SubjectPublicKeyInfo:
     //   SEQUENCE {
@@ -195,7 +213,7 @@ fn der_length(len: usize) -> Vec<u8> {
     } else if len < 256 {
         vec![0x81, len as u8]
     } else {
-        vec![0x82, (len >> 8) as u8, (len & 0xFF) as u8]
+        vec![0x82, (len >> 8) as u8, (len & 0xff) as u8]
     }
 }
 
@@ -282,6 +300,13 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert(cbor_int(KTY as i64), cbor_int(KTY_EC2 as i64));
         map.insert(cbor_int(KID as i64), CborValue::Bytes(kid.to_vec()));
+        let alg = match crv {
+            1 => -7,
+            2 => -35,
+            3 => -36,
+            _ => 0,
+        };
+        map.insert(cbor_int(ALG as i64), cbor_int(alg));
         map.insert(cbor_int(EC2_CRV as i64), cbor_int(crv));
         map.insert(cbor_int(EC2_X as i64), CborValue::Bytes(x.to_vec()));
         map.insert(cbor_int(EC2_Y as i64), CborValue::Bytes(y.to_vec()));
@@ -314,8 +339,8 @@ mod tests {
 
     #[test]
     fn ec2_p256_to_der_produces_valid_spki() {
-        let x = [0xAA; 32];
-        let y = [0xBB; 32];
+        let x = [0xaa; 32];
+        let y = [0xbb; 32];
         let key = make_ec2_cose_key(CRV_P256 as i64, &x, &y, b"test-kid");
 
         let der = cose_key_to_der(&key).unwrap();
@@ -342,9 +367,10 @@ mod tests {
 
     #[test]
     fn ed25519_to_der_produces_valid_spki() {
-        let x = [0xCC; 32];
+        let x = [0xcc; 32];
         let mut map = BTreeMap::new();
         map.insert(cbor_int(KTY as i64), cbor_int(KTY_OKP as i64));
+        map.insert(cbor_int(ALG as i64), cbor_int(-8));
         map.insert(cbor_int(OKP_CRV as i64), cbor_int(CRV_ED25519 as i64));
         map.insert(cbor_int(OKP_X as i64), CborValue::Bytes(x.to_vec()));
         let key = CborValue::Map(map);
@@ -373,6 +399,21 @@ mod tests {
         // Missing crv, x, y
         let key = CborValue::Map(map);
 
+        assert!(cose_key_to_der(&key).is_none());
+    }
+
+    #[test]
+    fn mismatched_declared_algorithm_returns_none() {
+        let mut key = make_ec2_cose_key(CRV_P256 as i64, &[1; 32], &[2; 32], b"k");
+        if let CborValue::Map(map) = &mut key {
+            map.insert(cbor_int(ALG as i64), cbor_int(-8));
+        }
+        assert!(signing_alg_from_cose_key(&key).is_none());
+    }
+
+    #[test]
+    fn malformed_public_key_lengths_return_none() {
+        let key = make_ec2_cose_key(CRV_P256 as i64, &[1; 31], &[2; 32], b"k");
         assert!(cose_key_to_der(&key).is_none());
     }
 }

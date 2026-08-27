@@ -45,11 +45,55 @@ pub struct SegmentInfoMap {
     pub manifest_uri: Option<HashedUri>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VsiEmsg {
+    pub message_data: Vec<u8>,
+    pub timescale: u32,
+    pub presentation_time_delta: u32,
+    pub event_duration: u32,
+    pub id: u32,
+}
+
 /// Returns the `COSE_Sign1_Tagged` bytes from the VSI `emsg` box in `segment_data`, if present.
 pub fn extract_vsi_payload_from_segment(segment_data: &[u8]) -> Option<Vec<u8>> {
+    extract_vsi_emsg_from_segment(segment_data)
+        .ok()
+        .flatten()
+        .map(|event| event.message_data)
+}
+
+pub(crate) fn extract_vsi_emsg_from_segment(segment_data: &[u8]) -> Result<Option<VsiEmsg>> {
+    let candidates: Vec<_> = find_emsg_boxes(segment_data)
+        .into_iter()
+        .filter(|emsg| is_vsi_exclusion_candidate(emsg))
+        .collect();
+    if candidates.len() > 1 {
+        return Err(Error::BadParam(
+            "segment contains multiple C2PA VSI emsg candidates".to_string(),
+        ));
+    }
+    let Some(candidate) = candidates.first() else {
+        return Ok(None);
+    };
+    extract_vsi_from_emsg_box(candidate)
+        .map(Some)
+        .ok_or_else(|| {
+            Error::BadParam("segment contains a malformed C2PA VSI emsg candidate".to_string())
+        })
+}
+
+pub(super) fn contains_c2pa_vsi_scheme(segment_data: &[u8]) -> bool {
     find_emsg_boxes(segment_data)
         .into_iter()
-        .find_map(|emsg_box| extract_vsi_from_emsg_box(&emsg_box))
+        .any(is_vsi_exclusion_candidate)
+}
+
+fn is_vsi_exclusion_candidate(emsg_box: &[u8]) -> bool {
+    let offset = usize::try_from(VSI_URI_OFFSET_IN_EMSG).ok();
+    offset.is_some_and(|start| {
+        emsg_box.get(start..start.saturating_add(VSI_SCHEME_ID_URI.len()))
+            == Some(VSI_SCHEME_ID_URI.as_bytes())
+    })
 }
 
 /// Result of parsing a VSI COSE_Sign1_Tagged: the decoded map and the raw COSE structure.
@@ -85,7 +129,7 @@ pub fn parse_segment_info_map(cose_sign1_bytes: &[u8]) -> Result<SegmentInfoMap>
     parse_vsi(cose_sign1_bytes).map(|p| p.segment_info_map)
 }
 
-fn find_emsg_boxes(segment_data: &[u8]) -> Vec<Vec<u8>> {
+fn find_emsg_boxes(segment_data: &[u8]) -> Vec<&[u8]> {
     const EMSG_BOX_TYPE: &[u8; 4] = b"emsg";
 
     let mut cursor = Cursor::new(segment_data);
@@ -102,17 +146,24 @@ fn find_emsg_boxes(segment_data: &[u8]) -> Vec<Vec<u8>> {
         let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
         let box_type = &header[4..8];
 
-        let box_size = if size == 1 {
+        let (header_len, box_size) = if size == 1 {
             let mut large = [0u8; 8];
             if cursor.read_exact(&mut large).is_err() {
                 break;
             }
-            u64::from_be_bytes(large) as usize
+            let Ok(size) = usize::try_from(u64::from_be_bytes(large)) else {
+                break;
+            };
+            (16, size)
         } else if size == 0 {
-            segment_data.len() - box_start
+            (8, segment_data.len() - box_start)
         } else {
-            size as usize
+            (8, size as usize)
         };
+
+        if box_size < header_len {
+            break;
+        }
 
         let Some(box_end) = box_start.checked_add(box_size) else {
             break;
@@ -122,7 +173,7 @@ fn find_emsg_boxes(segment_data: &[u8]) -> Vec<Vec<u8>> {
         }
 
         if box_type == EMSG_BOX_TYPE {
-            emsg_boxes.push(segment_data[box_start..box_end].to_vec());
+            emsg_boxes.push(&segment_data[box_start..box_end]);
         }
 
         cursor.set_position(box_end as u64);
@@ -134,11 +185,15 @@ fn find_emsg_boxes(segment_data: &[u8]) -> Vec<Vec<u8>> {
     emsg_boxes
 }
 
-fn extract_vsi_from_emsg_box(emsg_box: &[u8]) -> Option<Vec<u8>> {
+fn extract_vsi_from_emsg_box(emsg_box: &[u8]) -> Option<VsiEmsg> {
     let mut cursor = Cursor::new(emsg_box);
 
-    // Skip box header (8 bytes: size + type).
-    cursor.set_position(8);
+    let size = u32::from_be_bytes(emsg_box.get(..4)?.try_into().ok()?);
+    let header_len = if size == 1 { 16 } else { 8 };
+    if emsg_box.len() < header_len {
+        return None;
+    }
+    cursor.set_position(header_len as u64);
 
     // version (1 byte) + flags (3 bytes).
     let mut version_flags = [0u8; 4];
@@ -146,25 +201,40 @@ fn extract_vsi_from_emsg_box(emsg_box: &[u8]) -> Option<Vec<u8>> {
     let version = version_flags[0];
 
     // C2PA spec requires emsg version 0 (SHALL be version 0).
-    if version != 0 {
+    if version != 0 || version_flags[1..] != [0, 0, 0] {
         return None;
     }
 
-    let (scheme_id_uri, value, message_data) = parse_emsg_v0_body(&mut cursor)?;
+    let (scheme_id_uri, value, event) = parse_emsg_v0_body(&mut cursor)?;
 
     if scheme_id_uri != VSI_SCHEME_ID_URI || value != VSI_VALUE_FSEG {
         return None;
     }
 
-    Some(message_data)
+    Some(event)
 }
 
-fn parse_emsg_v0_body(cursor: &mut Cursor<&[u8]>) -> Option<(String, String, Vec<u8>)> {
+fn parse_emsg_v0_body(cursor: &mut Cursor<&[u8]>) -> Option<(String, String, VsiEmsg)> {
     let scheme_id_uri = read_null_terminated_string(cursor)?;
     let value = read_null_terminated_string(cursor)?;
-    skip_bytes(cursor, 16)?; // timescale + presentation_time_delta + event_duration + id
-    let message_data = read_remaining(cursor);
-    Some((scheme_id_uri, value, message_data))
+    let timescale = read_u32(cursor)?;
+    let presentation_time_delta = read_u32(cursor)?;
+    let event_duration = read_u32(cursor)?;
+    let id = read_u32(cursor)?;
+    let event = VsiEmsg {
+        message_data: read_remaining(cursor),
+        timescale,
+        presentation_time_delta,
+        event_duration,
+        id,
+    };
+    Some((scheme_id_uri, value, event))
+}
+
+fn read_u32(cursor: &mut Cursor<&[u8]>) -> Option<u32> {
+    let mut value = [0u8; 4];
+    cursor.read_exact(&mut value).ok()?;
+    Some(u32::from_be_bytes(value))
 }
 
 fn read_null_terminated_string(cursor: &mut Cursor<&[u8]>) -> Option<String> {
@@ -178,11 +248,6 @@ fn read_null_terminated_string(cursor: &mut Cursor<&[u8]>) -> Option<String> {
         bytes.push(byte[0]);
     }
     String::from_utf8(bytes).ok()
-}
-
-fn skip_bytes(cursor: &mut Cursor<&[u8]>, count: u64) -> Option<()> {
-    cursor.set_position(cursor.position() + count);
-    Some(())
 }
 
 fn read_remaining(cursor: &mut Cursor<&[u8]>) -> Vec<u8> {
@@ -288,5 +353,35 @@ mod tests {
 
         let extracted = extract_vsi_payload_from_segment(&segment).unwrap();
         assert_eq!(extracted, payload);
+    }
+
+    #[test]
+    fn rejects_duplicate_vsi_emsg_boxes() {
+        let first = make_emsg_v0(VSI_SCHEME_ID_URI, VSI_VALUE_FSEG, b"one");
+        let second = make_emsg_v0(VSI_SCHEME_ID_URI, VSI_VALUE_FSEG, b"two");
+        assert!(extract_vsi_payload_from_segment(&[first, second].concat()).is_none());
+    }
+
+    #[test]
+    fn rejects_valid_plus_malformed_vsi_candidates() {
+        let valid = make_emsg_v0(VSI_SCHEME_ID_URI, VSI_VALUE_FSEG, b"one");
+        let mut malformed = make_emsg_v0(VSI_SCHEME_ID_URI, VSI_VALUE_FSEG, b"two");
+        malformed[9] = 1; // non-zero FullBox flags
+        let segment = [valid, malformed].concat();
+
+        assert!(extract_vsi_payload_from_segment(&segment).is_none());
+        assert!(extract_vsi_emsg_from_segment(&segment).is_err());
+    }
+
+    #[test]
+    fn malformed_large_size_boxes_do_not_loop_or_panic() {
+        let mut undersized = 1u32.to_be_bytes().to_vec();
+        undersized.extend_from_slice(b"emsg");
+        undersized.extend_from_slice(&8u64.to_be_bytes());
+        assert!(extract_vsi_payload_from_segment(&undersized).is_none());
+
+        let mut truncated = 1u32.to_be_bytes().to_vec();
+        truncated.extend_from_slice(b"emsg");
+        assert!(extract_vsi_payload_from_segment(&truncated).is_none());
     }
 }
