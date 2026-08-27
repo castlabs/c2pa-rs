@@ -18,8 +18,11 @@ use std::{
 
 // C has no namespace so we prefix things with C2PA to make them unique (as namespace)
 use c2pa::{
-    assertions::DataHash, create_signer, Builder as C2paBuilder, CallbackSigner, Context,
-    ProgressPhase, Reader as C2paReader, Settings as C2paSettings, SigningAlg,
+    assertions::DataHash,
+    create_signer,
+    dynamic_assertion::{DynamicAssertion, DynamicAssertionContent, PartialClaim},
+    Builder as C2paBuilder, CallbackSigner, Context, ProgressPhase, Reader as C2paReader,
+    Settings as C2paSettings, Signer, SigningAlg,
 };
 
 #[cfg(test)]
@@ -257,6 +260,7 @@ pub enum C2paHashType {
 #[repr(C)]
 pub struct C2paSigner {
     pub signer: Box<dyn crate::maybe_send_sync::C2paSignerObject>,
+    dynamic_assertions: Vec<FfiDynamicAssertionParams>,
 }
 
 /// Defines a callback to read from a stream.
@@ -270,6 +274,164 @@ pub type SignerCallback = unsafe extern "C" fn(
     signed_bytes: *mut c_uchar,
     signed_len: usize,
 ) -> isize;
+
+/// Callback type for dynamic assertion content generation.
+///
+/// The callback receives the resolved assertion label, reserved output size,
+/// and a JSON array of partial-claim entries. Each entry contains `url`, `alg`,
+/// and a standard-base64 `hash`. It writes CBOR assertion content to `out_data`
+/// and returns the number of bytes written, or a negative value on error.
+pub type DynamicAssertionCallback = unsafe extern "C" fn(
+    context: *const c_void,
+    label: *const c_char,
+    reserve_size: usize,
+    partial_claim_json: *const c_char,
+    out_data: *mut c_uchar,
+    out_data_max_len: usize,
+) -> isize;
+
+struct FfiDynamicAssertion {
+    params: FfiDynamicAssertionParams,
+}
+
+impl DynamicAssertion for FfiDynamicAssertion {
+    fn label(&self) -> String {
+        self.params.label.clone()
+    }
+
+    fn reserve_size(&self) -> c2pa::Result<usize> {
+        Ok(self.params.reserve_size)
+    }
+
+    fn content(
+        &self,
+        label: &str,
+        size: Option<usize>,
+        claim: &PartialClaim,
+    ) -> c2pa::Result<DynamicAssertionContent> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let partial_claim: Vec<serde_json::Value> = claim
+            .assertions()
+            .map(|assertion| {
+                serde_json::json!({
+                    "url": assertion.url(),
+                    "alg": assertion.alg().unwrap_or_default(),
+                    "hash": STANDARD.encode(assertion.hash()),
+                })
+            })
+            .collect();
+        let partial_claim_json = serde_json::to_string(&partial_claim)
+            .map_err(|err| c2pa::Error::OtherError(Box::new(err)))?;
+        let label =
+            std::ffi::CString::new(label).map_err(|err| c2pa::Error::OtherError(Box::new(err)))?;
+        let partial_claim_json = std::ffi::CString::new(partial_claim_json)
+            .map_err(|err| c2pa::Error::OtherError(Box::new(err)))?;
+
+        let output_capacity = size.unwrap_or(self.params.reserve_size);
+        let mut output = vec![0u8; output_capacity];
+        let output_ptr = if output.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            output.as_mut_ptr()
+        };
+        let written = unsafe {
+            (self.params.callback)(
+                self.params.context as *const c_void,
+                label.as_ptr(),
+                output_capacity,
+                partial_claim_json.as_ptr(),
+                output_ptr,
+                output_capacity,
+            )
+        };
+
+        if written < 0 {
+            return Err(c2pa::Error::BadParam(format!(
+                "dynamic assertion callback for '{}' returned error code {written}",
+                self.params.label
+            )));
+        }
+        let written = written as usize;
+        if written > output_capacity {
+            return Err(c2pa::Error::BadParam(format!(
+                "dynamic assertion callback for '{}' reported {written} bytes, exceeding output capacity {output_capacity}",
+                self.params.label
+            )));
+        }
+
+        output.truncate(written);
+        Ok(DynamicAssertionContent::Cbor(output))
+    }
+}
+
+#[derive(Clone)]
+struct FfiDynamicAssertionParams {
+    label: String,
+    reserve_size: usize,
+    context: usize,
+    callback: DynamicAssertionCallback,
+}
+
+impl FfiDynamicAssertionParams {
+    fn to_assertion(&self) -> Box<dyn DynamicAssertion> {
+        Box::new(FfiDynamicAssertion {
+            params: self.clone(),
+        })
+    }
+}
+
+impl Signer for C2paSigner {
+    fn sign(&self, data: &[u8]) -> c2pa::Result<Vec<u8>> {
+        self.signer.sign(data)
+    }
+
+    fn alg(&self) -> SigningAlg {
+        self.signer.alg()
+    }
+
+    fn certs(&self) -> c2pa::Result<Vec<Vec<u8>>> {
+        self.signer.certs()
+    }
+
+    fn reserve_size(&self) -> usize {
+        self.signer.reserve_size()
+    }
+
+    fn time_authority_url(&self) -> Option<String> {
+        self.signer.time_authority_url()
+    }
+
+    fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
+        self.signer.timestamp_request_headers()
+    }
+
+    fn timestamp_request_body(&self, message: &[u8]) -> c2pa::Result<Vec<u8>> {
+        self.signer.timestamp_request_body(message)
+    }
+
+    fn send_timestamp_request(&self, message: &[u8]) -> Option<c2pa::Result<Vec<u8>>> {
+        self.signer.send_timestamp_request(message)
+    }
+
+    fn ocsp_val(&self) -> Option<Vec<u8>> {
+        self.signer.ocsp_val()
+    }
+
+    fn direct_cose_handling(&self) -> bool {
+        self.signer.direct_cose_handling()
+    }
+
+    fn dynamic_assertions(&self) -> Vec<Box<dyn DynamicAssertion>> {
+        let mut assertions = self.signer.dynamic_assertions();
+        assertions.extend(
+            self.dynamic_assertions
+                .iter()
+                .map(FfiDynamicAssertionParams::to_assertion),
+        );
+        assertions
+    }
+}
 
 /// HTTP request passed to the resolver callback.
 ///
@@ -730,7 +892,7 @@ pub unsafe extern "C" fn c2pa_context_builder_set_signer(
     // Untrack the signer before taking ownership.
     // This prevents double-free if C code later calls c2pa_signer_free().
     let c2pa_signer = untrack_or_return_int!(signer_ptr, C2paSigner);
-    let result = builder.set_signer(c2pa_signer.signer);
+    let result = builder.set_signer(c2pa_signer);
     ok_or_return_int!(result);
     0
 }
@@ -2003,12 +2165,7 @@ pub unsafe extern "C" fn c2pa_builder_sign(
     let c2pa_signer = deref_mut_or_return_int!(signer_ptr, C2paSigner);
     ptr_or_return_int!(manifest_bytes_ptr);
 
-    let result = builder.sign(
-        c2pa_signer.signer.as_ref(),
-        &format,
-        &mut *source,
-        &mut *dest,
-    );
+    let result = builder.sign(c2pa_signer, &format, &mut *source, &mut *dest);
     let manifest_bytes = ok_or_return_int!(result);
     let len = manifest_bytes.len() as i64;
     if !manifest_bytes_ptr.is_null() {
@@ -2159,8 +2316,7 @@ pub unsafe extern "C" fn c2pa_builder_sign_data_hashed_embeddable(
             .map_err(Error::from_c2pa_error));
     }
 
-    let result =
-        builder.sign_data_hashed_embeddable(c2pa_signer.signer.as_ref(), &data_hash, &format);
+    let result = builder.sign_data_hashed_embeddable(c2pa_signer, &data_hash, &format);
 
     let manifest_bytes = ok_or_return_int!(result);
     let len = manifest_bytes.len() as i64;
@@ -2559,11 +2715,23 @@ pub unsafe extern "C" fn c2pa_format_embeddable(
 #[no_mangle]
 pub unsafe extern "C" fn c2pa_signer_create(
     context: *const c_void,
-    callback: SignerCallback,
+    callback: Option<
+        unsafe extern "C" fn(
+            context: *const (),
+            data: *const c_uchar,
+            len: usize,
+            signed_bytes: *mut c_uchar,
+            signed_len: usize,
+        ) -> isize,
+    >,
     alg: C2paSigningAlg,
     certs: *const c_char,
     tsa_url: *const c_char,
 ) -> *mut C2paSigner {
+    let Some(callback) = callback else {
+        CimplError::null_parameter("callback").set_last();
+        return std::ptr::null_mut();
+    };
     let certs = cstr_or_return_null!(certs);
     let tsa_url = cstr_option!(tsa_url);
     let context = context as *const ();
@@ -2573,7 +2741,9 @@ pub unsafe extern "C" fn c2pa_signer_create(
     // the context set on the CallbackSigner closure
     let c_callback = move |context: *const (), data: &[u8]| {
         // we need to guess at a max signed size, the callback must verify this is big enough or fail.
-        let signed_len_max = data.len() * 2;
+        let signed_len_max = data.len().checked_mul(2).ok_or_else(|| {
+            c2pa::Error::BadParam("signer callback output capacity overflow".to_string())
+        })?;
         let mut signed_bytes: Vec<u8> = vec![0; signed_len_max];
         let signed_size = unsafe {
             (callback)(
@@ -2585,9 +2755,17 @@ pub unsafe extern "C" fn c2pa_signer_create(
             )
         };
         if signed_size < 0 {
-            return Err(c2pa::Error::CoseSignature); // todo:: return errors from callback
+            return Err(c2pa::Error::BadParam(format!(
+                "signer callback returned error code {signed_size}"
+            )));
         }
-        signed_bytes.set_len(signed_size as usize);
+        let signed_size = signed_size as usize;
+        if signed_size > signed_len_max {
+            return Err(c2pa::Error::BadParam(format!(
+                "signer callback reported {signed_size} bytes, exceeding output capacity {signed_len_max}"
+            )));
+        }
+        signed_bytes.truncate(signed_size);
         Ok(signed_bytes)
     };
 
@@ -2597,7 +2775,60 @@ pub unsafe extern "C" fn c2pa_signer_create(
     }
     box_tracked!(C2paSigner {
         signer: Box::new(signer),
+        dynamic_assertions: Vec::new(),
     })
+}
+
+/// Registers a dynamic assertion callback on a signer.
+///
+/// Registrations are retained by the signer in call order, including multiple
+/// registrations with the same label. If the signer is transferred to a
+/// [`C2paContext`] with [`c2pa_context_builder_set_signer`], the context retains
+/// the registrations with it.
+///
+/// The callback and the pointee addressed by `context` remain owned by the
+/// caller and must remain valid and safe to call for the lifetime of the signer
+/// or owning context. Callback input strings and the output buffer are valid
+/// only for the duration of each callback invocation. The callback must never
+/// write more than `out_data_max_len` bytes.
+///
+/// Returns 0 on success or -1 on error. Call [`c2pa_error`] for details.
+///
+/// # Safety
+/// `signer_ptr` must be a valid tracked signer, `label` must be a valid
+/// NULL-terminated UTF-8 string, and the callback/context lifetime contract
+/// described above must be upheld by the caller.
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_signer_add_dynamic_assertion(
+    signer_ptr: *mut C2paSigner,
+    context: *const c_void,
+    callback: Option<
+        unsafe extern "C" fn(
+            context: *const c_void,
+            label: *const c_char,
+            reserve_size: usize,
+            partial_claim_json: *const c_char,
+            out_data: *mut c_uchar,
+            out_data_max_len: usize,
+        ) -> isize,
+    >,
+    label: *const c_char,
+    reserve_size: usize,
+) -> c_int {
+    let signer = deref_mut_or_return_int!(signer_ptr, C2paSigner);
+    let Some(callback) = callback else {
+        CimplError::null_parameter("callback").set_last();
+        return -1;
+    };
+    let label = cstr_or_return_int!(label);
+
+    signer.dynamic_assertions.push(FfiDynamicAssertionParams {
+        label,
+        reserve_size,
+        context: context as usize,
+        callback,
+    });
+    0
 }
 
 /// Creates a C2paSigner that handles both C2PA claim signing and X.509 identity assertion signing
@@ -2657,14 +2888,15 @@ pub unsafe extern "C" fn c2pa_identity_signer_create(
     let role_refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
 
     let signer = create_signer::from_x509_identity(
-        Box::new(c2pa_signer.signer),
-        Box::new(identity_signer.signer),
+        Box::new(c2pa_signer),
+        Box::new(identity_signer),
         &refs,
         &role_refs,
     );
 
     box_tracked!(C2paSigner {
         signer: Box::new(signer),
+        dynamic_assertions: Vec::new(),
     })
 }
 
@@ -2703,6 +2935,7 @@ pub unsafe extern "C" fn c2pa_signer_from_info(signer_info: &C2paSignerInfo) -> 
     match signer {
         Ok(signer) => box_tracked!(C2paSigner {
             signer: Box::new(signer),
+            dynamic_assertions: Vec::new(),
         }),
         Err(err) => {
             CimplError::from(err).set_last();
@@ -2730,6 +2963,7 @@ pub unsafe extern "C" fn c2pa_signer_from_settings() -> *mut C2paSigner {
     let signer = ok_or_return_null!(C2paSettings::signer());
     box_tracked!(C2paSigner {
         signer: Box::new(signer),
+        dynamic_assertions: Vec::new(),
     })
 }
 
@@ -2835,7 +3069,12 @@ unsafe fn c2pa_mime_types_to_c_array(strs: Vec<String>, count: *mut usize) -> *c
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CString, io::Seek, panic::catch_unwind};
+    use std::{
+        ffi::{CStr, CString},
+        io::Seek,
+        panic::catch_unwind,
+        sync::Mutex,
+    };
 
     use super::*;
     use crate::TestStream;
@@ -2844,6 +3083,64 @@ mod tests {
         ($path:expr) => {
             concat!("../../sdk/tests/fixtures/", $path)
         };
+    }
+
+    #[derive(Debug)]
+    struct DynamicCallbackInvocation {
+        label: String,
+        reserve_size: usize,
+        partial_claim: serde_json::Value,
+    }
+
+    struct DynamicCallbackState {
+        value: u8,
+        invocations: Mutex<Vec<DynamicCallbackInvocation>>,
+    }
+
+    unsafe extern "C" fn dynamic_assertion_callback(
+        context: *const c_void,
+        label: *const c_char,
+        reserve_size: usize,
+        partial_claim_json: *const c_char,
+        out_data: *mut c_uchar,
+        out_data_max_len: usize,
+    ) -> isize {
+        if context.is_null()
+            || label.is_null()
+            || partial_claim_json.is_null()
+            || out_data.is_null()
+            || out_data_max_len < 64
+        {
+            return -1;
+        }
+
+        let state = &*(context as *const DynamicCallbackState);
+        let label = match CStr::from_ptr(label).to_str() {
+            Ok(label) => label.to_string(),
+            Err(_) => return -2,
+        };
+        let partial_claim = match CStr::from_ptr(partial_claim_json).to_str() {
+            Ok(json) => match serde_json::from_str(json) {
+                Ok(value) => value,
+                Err(_) => return -3,
+            },
+            Err(_) => return -4,
+        };
+
+        // A one-entry CBOR map whose encoded length is exactly 64 bytes.
+        let mut content = [state.value; 64];
+        content[..6].copy_from_slice(&[0xa1, 0x62, b'i', b'd', 0x78, 58]);
+        std::ptr::copy_nonoverlapping(content.as_ptr(), out_data, content.len());
+
+        match state.invocations.lock() {
+            Ok(mut invocations) => invocations.push(DynamicCallbackInvocation {
+                label,
+                reserve_size,
+                partial_claim,
+            }),
+            Err(_) => return -5,
+        }
+        content.len() as isize
     }
 
     /// Helper to create a signer and builder for testing
@@ -3658,7 +3955,7 @@ mod tests {
         let signer = unsafe {
             c2pa_signer_create(
                 std::ptr::null(),
-                test_callback,
+                Some(test_callback),
                 C2paSigningAlg::Ed25519,
                 certs_cstr.as_ptr(),
                 std::ptr::null(),
@@ -3744,7 +4041,7 @@ mod tests {
         let signer = unsafe {
             c2pa_signer_create(
                 std::ptr::null(), // context
-                test_callback,
+                Some(test_callback),
                 C2paSigningAlg::Ed25519,
                 certs_cstr.as_ptr(),
                 std::ptr::null(), // tsa_url
@@ -3807,6 +4104,285 @@ mod tests {
         }
         unsafe { c2pa_builder_free(builder) };
         unsafe { c2pa_signer_free(signer) };
+    }
+
+    #[test]
+    fn test_dynamic_assertion_callbacks_survive_context_transfer() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let source_image = include_bytes!(fixture_path!("IMG_0003.jpg"));
+        let mut source_stream = TestStream::new(source_image.to_vec());
+        let mut dest_stream = TestStream::new(Vec::new());
+        let (signer, unused_builder) = setup_signer_and_builder_for_signing_tests();
+        unsafe { c2pa_free(unused_builder as *mut c_void) };
+
+        let first_state = DynamicCallbackState {
+            value: b'a',
+            invocations: Mutex::new(Vec::new()),
+        };
+        let second_state = DynamicCallbackState {
+            value: b'b',
+            invocations: Mutex::new(Vec::new()),
+        };
+        let label = CString::new("com.example.dynamic").unwrap();
+
+        let first_result = unsafe {
+            c2pa_signer_add_dynamic_assertion(
+                signer,
+                &first_state as *const DynamicCallbackState as *const c_void,
+                Some(dynamic_assertion_callback),
+                label.as_ptr(),
+                64,
+            )
+        };
+        let second_result = unsafe {
+            c2pa_signer_add_dynamic_assertion(
+                signer,
+                &second_state as *const DynamicCallbackState as *const c_void,
+                Some(dynamic_assertion_callback),
+                label.as_ptr(),
+                64,
+            )
+        };
+        assert_eq!(first_result, 0);
+        assert_eq!(second_result, 0);
+
+        let context_builder = unsafe { c2pa_context_builder_new() };
+        assert!(!context_builder.is_null());
+        assert_eq!(
+            unsafe { c2pa_context_builder_set_signer(context_builder, signer) },
+            0
+        );
+        let context = unsafe { c2pa_context_builder_build(context_builder) };
+        assert!(!context.is_null());
+        let builder = unsafe { c2pa_builder_from_context(context) };
+        assert!(!builder.is_null());
+        assert_eq!(
+            unsafe {
+                c2pa_builder_set_intent(
+                    builder,
+                    C2paBuilderIntent::Create,
+                    C2paDigitalSourceType::Empty,
+                )
+            },
+            0
+        );
+
+        let format = CString::new("image/jpeg").unwrap();
+        let mut manifest_bytes_ptr = std::ptr::null();
+        let result = unsafe {
+            c2pa_builder_sign_context(
+                builder,
+                format.as_ptr(),
+                source_stream.as_ptr(),
+                dest_stream.as_ptr(),
+                &mut manifest_bytes_ptr,
+            )
+        };
+        assert!(
+            result > 0,
+            "signing failed: {:?}",
+            CimplError::last_message()
+        );
+
+        dest_stream.stream_mut().rewind().unwrap();
+        let reader = unsafe { c2pa_reader_from_context(context) };
+        assert!(!reader.is_null());
+        let reader =
+            unsafe { c2pa_reader_with_stream(reader, format.as_ptr(), dest_stream.as_ptr()) };
+        assert!(!reader.is_null());
+        let manifest = unsafe { &*reader }.active_manifest().unwrap();
+        let assertions: Vec<_> = manifest
+            .assertions()
+            .iter()
+            .filter(|assertion| assertion.label() == "com.example.dynamic")
+            .collect();
+        assert_eq!(assertions.len(), 2);
+        assert_eq!(assertions[0].value().unwrap()["id"], "a".repeat(58));
+        assert_eq!(assertions[1].value().unwrap()["id"], "b".repeat(58));
+
+        let first_invocations = first_state.invocations.lock().unwrap();
+        let second_invocations = second_state.invocations.lock().unwrap();
+        assert_eq!(first_invocations.len(), 1);
+        assert_eq!(second_invocations.len(), 1);
+        assert_eq!(first_invocations[0].label, "com.example.dynamic");
+        assert_eq!(second_invocations[0].label, "com.example.dynamic__1");
+        assert_eq!(first_invocations[0].reserve_size, 64);
+        assert_eq!(second_invocations[0].reserve_size, 64);
+
+        let first_partial_claim = first_invocations[0].partial_claim.as_array().unwrap();
+        assert!(!first_partial_claim.iter().any(|entry| entry["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/com.example.dynamic"))));
+
+        let second_partial_claim = second_invocations[0].partial_claim.as_array().unwrap();
+        let first_assertion = second_partial_claim
+            .iter()
+            .find(|entry| {
+                entry["url"]
+                    .as_str()
+                    .is_some_and(|url| url.ends_with("/com.example.dynamic"))
+            })
+            .expect("second callback should receive the first callback's assertion");
+        assert!(first_assertion["alg"].is_string());
+        assert_eq!(
+            STANDARD
+                .decode(first_assertion["hash"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            32
+        );
+        assert!(!second_partial_claim.iter().any(|entry| entry["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/com.example.dynamic__1"))));
+
+        unsafe {
+            c2pa_free(manifest_bytes_ptr as *mut c_void);
+            c2pa_free(reader as *mut c_void);
+            c2pa_free(builder as *mut c_void);
+            c2pa_free(context as *mut c_void);
+        }
+    }
+
+    #[test]
+    fn test_dynamic_assertion_callback_errors_and_bounds() {
+        unsafe extern "C" fn callback_error(
+            _context: *const c_void,
+            _label: *const c_char,
+            _reserve_size: usize,
+            _partial_claim_json: *const c_char,
+            _out_data: *mut c_uchar,
+            _out_data_max_len: usize,
+        ) -> isize {
+            -17
+        }
+
+        unsafe extern "C" fn callback_oversized(
+            _context: *const c_void,
+            _label: *const c_char,
+            _reserve_size: usize,
+            _partial_claim_json: *const c_char,
+            _out_data: *mut c_uchar,
+            out_data_max_len: usize,
+        ) -> isize {
+            (out_data_max_len + 1) as isize
+        }
+
+        let (signer, builder) = setup_signer_and_builder_for_signing_tests();
+        unsafe { c2pa_free(builder as *mut c_void) };
+        let error_label = CString::new("com.example.error").unwrap();
+        let oversized_label = CString::new("com.example.oversized").unwrap();
+        assert_eq!(
+            unsafe {
+                c2pa_signer_add_dynamic_assertion(
+                    signer,
+                    std::ptr::null(),
+                    Some(callback_error),
+                    error_label.as_ptr(),
+                    8,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                c2pa_signer_add_dynamic_assertion(
+                    signer,
+                    std::ptr::null(),
+                    Some(callback_oversized),
+                    oversized_label.as_ptr(),
+                    8,
+                )
+            },
+            0
+        );
+
+        let dynamic_assertions = unsafe { &*signer }.dynamic_assertions();
+        let error = dynamic_assertions[0]
+            .content("com.example.error", Some(8), &PartialClaim::default())
+            .err()
+            .expect("callback error should fail");
+        assert!(error.to_string().contains("error code -17"));
+        let error = dynamic_assertions[1]
+            .content("com.example.oversized", Some(8), &PartialClaim::default())
+            .err()
+            .expect("oversized callback result should fail");
+        assert!(error.to_string().contains("exceeding output capacity 8"));
+
+        assert_eq!(
+            unsafe {
+                c2pa_signer_add_dynamic_assertion(
+                    signer,
+                    std::ptr::null(),
+                    None,
+                    error_label.as_ptr(),
+                    8,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            CimplError::last_message().as_deref(),
+            Some("NullParameter: callback")
+        );
+        assert_eq!(
+            unsafe {
+                c2pa_signer_add_dynamic_assertion(
+                    signer,
+                    std::ptr::null(),
+                    Some(callback_error),
+                    std::ptr::null(),
+                    8,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            CimplError::last_message().as_deref(),
+            Some("NullParameter: label")
+        );
+        assert_eq!(
+            unsafe {
+                c2pa_signer_add_dynamic_assertion(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    Some(callback_error),
+                    error_label.as_ptr(),
+                    8,
+                )
+            },
+            -1
+        );
+
+        unsafe { c2pa_free(signer as *mut c_void) };
+    }
+
+    #[test]
+    fn test_signer_callback_rejects_oversized_result() {
+        unsafe extern "C" fn callback_oversized(
+            _context: *const (),
+            _data: *const c_uchar,
+            len: usize,
+            _signed_bytes: *mut c_uchar,
+            _signed_len: usize,
+        ) -> isize {
+            (len * 2 + 1) as isize
+        }
+
+        let certs = CString::new(include_str!(fixture_path!("certs/ed25519.pub"))).unwrap();
+        let signer = unsafe {
+            c2pa_signer_create(
+                std::ptr::null(),
+                Some(callback_oversized),
+                C2paSigningAlg::Ed25519,
+                certs.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!signer.is_null());
+        let error = unsafe { &*signer }.sign(b"test").unwrap_err();
+        assert!(error.to_string().contains("exceeding output capacity 8"));
+        unsafe { c2pa_free(signer as *mut c_void) };
     }
 
     #[test]

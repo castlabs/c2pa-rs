@@ -2329,23 +2329,9 @@ impl Store {
         // earlier call is what silently dropped identity assertions in issue #2055.
         let dynamic_assertions = signer.dynamic_assertions();
         if !dynamic_assertions.is_empty() {
-            // Every dynamic assertion needs a reserved placeholder slot to replace.
-            // Surface any that are missing with an actionable message instead of
-            // letting `write_dynamic_assertions` fail later with an opaque
-            // `Error::NotFound`.
-            let missing: Vec<String> = dynamic_assertions
-                .iter()
-                .map(|da| da.label())
-                .filter(|label| pc.assertion_hashed_uri_from_label(label).is_none())
-                .collect();
-
-            if !missing.is_empty() {
-                return Err(Error::BadParam(format!(
-                    "no placeholder slots were reserved for dynamic assertions [{}]; \
-                     call add_dynamic_assertion_placeholders() before signing",
-                    missing.join(", ")
-                )));
-            }
+            let preferred_labels: Vec<String> =
+                dynamic_assertions.iter().map(|da| da.label()).collect();
+            self.resolve_dynamic_assertion_labels(&preferred_labels)?;
 
             let mut preliminary_claim = PartialClaim::default();
             {
@@ -2578,7 +2564,13 @@ impl Store {
             let reserve_size = da.reserve_size()?;
             let data1 = c2pa_cbor::ser::to_vec_packed(&vec![0; reserve_size])?;
             let cbor_delta = data1.len() - reserve_size;
-            let da_data = c2pa_cbor::ser::to_vec_packed(&vec![0; reserve_size - cbor_delta])?;
+            let payload_size = reserve_size.checked_sub(cbor_delta).ok_or_else(|| {
+                Error::BadParam(format!(
+                    "dynamic assertion '{}' reserve size {reserve_size} is too small",
+                    da.label()
+                ))
+            })?;
+            let da_data = c2pa_cbor::ser::to_vec_packed(&vec![0; payload_size])?;
             assertions.push(UserCbor::new(&da.label(), da_data));
         }
 
@@ -2587,9 +2579,62 @@ impl Store {
         assertions.iter().map(|a| pc.add_assertion(a)).collect()
     }
 
+    /// Match dynamic assertions to their reserved slots in registration order.
+    ///
+    /// Placeholders are appended to the claim, so selecting the last requested
+    /// number of instances for each preferred label avoids consuming an earlier
+    /// static assertion with the same label.
+    fn resolve_dynamic_assertion_labels(&self, preferred_labels: &[String]) -> Result<Vec<String>> {
+        let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+        let mut requested_by_label = HashMap::<String, usize>::new();
+        for label in preferred_labels {
+            *requested_by_label.entry(label.clone()).or_default() += 1;
+        }
+
+        let mut available_by_label = HashMap::<String, Vec<String>>::new();
+        for assertion in pc.claim_assertion_store() {
+            let raw_label = assertion.label_raw();
+            if requested_by_label.contains_key(&raw_label) {
+                available_by_label
+                    .entry(raw_label)
+                    .or_default()
+                    .push(assertion.label());
+            }
+        }
+
+        let missing: Vec<String> = requested_by_label
+            .iter()
+            .filter(|(label, count)| {
+                available_by_label
+                    .get(*label)
+                    .is_none_or(|available| available.len() < **count)
+            })
+            .map(|(label, _)| label.clone())
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::BadParam(format!(
+                "no placeholder slots were reserved for dynamic assertions [{}]; \
+                 call add_dynamic_assertion_placeholders() before signing",
+                missing.join(", ")
+            )));
+        }
+
+        let mut assigned_by_label = HashMap::<String, usize>::new();
+        Ok(preferred_labels
+            .iter()
+            .map(|label| {
+                let available = &available_by_label[label];
+                let first_placeholder = available.len() - requested_by_label[label];
+                let assigned = assigned_by_label.entry(label.clone()).or_default();
+                let resolved = available[first_placeholder + *assigned].clone();
+                *assigned += 1;
+                resolved
+            })
+            .collect())
+    }
+
     /// Write the dynamic assertions to the manifest.
-    /// Note: This assumes each dynamic assertion label is unique (no instance suffixes).
-    /// Multiple dynamic assertions with different labels are supported.
+    /// Supports multiple assertions with the same preferred label.
     #[async_generic(async_signature(
         &mut self,
         dyn_assertions: &[Box<dyn AsyncDynamicAssertion>],
@@ -2605,40 +2650,51 @@ impl Store {
             return Ok(false);
         }
 
-        let mut final_assertions = Vec::new();
+        let preferred_labels: Vec<String> = dyn_assertions.iter().map(|da| da.label()).collect();
+        let resolved_labels = self.resolve_dynamic_assertion_labels(&preferred_labels)?;
 
-        for da in dyn_assertions.iter() {
-            // Use the dynamic assertion's label directly.
-            // This assumes each dynamic assertion label is unique (no instance suffixes needed).
-            let label = da.label();
+        for ((da, preferred_label), resolved_label) in dyn_assertions
+            .iter()
+            .zip(preferred_labels.iter())
+            .zip(resolved_labels.iter())
+        {
+            let own_url_suffix = format!("/{resolved_label}");
+            let mut callback_view = PartialClaim::default();
+            for assertion_uri in preliminary_claim.assertions() {
+                if !assertion_uri.url().ends_with(&own_url_suffix) {
+                    callback_view.add_assertion(assertion_uri);
+                }
+            }
 
             let da_size = da.reserve_size()?;
             let da_data = if _sync {
-                da.content(&label, Some(da_size), preliminary_claim)?
+                da.content(resolved_label, Some(da_size), &callback_view)?
             } else {
-                da.content(&label, Some(da_size), preliminary_claim).await?
+                da.content(resolved_label, Some(da_size), &callback_view)
+                    .await?
             };
 
-            match da_data {
+            let assertion = match da_data {
                 DynamicAssertionContent::Cbor(data) => {
-                    final_assertions.push(UserCbor::new(&label, data).to_assertion()?);
+                    UserCbor::new(preferred_label, data).to_assertion()?
                 }
                 DynamicAssertionContent::Json(data) => {
-                    final_assertions.push(User::new(&label, &data).to_assertion()?);
+                    User::new(preferred_label, &data).to_assertion()?
                 }
-                DynamicAssertionContent::Binary(format, data) => {
-                    //final_assertions.push(EmbeddedData::to_binary_assertion(&EmbeddedData::new(&label, format, data))?);
+                DynamicAssertionContent::Binary(_format, _data) => {
+                    continue;
                 }
+            };
+
+            let instance = labels::instance(resolved_label);
+            let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
+            pc.replace_assertion_by_instance(assertion, instance)?;
+
+            *preliminary_claim = PartialClaim::default();
+            for assertion_uri in pc.assertions() {
+                preliminary_claim.add_assertion(assertion_uri);
             }
         }
-
-        let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
-        for assertion in final_assertions {
-            pc.replace_assertion(assertion)?;
-        }
-
-        // clear the provenance claim data since the contents are now different
-        pc.clear_data();
 
         Ok(true)
     }
@@ -4367,14 +4423,14 @@ pub mod tests {
         io::{Read, Seek, SeekFrom, Write},
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc,
+            Arc, Mutex,
         },
     };
 
     use c2pa_macros::c2pa_test_async;
     #[cfg(feature = "file_io")]
     use memchr::memmem;
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
     #[cfg(feature = "file_io")]
     use sha2::Sha256;
     #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
@@ -8527,6 +8583,116 @@ pub mod tests {
 
         assert!(!report.has_any_error());
         // std::fs::write("target/test.jpg", result).unwrap();
+    }
+
+    #[test]
+    fn test_same_label_dynamic_assertions_refresh_and_exclude_self() {
+        #[derive(Clone, Debug, Deserialize, Serialize)]
+        struct TestAssertion {
+            id: u8,
+        }
+
+        type Observation = (u8, String, Vec<(String, Vec<u8>)>);
+
+        struct RecordingDynamicAssertion {
+            id: u8,
+            observations: Arc<Mutex<Vec<Observation>>>,
+        }
+
+        impl DynamicAssertion for RecordingDynamicAssertion {
+            fn label(&self) -> String {
+                "cawg.identity".to_string()
+            }
+
+            fn reserve_size(&self) -> Result<usize> {
+                Ok(c2pa_cbor::to_vec(&TestAssertion { id: self.id })?.len())
+            }
+
+            fn content(
+                &self,
+                label: &str,
+                _size: Option<usize>,
+                claim: &PartialClaim,
+            ) -> Result<DynamicAssertionContent> {
+                let assertions = claim
+                    .assertions()
+                    .map(|uri| (uri.url(), uri.hash()))
+                    .collect();
+                self.observations
+                    .lock()
+                    .unwrap()
+                    .push((self.id, label.to_string(), assertions));
+                Ok(DynamicAssertionContent::Cbor(c2pa_cbor::to_vec(
+                    &TestAssertion { id: self.id },
+                )?))
+            }
+        }
+
+        let context = Context::new();
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let dynamic_assertions: Vec<Box<dyn DynamicAssertion>> = vec![
+            Box::new(RecordingDynamicAssertion {
+                id: 1,
+                observations: Arc::clone(&observations),
+            }),
+            Box::new(RecordingDynamicAssertion {
+                id: 2,
+                observations: Arc::clone(&observations),
+            }),
+        ];
+        store
+            .add_dynamic_assertion_placeholders(&dynamic_assertions)
+            .unwrap();
+
+        let mut preliminary_claim = PartialClaim::default();
+        for assertion in store.provenance_claim().unwrap().assertions() {
+            preliminary_claim.add_assertion(assertion);
+        }
+        store
+            .write_dynamic_assertions(&dynamic_assertions, &mut preliminary_claim)
+            .unwrap();
+
+        let claim = store.provenance_claim().unwrap();
+        let identity_assertions: Vec<_> = claim
+            .claim_assertion_store()
+            .iter()
+            .filter(|assertion| assertion.label_raw() == "cawg.identity")
+            .collect();
+        assert_eq!(identity_assertions.len(), 2);
+        assert_eq!(identity_assertions[0].label(), "cawg.identity");
+        assert_eq!(identity_assertions[1].label(), "cawg.identity__1");
+
+        let first: TestAssertion =
+            c2pa_cbor::from_slice(identity_assertions[0].assertion().data()).unwrap();
+        let second: TestAssertion =
+            c2pa_cbor::from_slice(identity_assertions[1].assertion().data()).unwrap();
+        assert_eq!(first.id, 1);
+        assert_eq!(second.id, 2);
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].0, 1);
+        assert_eq!(observations[0].1, "cawg.identity");
+        assert_eq!(observations[1].0, 2);
+        assert_eq!(observations[1].1, "cawg.identity__1");
+
+        assert!(!observations[0]
+            .2
+            .iter()
+            .any(|(url, _)| url.ends_with("/cawg.identity")));
+        let first_seen_by_second = observations[1]
+            .2
+            .iter()
+            .find(|(url, _)| url.ends_with("/cawg.identity"))
+            .expect("second callback should see the first assertion");
+        assert_eq!(first_seen_by_second.1, identity_assertions[0].hash());
+        assert!(!observations[1]
+            .2
+            .iter()
+            .any(|(url, _)| url.ends_with("/cawg.identity__1")));
     }
 
     #[c2pa_test_async]

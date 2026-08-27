@@ -1825,6 +1825,19 @@ impl Claim {
         )
     }
 
+    /// Replace one instance of an assertion without affecting sibling instances.
+    pub(crate) fn replace_assertion_by_instance(
+        &mut self,
+        replace_with: Assertion,
+        instance: usize,
+    ) -> Result<()> {
+        self.update_assertion(
+            replace_with,
+            |ca: &ClaimAssertion| ca.instance() == instance,
+            |_: &ClaimAssertion, a: Assertion| Ok(a),
+        )
+    }
+
     /// Redact an assertion from a given claim.
     /// This will remove the assertion from the JUMBF.
     fn redact_assertion(&mut self, assertion_uri: &str) -> Result<()> {

@@ -291,6 +291,7 @@ impl Signer for CawgX509IdentitySigner {
     }
 
     fn dynamic_assertions(&self) -> Vec<Box<dyn DynamicAssertion>> {
+        let mut assertions = self.c2pa_signer.dynamic_assertions();
         let identity_signer: Box<dyn RawSigner + Sync + Send + 'static> =
             Box::new(ArcRawSigner(Arc::clone(&self.identity_signer)));
         let x509_credential_holder = X509CredentialHolder::from_raw_signer(
@@ -314,7 +315,8 @@ impl Signer for CawgX509IdentitySigner {
             iab.add_roles(&roles);
         }
 
-        vec![Box::new(iab)]
+        assertions.push(Box::new(iab));
+        assertions
     }
 }
 

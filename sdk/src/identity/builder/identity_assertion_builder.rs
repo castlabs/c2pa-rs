@@ -24,6 +24,14 @@ use crate::{
     identity::{builder::AsyncCredentialHolder, IdentityAssertion, SignerPayload},
 };
 
+fn referenced_label_matches(referenced_assertions: &HashSet<String>, label: &str) -> bool {
+    referenced_assertions.contains(label)
+        || label
+            .rsplit_once("__")
+            .filter(|(_, instance)| instance.parse::<usize>().is_ok())
+            .is_some_and(|(base_label, _)| referenced_assertions.contains(base_label))
+}
+
 /// An `IdentityAssertionBuilder` gathers together the necessary components
 /// for an identity assertion. When added to an [`IdentityAssertionSigner`],
 /// it ensures that the proper data is added to the final C2PA Manifest.
@@ -111,7 +119,7 @@ impl DynamicAssertion for IdentityAssertionBuilder {
                     a.url()
                 };
 
-                self.referenced_assertions.contains(&label)
+                referenced_label_matches(&self.referenced_assertions, &label)
             })
             .cloned()
             .collect();
@@ -248,7 +256,7 @@ impl AsyncDynamicAssertion for AsyncIdentityAssertionBuilder {
                     a.url()
                 };
 
-                self.referenced_assertions.contains(&label)
+                referenced_label_matches(&self.referenced_assertions, &label)
             })
             .cloned()
             .collect();
@@ -358,6 +366,7 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test;
 
     use crate::{
+        dynamic_assertion::{DynamicAssertion, DynamicAssertionContent, PartialClaim},
         identity::{
             builder::{
                 AsyncIdentityAssertionBuilder, AsyncIdentityAssertionSigner,
@@ -370,7 +379,7 @@ mod tests {
             IdentityAssertion, ToCredentialSummary,
         },
         status_tracker::StatusTracker,
-        Builder, Reader, SigningAlg,
+        Builder, HashedUri, Reader, SigningAlg,
     };
 
     const TEST_IMAGE: &[u8] = include_bytes!("../../../tests/fixtures/CA.jpg");
@@ -481,5 +490,60 @@ mod tests {
         let nc_summary = naive_credential.to_summary();
         let nc_json = serde_json::to_string(&nc_summary).unwrap();
         assert_eq!(nc_json, "{}");
+    }
+
+    #[test]
+    fn referenced_assertion_labels_match_numeric_instance_suffixes() {
+        fn referenced_urls(configured_labels: &[&str]) -> Vec<String> {
+            let mut builder =
+                IdentityAssertionBuilder::for_credential_holder(NaiveCredentialHolder {});
+            builder.add_referenced_assertions(configured_labels);
+
+            let mut claim = PartialClaim::default();
+            for label in [
+                "c2pa.hash.data",
+                "c2pa.soft-binding",
+                "c2pa.soft-binding__1",
+                "c2pa.soft-binding__2",
+            ] {
+                claim.add_assertion(&HashedUri::new(
+                    format!("self#jumbf=c2pa.assertions/{label}"),
+                    Some("sha256".to_string()),
+                    &[1; 32],
+                ));
+            }
+
+            let DynamicAssertionContent::Cbor(content) =
+                builder.content("cawg.identity", None, &claim).unwrap()
+            else {
+                panic!("identity assertion should be CBOR");
+            };
+            let identity: IdentityAssertion = c2pa_cbor::from_slice(&content).unwrap();
+            identity
+                .signer_payload
+                .referenced_assertions
+                .iter()
+                .map(|assertion| assertion.url())
+                .collect()
+        }
+
+        let all_instances = referenced_urls(&["c2pa.soft-binding"]);
+        assert!(all_instances
+            .iter()
+            .any(|url| url.ends_with("/c2pa.soft-binding")));
+        assert!(all_instances
+            .iter()
+            .any(|url| url.ends_with("/c2pa.soft-binding__1")));
+        assert!(all_instances
+            .iter()
+            .any(|url| url.ends_with("/c2pa.soft-binding__2")));
+
+        let explicit_instance = referenced_urls(&["c2pa.soft-binding__1"]);
+        assert!(explicit_instance
+            .iter()
+            .any(|url| url.ends_with("/c2pa.soft-binding__1")));
+        assert!(!explicit_instance
+            .iter()
+            .any(|url| url.ends_with("/c2pa.soft-binding__2")));
     }
 }
