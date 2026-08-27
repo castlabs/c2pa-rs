@@ -84,4 +84,5 @@ deprecated_with_note = "C2PA_DEPRECATED_MSG({})"
 exclude = ["cimpl_free"]
 
 [defines]
+"feature = file_io" = "C2PA_FILE_IO"
 "feature = unstable_live_video" = "C2PA_UNSTABLE_LIVE_VIDEO"

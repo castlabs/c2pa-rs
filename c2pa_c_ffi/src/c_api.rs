@@ -1198,6 +1198,51 @@ pub unsafe extern "C" fn c2pa_free_string_array(ptr: *const *const c_char, count
     Vec::from_raw_parts(mut_ptr, count, count);
 }
 
+#[cfg(feature = "file_io")]
+unsafe fn path_from_c(
+    path: *const c_char,
+    parameter: &str,
+) -> Result<std::path::PathBuf, CimplError> {
+    if path.is_null() {
+        return Err(CimplError::null_parameter(parameter));
+    }
+
+    let path = std::ffi::CStr::from_ptr(path);
+    if path.to_bytes().len() > crate::cimpl::macros::MAX_CSTRING_LEN {
+        return Err(CimplError::string_too_long(parameter));
+    }
+    let path = path
+        .to_str()
+        .map_err(|_| CimplError::other(format!("{parameter} is not valid UTF-8")))?;
+    Ok(std::path::PathBuf::from(path))
+}
+
+#[cfg(feature = "file_io")]
+unsafe fn fragment_paths_from_c(
+    fragments: *const *const c_char,
+    fragments_count: usize,
+) -> Result<Vec<std::path::PathBuf>, CimplError> {
+    if fragments_count == 0 {
+        return Ok(Vec::new());
+    }
+    if fragments.is_null() {
+        return Err(CimplError::null_parameter("fragments"));
+    }
+    if fragments_count > isize::MAX as usize / std::mem::size_of::<*const c_char>() {
+        return Err(CimplError::invalid_buffer_size(
+            fragments_count,
+            "fragments",
+        ));
+    }
+
+    let fragment_ptrs = std::slice::from_raw_parts(fragments, fragments_count);
+    fragment_ptrs
+        .iter()
+        .enumerate()
+        .map(|(index, &fragment)| path_from_c(fragment, &format!("fragments[{index}]")))
+        .collect()
+}
+
 /// Creates a new C2paReader from a default context.
 ///
 /// # Safety
@@ -1377,6 +1422,80 @@ pub unsafe extern "C" fn c2pa_reader_with_fragment(
 
     let reader = ok_or_return_null!(reader.with_fragment(&format, stream, fragment));
     box_tracked!(reader)
+}
+
+/// Creates and verifies a reader from a fragmented BMFF file set.
+///
+/// This legacy entry point preserves the settings behavior used by existing
+/// bindings: it inherits settings loaded on the current thread by
+/// `c2pa_load_settings()`. New callers should use
+/// `c2pa_reader_from_fragmented_files_context()` so settings and trust are
+/// supplied explicitly.
+///
+/// # Parameters
+///
+/// * `asset_path` - null-terminated UTF-8 path to the initialization segment.
+/// * `fragments` - array of `fragments_count` null-terminated UTF-8 fragment paths.
+/// * `fragments_count` - number of entries in `fragments`. If zero, `fragments` may be NULL.
+///
+/// # Safety
+///
+/// `asset_path` and every counted fragment entry must point to valid,
+/// null-terminated strings. `fragments` must reference at least
+/// `fragments_count` pointers. The returned reader must be freed with
+/// `c2pa_free()`.
+#[cfg(feature = "file_io")]
+#[no_mangle]
+#[deprecated(
+    note = "Use c2pa_reader_from_fragmented_files_context() with an explicit context instead of relying on thread-local settings."
+)]
+pub unsafe extern "C" fn c2pa_reader_from_fragmented_files(
+    asset_path: *const c_char,
+    fragments: *const *const c_char,
+    fragments_count: usize,
+) -> *mut C2paReader {
+    let asset_path = ok_or_return_null!(path_from_c(asset_path, "asset_path"));
+    let fragment_paths = ok_or_return_null!(fragment_paths_from_c(fragments, fragments_count));
+
+    #[allow(deprecated)]
+    let reader = C2paReader::from_fragmented_files(&asset_path, &fragment_paths);
+    box_tracked!(ok_or_return_null!(reader))
+}
+
+/// Creates and verifies a reader from a fragmented BMFF file set using an
+/// explicit Context.
+///
+/// The reader inherits all verification, C2PA trust, CAWG trust, resolver, and
+/// progress settings from `context`. The Context remains valid and reusable.
+///
+/// # Parameters
+///
+/// * `context` - a valid C2paContext pointer.
+/// * `asset_path` - null-terminated UTF-8 path to the initialization segment.
+/// * `fragments` - array of `fragments_count` null-terminated UTF-8 fragment paths.
+/// * `fragments_count` - number of entries in `fragments`. If zero, `fragments` may be NULL.
+///
+/// # Safety
+///
+/// `context` must be a valid tracked Context. `asset_path` and every counted
+/// fragment entry must point to valid, null-terminated strings. `fragments`
+/// must reference at least `fragments_count` pointers. The returned reader must
+/// be freed with `c2pa_free()`.
+#[cfg(feature = "file_io")]
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_reader_from_fragmented_files_context(
+    context: *mut C2paContext,
+    asset_path: *const c_char,
+    fragments: *const *const c_char,
+    fragments_count: usize,
+) -> *mut C2paReader {
+    let context = deref_or_return_null!(context, C2paContext);
+    let asset_path = ok_or_return_null!(path_from_c(asset_path, "asset_path"));
+    let fragment_paths = ok_or_return_null!(fragment_paths_from_c(fragments, fragments_count));
+
+    let reader = C2paReader::from_shared_context(context)
+        .with_fragmented_files(&asset_path, &fragment_paths);
+    box_tracked!(ok_or_return_null!(reader))
 }
 
 /// Creates a new C2paReader from a shared Context.
@@ -2219,6 +2338,104 @@ pub unsafe extern "C" fn c2pa_builder_sign_context(
     if !manifest_bytes_ptr.is_null() {
         *manifest_bytes_ptr = to_c_bytes(manifest_bytes);
     }
+    len
+}
+
+/// Signs a fragmented BMFF file set and returns the embedded manifest bytes.
+///
+/// The output directory receives signed copies under
+/// `<output_dir>/<input_parent_name>/`. This compatibility API supports one
+/// literal initialization-segment path, matching the existing Python
+/// `Builder.sign_fragmented` wrapper. The Builder's Context supplies settings
+/// and trust configuration; `signer_ptr` supplies the signer, including any
+/// FFI DynamicAssertions registered on it.
+///
+/// # Parameters
+///
+/// * `builder_ptr` - a valid C2paBuilder pointer.
+/// * `signer_ptr` - a valid C2paSigner pointer.
+/// * `asset_path` - null-terminated UTF-8 path to the initialization segment.
+/// * `fragments_glob` - null-terminated UTF-8 filename glob relative to the init directory.
+/// * `output_dir` - null-terminated UTF-8 output directory path.
+/// * `manifest_bytes_ptr` - receives tracked manifest bytes on success.
+///
+/// # Safety
+///
+/// All pointers must be valid and non-NULL, and path strings must be
+/// null-terminated UTF-8. The returned manifest bytes must be freed with
+/// `c2pa_free()`.
+///
+/// # Returns
+///
+/// The manifest byte length on success, or `-1` on error.
+#[cfg(feature = "file_io")]
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_builder_sign_fragmented(
+    builder_ptr: *mut C2paBuilder,
+    signer_ptr: *mut C2paSigner,
+    asset_path: *const c_char,
+    fragments_glob: *const c_char,
+    output_dir: *const c_char,
+    manifest_bytes_ptr: *mut *const c_uchar,
+) -> i64 {
+    ptr_or_return_int!(manifest_bytes_ptr);
+    *manifest_bytes_ptr = std::ptr::null();
+    let builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
+    let signer = deref_mut_or_return_int!(signer_ptr, C2paSigner);
+    let asset_path = ok_or_return_int!(path_from_c(asset_path, "asset_path"));
+    let fragments_glob = ok_or_return_int!(path_from_c(fragments_glob, "fragments_glob"));
+    let output_dir = ok_or_return_int!(path_from_c(output_dir, "output_dir"));
+
+    let asset_path_str = match asset_path.to_str() {
+        Some(path) => path,
+        None => {
+            CimplError::other("asset_path is not valid UTF-8").set_last();
+            return -1;
+        }
+    };
+    if asset_path_str
+        .chars()
+        .any(|character| "*?[]".contains(character))
+    {
+        CimplError::other("asset_path must be one literal initialization-segment path").set_last();
+        return -1;
+    }
+    if !asset_path.is_file() {
+        CimplError::other("asset_path must identify an existing regular file").set_last();
+        return -1;
+    }
+
+    let input_dir_name = match asset_path.parent().and_then(|path| path.file_name()) {
+        Some(name) => name.to_owned(),
+        None => {
+            CimplError::other("asset_path has no parent directory").set_last();
+            return -1;
+        }
+    };
+    let init_file_name = match asset_path.file_name() {
+        Some(name) => name.to_owned(),
+        None => {
+            CimplError::other("asset_path has no file name").set_last();
+            return -1;
+        }
+    };
+
+    ok_or_return_int!(builder.sign_fragmented_files(
+        signer,
+        &asset_path,
+        &fragments_glob,
+        &output_dir,
+    ));
+
+    let signed_init_path = output_dir.join(input_dir_name).join(init_file_name);
+    let manifest_bytes = ok_or_return_int!(c2pa::jumbf_io::load_jumbf_from_file(&signed_init_path)
+        .map_err(|error| c2pa::Error::BadParam(format!(
+            "failed to read back manifest from signed init {}: {error}",
+            signed_init_path.display()
+        ))));
+
+    let len = manifest_bytes.len() as i64;
+    *manifest_bytes_ptr = to_c_bytes(manifest_bytes);
     len
 }
 
@@ -5015,6 +5232,296 @@ verify_after_sign = true
             new_reader.is_null(),
             "Should return null for invalid format"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "file_io")]
+    #[allow(deprecated)]
+    fn test_fragmented_file_set_ffi_round_trip_and_settings() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input_dir = temp_dir.path().join("input");
+        let output_dir = temp_dir.path().join("output");
+        std::fs::create_dir(&input_dir).unwrap();
+
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../sdk/tests/fixtures/bunny/bunny_791182bps");
+        let init_path = input_dir.join("init.m4s");
+        let fragment_path = input_dir.join("segment.m4s");
+        std::fs::copy(fixture_dir.join("BigBuckBunny_2s_init.mp4"), &init_path).unwrap();
+        std::fs::copy(fixture_dir.join("BigBuckBunny_2s5.m4s"), &fragment_path).unwrap();
+
+        let settings = unsafe { c2pa_settings_new() };
+        let settings_json =
+            CString::new(include_str!(fixture_path!("test_settings.json"))).unwrap();
+        let json_format = CString::new("json").unwrap();
+        assert_eq!(
+            unsafe {
+                c2pa_settings_update_from_string(
+                    settings,
+                    settings_json.as_ptr(),
+                    json_format.as_ptr(),
+                )
+            },
+            0
+        );
+        let context_builder = unsafe { c2pa_context_builder_new() };
+        assert_eq!(
+            unsafe { c2pa_context_builder_set_settings(context_builder, settings) },
+            0
+        );
+        let context = unsafe { c2pa_context_builder_build(context_builder) };
+        assert!(!context.is_null());
+
+        let builder = unsafe { c2pa_builder_from_context(context) };
+        assert!(!builder.is_null());
+        assert_eq!(
+            unsafe {
+                c2pa_builder_set_intent(
+                    builder,
+                    C2paBuilderIntent::Create,
+                    C2paDigitalSourceType::Empty,
+                )
+            },
+            0
+        );
+        let (signer, unused_builder) = setup_signer_and_builder_for_signing_tests();
+        assert_eq!(unsafe { c2pa_free(unused_builder as *const c_void) }, 0);
+
+        let dynamic_state = DynamicCallbackState {
+            value: b'f',
+            invocations: Mutex::new(Vec::new()),
+        };
+        let dynamic_label = CString::new("com.example.fragmented").unwrap();
+        assert_eq!(
+            unsafe {
+                c2pa_signer_add_dynamic_assertion(
+                    signer,
+                    &dynamic_state as *const DynamicCallbackState as *const c_void,
+                    Some(dynamic_assertion_callback),
+                    dynamic_label.as_ptr(),
+                    64,
+                )
+            },
+            0
+        );
+
+        let init_path_c = CString::new(init_path.to_str().unwrap()).unwrap();
+        let fragment_glob_c = CString::new("segment*.m4s").unwrap();
+        let output_dir_c = CString::new(output_dir.to_str().unwrap()).unwrap();
+        let mut manifest_bytes = std::ptr::null();
+        let manifest_len = unsafe {
+            c2pa_builder_sign_fragmented(
+                builder,
+                signer,
+                init_path_c.as_ptr(),
+                fragment_glob_c.as_ptr(),
+                output_dir_c.as_ptr(),
+                &mut manifest_bytes,
+            )
+        };
+        assert!(
+            manifest_len > 0,
+            "fragmented signing failed: {:?}",
+            CimplError::last_message()
+        );
+        assert!(!manifest_bytes.is_null());
+        assert_eq!(dynamic_state.invocations.lock().unwrap().len(), 1);
+
+        let signed_dir = output_dir.join("input");
+        let signed_init = signed_dir.join("init.m4s");
+        let signed_fragment = signed_dir.join("segment.m4s");
+        assert!(signed_init.is_file());
+        assert!(signed_fragment.is_file());
+        let disk_manifest = c2pa::jumbf_io::load_jumbf_from_file(&signed_init).unwrap();
+        let returned_manifest =
+            unsafe { std::slice::from_raw_parts(manifest_bytes, manifest_len as usize) };
+        assert_eq!(returned_manifest, disk_manifest);
+
+        let signed_init_c = CString::new(signed_init.to_str().unwrap()).unwrap();
+        let signed_fragment_c = CString::new(signed_fragment.to_str().unwrap()).unwrap();
+        let fragment_paths = [signed_fragment_c.as_ptr()];
+        let reader = unsafe {
+            c2pa_reader_from_fragmented_files_context(
+                context,
+                signed_init_c.as_ptr(),
+                fragment_paths.as_ptr(),
+                fragment_paths.len(),
+            )
+        };
+        assert!(
+            !reader.is_null(),
+            "context reader failed: {:?}",
+            CimplError::last_message()
+        );
+        assert_eq!(unsafe { &*reader }.validation_status(), None);
+        assert!(unsafe { &*reader }
+            .active_manifest()
+            .unwrap()
+            .assertions()
+            .iter()
+            .any(|assertion| assertion.label() == "com.example.fragmented"));
+        assert_eq!(unsafe { c2pa_free(reader as *const c_void) }, 0);
+
+        assert_eq!(
+            unsafe { c2pa_load_settings(settings_json.as_ptr(), json_format.as_ptr()) },
+            0
+        );
+        let legacy_reader = unsafe {
+            c2pa_reader_from_fragmented_files(
+                signed_init_c.as_ptr(),
+                fragment_paths.as_ptr(),
+                fragment_paths.len(),
+            )
+        };
+        assert!(
+            !legacy_reader.is_null(),
+            "legacy reader failed: {:?}",
+            CimplError::last_message()
+        );
+        assert_eq!(unsafe { &*legacy_reader }.validation_status(), None);
+
+        unsafe {
+            assert_eq!(c2pa_free(legacy_reader as *const c_void), 0);
+            assert_eq!(c2pa_free(manifest_bytes as *const c_void), 0);
+            assert_eq!(c2pa_free(builder as *const c_void), 0);
+            assert_eq!(c2pa_free(signer as *const c_void), 0);
+            assert_eq!(c2pa_free(context as *const c_void), 0);
+            assert_eq!(c2pa_free(settings as *const c_void), 0);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "file_io")]
+    #[allow(deprecated)]
+    fn test_fragmented_reader_ffi_rejects_invalid_inputs() {
+        let asset_path = CString::new("missing-init.mp4").unwrap();
+        let fragment_path = CString::new("missing-fragment.m4s").unwrap();
+        let fragment_paths = [fragment_path.as_ptr()];
+
+        let reader =
+            unsafe { c2pa_reader_from_fragmented_files(asset_path.as_ptr(), std::ptr::null(), 1) };
+        assert!(reader.is_null());
+        assert_eq!(
+            CimplError::last_message().as_deref(),
+            Some("NullParameter: fragments")
+        );
+
+        let null_fragment = [std::ptr::null()];
+        let reader = unsafe {
+            c2pa_reader_from_fragmented_files(
+                asset_path.as_ptr(),
+                null_fragment.as_ptr(),
+                null_fragment.len(),
+            )
+        };
+        assert!(reader.is_null());
+        assert_eq!(
+            CimplError::last_message().as_deref(),
+            Some("NullParameter: fragments[0]")
+        );
+
+        let invalid_utf8 = CString::from_vec_with_nul(vec![0xff, 0]).unwrap();
+        let reader = unsafe {
+            c2pa_reader_from_fragmented_files(invalid_utf8.as_ptr(), std::ptr::null(), 0)
+        };
+        assert!(reader.is_null());
+        assert!(CimplError::last_message()
+            .unwrap()
+            .contains("asset_path is not valid UTF-8"));
+
+        let reader = unsafe {
+            c2pa_reader_from_fragmented_files(
+                asset_path.as_ptr(),
+                fragment_paths.as_ptr(),
+                fragment_paths.len(),
+            )
+        };
+        assert!(reader.is_null());
+        assert!(CimplError::last_message().is_some());
+
+        let settings = unsafe { c2pa_settings_new() };
+        let reader = unsafe {
+            c2pa_reader_from_fragmented_files_context(
+                settings as *mut C2paContext,
+                asset_path.as_ptr(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert!(reader.is_null());
+        assert!(CimplError::last_message()
+            .unwrap()
+            .contains("WrongPointerType"));
+        assert_eq!(unsafe { c2pa_free(settings as *const c_void) }, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_fragmented_signer_ffi_rejects_invalid_inputs() {
+        let (signer, builder) = setup_signer_and_builder_for_signing_tests();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../sdk/tests/fixtures/bunny/bunny_791182bps");
+        let invalid_asset_glob = fixture_dir.join("[");
+        let invalid_asset_glob_c = CString::new(invalid_asset_glob.to_str().unwrap()).unwrap();
+        let fragment_glob = CString::new("BigBuckBunny_2s*.m4s").unwrap();
+        let output_dir = CString::new(temp_dir.path().join("output").to_str().unwrap()).unwrap();
+        let mut manifest_bytes = std::ptr::dangling();
+
+        let result = unsafe {
+            c2pa_builder_sign_fragmented(
+                builder,
+                signer,
+                invalid_asset_glob_c.as_ptr(),
+                fragment_glob.as_ptr(),
+                output_dir.as_ptr(),
+                &mut manifest_bytes,
+            )
+        };
+        assert_eq!(result, -1);
+        assert!(manifest_bytes.is_null());
+        assert!(CimplError::last_message()
+            .unwrap()
+            .contains("literal initialization-segment path"));
+
+        let valid_init = fixture_dir.join("BigBuckBunny_2s_init.mp4");
+        let valid_init_c = CString::new(valid_init.to_str().unwrap()).unwrap();
+        let result = unsafe {
+            c2pa_builder_sign_fragmented(
+                builder,
+                signer,
+                valid_init_c.as_ptr(),
+                fragment_glob.as_ptr(),
+                output_dir.as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, -1);
+        assert_eq!(
+            CimplError::last_message().as_deref(),
+            Some("NullParameter: manifest_bytes_ptr")
+        );
+
+        let result = unsafe {
+            c2pa_builder_sign_fragmented(
+                std::ptr::null_mut(),
+                signer,
+                valid_init_c.as_ptr(),
+                fragment_glob.as_ptr(),
+                output_dir.as_ptr(),
+                &mut manifest_bytes,
+            )
+        };
+        assert_eq!(result, -1);
+        assert_eq!(
+            CimplError::last_message().as_deref(),
+            Some("NullParameter: builder_ptr")
+        );
+
+        unsafe {
+            assert_eq!(c2pa_free(builder as *const c_void), 0);
+            assert_eq!(c2pa_free(signer as *const c_void), 0);
+        }
     }
 
     // ========== High-Value Coverage Tests ==========

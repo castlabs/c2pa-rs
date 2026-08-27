@@ -22,7 +22,8 @@ The following table summarizes the supported media (asset) file formats. This in
 | `jxl`           | `image/jxl`                                                                     |
 | `m4a`           | `audio/mp4`                                                                     |
 | `mp3`           | `audio/mpeg`                                                                    |
-| `mp4`           | `video/mp4`, `application/mp4` <br/>Fragmented MP4 (DASH) supported only for file-based operations from the Rust library. |
+| `mp4`           | `video/mp4`, `application/mp4`                                              |
+| `m4s`, `cmfv`   | `video/mp4` <br/>Fragmented MP4/CMAF file-set signing and reading are available through the Rust library and the `file_io` C FFI APIs. |
 | `mov`           | `video/quicktime`                                                               |
 | `pdf`           | `application/pdf` (**read-only**)                                              |
 | `png`           | `image/png`                                                                     |
