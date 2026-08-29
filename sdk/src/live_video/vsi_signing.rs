@@ -13,8 +13,8 @@
 
 //! Verifiable Segment Info (VSI) signing for live video (C2PA section 19.4).
 //!
-//! Each media segment carries a COSE_Sign1 inside an `emsg` box, signed by an
-//! Ed25519 session key provided by the caller.  The init segment carries the
+//! Each media segment carries a COSE_Sign1 inside an `emsg` box, signed by a
+//! session key provided by the caller.  The init segment carries the
 //! session key in a `c2pa.session-keys` assertion; the session key's
 //! `signerBinding` is a detached COSE_Sign1 where the session key signs the
 //! signer's end-entity certificate, proving the key is associated with the
@@ -24,9 +24,10 @@ use std::sync::Arc;
 
 use coset::{iana, CoseSign1Builder, HeaderBuilder, TaggedCborSerializable};
 use ed25519_dalek::{Signer as Ed25519Signer, SigningKey};
+use pkcs8::DecodePublicKey;
 
 use super::{
-    bmff::{parse_init_segment, parse_media_segment},
+    bmff::{parse_init_segment, parse_media_segment, InitSegmentInfo},
     cose_key::{
         build_ed25519_cose_key, cose_key_to_der, kid_from_cose_key, signing_alg_from_cose_key,
     },
@@ -43,9 +44,76 @@ use crate::{
 
 const VSI_VALUE_FSEG: &str = "fseg";
 
+/// Identifies why a VSI session-key signature is being requested.
+///
+/// Callers must authorize based on this explicit value rather than inferring
+/// purpose from callback order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VsiSigningPurpose {
+    /// Signs the detached COSE Sig_structure that binds the session key to the
+    /// manifest signer's end-entity certificate.
+    SignerBinding,
+    /// Signs the final VSI COSE Sig_structure for a media segment.
+    Vsi {
+        /// The actual `mfhd` and VSI sequence number represented by the payload.
+        sequence_number: u64,
+    },
+}
+
+/// Synchronous, non-exportable session-key signing interface for live-video VSI.
+///
+/// `sig_structure` is the exact final COSE Sig_structure byte string. The
+/// implementation must return a raw COSE signature: exactly 64 bytes for both
+/// Ed25519 and ES256 (`r || s`, not ASN.1 DER). Implementations may call a
+/// hardware or remote keystore, but the call remains synchronous to the SDK.
+pub trait VsiSessionSigner: Send + Sync + 'static {
+    /// Signs one COSE Sig_structure for the explicit signing purpose.
+    fn sign(&self, purpose: VsiSigningPurpose, sig_structure: &[u8]) -> Result<Vec<u8>>;
+}
+
+impl<F> VsiSessionSigner for F
+where
+    F: Fn(VsiSigningPurpose, &[u8]) -> Result<Vec<u8>> + Send + Sync + 'static,
+{
+    fn sign(&self, purpose: VsiSigningPurpose, sig_structure: &[u8]) -> Result<Vec<u8>> {
+        self(purpose, sig_structure)
+    }
+}
+
+/// Public metadata and verification material for one VSI session key.
+///
+/// `public_cose_key_cbor` must encode a public COSE_Key map whose algorithm and
+/// non-empty `kid` agree with the explicit fields. Milestone 2 initially accepts
+/// EdDSA/Ed25519 and ES256/P-256 only.
+#[derive(Clone, Debug)]
+pub struct VsiSessionConfig {
+    /// Session signing algorithm.
+    pub algorithm: SigningAlg,
+    /// Non-empty binary COSE key identifier.
+    pub kid: Vec<u8>,
+    /// CBOR-encoded public COSE_Key map.
+    pub public_cose_key_cbor: Vec<u8>,
+    /// First valid BMFF `mfhd` sequence number.
+    pub min_sequence_number: u64,
+    /// RFC 3339 session-key creation time emitted unchanged as `createdAt`.
+    pub created_at: String,
+    /// Session-key validity period in seconds.
+    pub validity_period_secs: u64,
+}
+
+struct LocalEd25519SessionSigner(SigningKey);
+
+impl VsiSessionSigner for LocalEd25519SessionSigner {
+    fn sign(&self, _purpose: VsiSigningPurpose, sig_structure: &[u8]) -> Result<Vec<u8>> {
+        let signature: ed25519_dalek::Signature = Ed25519Signer::sign(&self.0, sig_structure);
+        Ok(signature.to_bytes().to_vec())
+    }
+}
+
 /// Signs live video segments using the Verifiable Segment Info method (§19.4).
 ///
-/// The caller provides an Ed25519 session key via [`from_signing_key`].  The
+/// The caller provides a local Ed25519 session key via [`from_signing_key`] or
+/// a generic session signer via [`from_session_signer`]. The
 /// init segment is signed with the manifest [`Signer`] and carries a
 /// `c2pa.session-keys` assertion that includes the session public key and a
 /// `signerBinding` COSE_Sign1 proving the key is associated with the manifest
@@ -55,12 +123,14 @@ const VSI_VALUE_FSEG: &str = "fseg";
 /// key; the box is prepended to the segment bytes.
 ///
 /// [`from_signing_key`]: LiveVideoVsiSigner::from_signing_key
+/// [`from_session_signer`]: LiveVideoVsiSigner::from_session_signer
 pub struct LiveVideoVsiSigner {
     context: Arc<Context>,
-    session_signing_key: SigningKey,
+    session_signer: Arc<dyn VsiSessionSigner>,
+    algorithm: SigningAlg,
     session_cose_key: c2pa_cbor::Value,
     kid: Vec<u8>,
-    signer_binding: c2pa_cbor::Value,
+    signer_binding: Option<c2pa_cbor::Value>,
     manifest_signer_ee_cert_der: Vec<u8>,
     min_sequence_number: u64,
     created_at: DateT,
@@ -76,6 +146,12 @@ pub struct LiveVideoVsiSigner {
     track_id: Option<u32>,
     track_timescale: Option<u32>,
     default_sample_duration: Option<u32>,
+}
+
+struct RestoredInitState {
+    manifest_id: String,
+    session_key: SessionKey,
+    init_info: InitSegmentInfo,
 }
 
 impl LiveVideoVsiSigner {
@@ -103,7 +179,7 @@ impl LiveVideoVsiSigner {
         validity_period_secs: u64,
     ) -> Result<Self> {
         let context = Arc::new(super::context_from_thread_local_settings()?);
-        Self::from_parts(
+        Self::from_local_ed25519_parts(
             context,
             manifest_json.into(),
             manifest_signer,
@@ -128,7 +204,7 @@ impl LiveVideoVsiSigner {
         validity_period_secs: u64,
     ) -> Result<Self> {
         let manifest_signer = context.signer()?;
-        Self::from_parts(
+        Self::from_local_ed25519_parts(
             Arc::clone(context),
             manifest_json.into(),
             manifest_signer,
@@ -139,8 +215,58 @@ impl LiveVideoVsiSigner {
         )
     }
 
+    /// Creates a VSI signer backed by a generic synchronous session signer.
+    ///
+    /// The public COSE key is used to verify every callback result before any
+    /// output or sequence state is committed. The `signerBinding` callback is
+    /// deferred until [`sign_init_segment`](Self::sign_init_segment), allowing
+    /// artifact recovery to proceed without requesting a throwaway signature.
+    pub fn from_session_signer<S>(
+        manifest_json: impl Into<String>,
+        manifest_signer: &dyn Signer,
+        config: VsiSessionConfig,
+        session_signer: S,
+    ) -> Result<Self>
+    where
+        S: VsiSessionSigner,
+    {
+        let context = Arc::new(super::context_from_thread_local_settings()?);
+        Self::from_generic_parts(
+            context,
+            manifest_json.into(),
+            manifest_signer,
+            config,
+            Arc::new(session_signer),
+            false,
+        )
+    }
+
+    /// Creates a generic VSI signer using an explicit shared SDK context.
+    ///
+    /// This is the context-aware entry point used by language bindings and
+    /// non-exportable keystore integrations.
+    pub fn from_shared_context_with_session_signer<S>(
+        context: &Arc<Context>,
+        manifest_json: impl Into<String>,
+        config: VsiSessionConfig,
+        session_signer: S,
+    ) -> Result<Self>
+    where
+        S: VsiSessionSigner,
+    {
+        let manifest_signer = context.signer()?;
+        Self::from_generic_parts(
+            Arc::clone(context),
+            manifest_json.into(),
+            manifest_signer,
+            config,
+            Arc::new(session_signer),
+            false,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn from_parts(
+    fn from_local_ed25519_parts(
         context: Arc<Context>,
         manifest_json: String,
         manifest_signer: &dyn Signer,
@@ -149,25 +275,103 @@ impl LiveVideoVsiSigner {
         min_sequence_number: u64,
         validity_period_secs: u64,
     ) -> Result<Self> {
-        if kid.is_empty() {
+        let session_cose_key = build_ed25519_cose_key(&signing_key.verifying_key(), &kid);
+        let config = VsiSessionConfig {
+            algorithm: SigningAlg::Ed25519,
+            kid,
+            public_cose_key_cbor: c2pa_cbor::to_vec(&session_cose_key).map_err(|e| {
+                Error::BadParam(format!("failed to encode local Ed25519 COSE_Key: {e}"))
+            })?,
+            min_sequence_number,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            validity_period_secs,
+        };
+        Self::from_generic_parts(
+            context,
+            manifest_json,
+            manifest_signer,
+            config,
+            Arc::new(LocalEd25519SessionSigner(signing_key)),
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_generic_parts(
+        context: Arc<Context>,
+        manifest_json: String,
+        manifest_signer: &dyn Signer,
+        config: VsiSessionConfig,
+        session_signer: Arc<dyn VsiSessionSigner>,
+        create_signer_binding: bool,
+    ) -> Result<Self> {
+        if !matches!(config.algorithm, SigningAlg::Ed25519 | SigningAlg::Es256) {
+            return Err(Error::BadParam(
+                "VSI session signing supports only Ed25519 and ES256".to_string(),
+            ));
+        }
+        if config.kid.is_empty() {
             return Err(Error::BadParam(
                 "VSI session key kid must not be empty".to_string(),
             ));
         }
-        if validity_period_secs == 0 {
+        if config.validity_period_secs == 0 {
             return Err(Error::BadParam(
                 "VSI session key validity period must be greater than zero".to_string(),
             ));
         }
-        if min_sequence_number > u64::from(u32::MAX) {
+        if config.min_sequence_number > u64::from(u32::MAX) {
             return Err(Error::BadParam(
                 "VSI min sequence number must fit the BMFF mfhd sequence_number field".to_string(),
             ));
         }
 
-        let base_manifest_json = super::prepare_live_manifest_json(&manifest_json)?;
+        let created_at: chrono::DateTime<chrono::Utc> = config
+            .created_at
+            .parse()
+            .map_err(|_| Error::BadParam("VSI session key createdAt is invalid".to_string()))?;
+        let validity = i64::try_from(config.validity_period_secs)
+            .map_err(|_| Error::BadParam("VSI session key validity period overflow".to_string()))?;
+        created_at
+            .timestamp()
+            .checked_add(validity)
+            .ok_or_else(|| {
+                Error::BadParam("VSI session key validity window overflow".to_string())
+            })?;
 
-        let session_cose_key = build_ed25519_cose_key(&signing_key.verifying_key(), &kid);
+        let session_cose_key: c2pa_cbor::Value =
+            c2pa_cbor::from_slice(&config.public_cose_key_cbor).map_err(|e| {
+                Error::BadParam(format!("VSI public COSE_Key is not valid CBOR: {e}"))
+            })?;
+        if signing_alg_from_cose_key(&session_cose_key) != Some(config.algorithm) {
+            return Err(Error::BadParam(
+                "VSI algorithm does not agree with the public COSE_Key type, curve, and alg"
+                    .to_string(),
+            ));
+        }
+        if kid_from_cose_key(&session_cose_key).as_deref() != Some(config.kid.as_slice()) {
+            return Err(Error::BadParam(
+                "VSI kid does not agree with the public COSE_Key kid".to_string(),
+            ));
+        }
+        let public_key_der = cose_key_to_der(&session_cose_key).ok_or_else(|| {
+            Error::BadParam("VSI public COSE_Key has an unsupported key shape".to_string())
+        })?;
+        match config.algorithm {
+            SigningAlg::Ed25519 => {
+                ed25519_dalek::VerifyingKey::from_public_key_der(&public_key_der).map_err(|e| {
+                    Error::BadParam(format!("VSI Ed25519 public COSE_Key is invalid: {e}"))
+                })?;
+            }
+            SigningAlg::Es256 => {
+                p256::PublicKey::from_public_key_der(&public_key_der).map_err(|e| {
+                    Error::BadParam(format!("VSI P-256 public COSE_Key is invalid: {e}"))
+                })?;
+            }
+            _ => unreachable!("algorithm checked above"),
+        }
+
+        let base_manifest_json = super::prepare_live_manifest_json(&manifest_json)?;
 
         let ee_cert_der = manifest_signer
             .certs()
@@ -176,28 +380,29 @@ impl LiveVideoVsiSigner {
             .next()
             .ok_or_else(|| Error::BadParam("manifest signer has no certificates".into()))?;
 
-        let signer_binding = build_signer_binding(&ee_cert_der, &signing_key)?;
-
-        let created_at = DateT(chrono::Utc::now().to_rfc3339());
-
-        Ok(Self {
+        let mut signer = Self {
             context,
-            session_signing_key: signing_key,
+            session_signer,
+            algorithm: config.algorithm,
             session_cose_key,
-            kid,
-            signer_binding,
+            kid: config.kid,
+            signer_binding: None,
             manifest_signer_ee_cert_der: ee_cert_der,
-            min_sequence_number,
-            created_at,
-            validity_period: validity_period_secs,
-            next_sequence_number: min_sequence_number,
+            min_sequence_number: config.min_sequence_number,
+            created_at: DateT(config.created_at),
+            validity_period: config.validity_period_secs,
+            next_sequence_number: config.min_sequence_number,
             next_event_id: 1,
             base_manifest_json,
             active_manifest_id: None,
             track_id: None,
             track_timescale: None,
             default_sample_duration: None,
-        })
+        };
+        if create_signer_binding {
+            signer.ensure_signer_binding()?;
+        }
+        Ok(signer)
     }
 
     /// Signs an init segment, embedding a `c2pa.session-keys` assertion.
@@ -228,7 +433,8 @@ impl LiveVideoVsiSigner {
                     .to_string(),
             ));
         }
-        let session_keys = self.build_session_keys_assertion();
+        self.ensure_signer_binding()?;
+        let session_keys = self.build_session_keys_assertion()?;
         let mut builder = Builder::from_shared_context(&self.context)
             .with_definition(self.base_manifest_json.as_str())?;
         builder.add_assertion_cbor(SessionKeys::LABEL, &session_keys)?;
@@ -337,10 +543,10 @@ impl LiveVideoVsiSigner {
             }
         };
 
-        // Pass 1 is sizing only. A fixed-size dummy digest and Ed25519 signature establish
+        // Pass 1 is sizing only. A fixed-size dummy digest and signature establish
         // final offsets without invoking the session private key.
         let draft_info = build_segment_info(build_segment_bmff_hash_placeholder()?);
-        let draft_cose = build_vsi_cose_sign1_dummy(&draft_info, &self.kid, iat)?;
+        let draft_cose = build_vsi_cose_sign1_dummy(&draft_info, self.algorithm, &self.kid, iat)?;
         let draft_emsg_box = build_emsg_box(&draft_cose, timescale, event_duration, id)?;
         let mut draft_segment = draft_emsg_box.clone();
         draft_segment.extend_from_slice(segment_data);
@@ -348,8 +554,14 @@ impl LiveVideoVsiSigner {
 
         // Pass 2 performs the only real session signature for this media segment.
         let final_info = build_segment_info(bmff_hash);
-        let cose_sign1_bytes =
-            build_vsi_cose_sign1(&final_info, &self.session_signing_key, &self.kid, iat)?;
+        let cose_sign1_bytes = build_vsi_cose_sign1(
+            &final_info,
+            self.algorithm,
+            self.session_signer.as_ref(),
+            &self.session_cose_key,
+            &self.kid,
+            iat,
+        )?;
         let emsg_box = build_emsg_box(&cose_sign1_bytes, timescale, event_duration, id)?;
         if draft_emsg_box.len() != emsg_box.len() {
             return Err(Error::BadParam(
@@ -383,20 +595,50 @@ impl LiveVideoVsiSigner {
     /// the init would produce a different UUID, breaking `manifestId` continuity
     /// across segments.  Instead, call this method with the already-signed init
     /// from the output directory to restore the session's `manifestId`.
+    ///
+    /// This init-only method is safe only before any media segment from the
+    /// session has been published. It restores no media counters, so signing
+    /// directly after a post-publication init-only restore can reuse a sequence.
+    /// Durable resume callers must use [`recover_from_artifacts`] with the last
+    /// committed media segment, or call [`resume_from_segment`] before signing.
     pub fn restore_manifest_id_from_signed_init(
         &mut self,
         signed_init_data: &[u8],
         format: &str,
     ) -> Result<()> {
-        let init_info = parse_init_segment(signed_init_data)?;
-        let (manifest_id, session_key) =
-            self.read_and_validate_init_manifest(signed_init_data, format)?;
-        self.validate_session_key_metadata(&session_key)?;
-        self.active_manifest_id = Some(manifest_id);
-        self.apply_session_key_metadata(&session_key);
-        self.track_id = Some(init_info.track_id);
-        self.track_timescale = Some(init_info.timescale);
-        self.default_sample_duration = init_info.default_sample_duration;
+        let restored = self.validate_signed_init_state(signed_init_data, format)?;
+        self.apply_restored_init_state(restored, true);
+        Ok(())
+    }
+
+    /// Atomically recovers session state from signed publication artifacts.
+    ///
+    /// The signed initialization segment is always validated. When supplied,
+    /// `previous_segment` must be the complete last published VSI media segment;
+    /// its signature, hash, manifest, track, timing, and counters are validated
+    /// before any recovered state is accepted. Recovery never invokes the
+    /// session signing callback.
+    ///
+    /// Omitting `previous_segment` is valid only when no media segment from this
+    /// session has ever been published. It restores the initial sequence and
+    /// event counters; using it after publication would permit sequence reuse.
+    /// Durable callers must therefore supply their last committed media artifact
+    /// or refuse recovery when publication state is unknown.
+    pub fn recover_from_artifacts(
+        &mut self,
+        signed_init_data: &[u8],
+        previous_segment: Option<&[u8]>,
+        format: &str,
+    ) -> Result<()> {
+        let restored = self.validate_signed_init_state(signed_init_data, format)?;
+        let counters = previous_segment
+            .map(|segment| self.validate_resumed_segment(segment, &restored))
+            .transpose()?
+            .unwrap_or((restored.session_key.min_sequence_number, 1));
+
+        self.apply_restored_init_state(restored, true);
+        self.next_sequence_number = counters.0;
+        self.next_event_id = counters.1;
         Ok(())
     }
 
@@ -409,6 +651,47 @@ impl LiveVideoVsiSigner {
     ///
     /// [`restore_manifest_id_from_signed_init`]: LiveVideoVsiSigner::restore_manifest_id_from_signed_init
     pub fn resume_from_segment(&mut self, segment_data: &[u8]) -> Result<()> {
+        let restored = RestoredInitState {
+            manifest_id: self.active_manifest_id.clone().ok_or_else(|| {
+                Error::BadParam(
+                    "restore_manifest_id_from_signed_init must be called before resume_from_segment"
+                        .to_string(),
+                )
+            })?,
+            session_key: SessionKey {
+                key: self.session_cose_key.clone(),
+                min_sequence_number: self.min_sequence_number,
+                created_at: self.created_at.clone(),
+                validity_period: self.validity_period,
+                signer_binding: self.signer_binding.clone().ok_or_else(|| {
+                    Error::BadParam(
+                        "restore_manifest_id_from_signed_init must establish signerBinding before resume_from_segment"
+                            .to_string(),
+                    )
+                })?,
+            },
+            init_info: InitSegmentInfo {
+                track_id: self.track_id.ok_or_else(|| {
+                    Error::BadParam("restored initialization track is missing".to_string())
+                })?,
+                timescale: self.track_timescale.ok_or_else(|| {
+                    Error::BadParam("restored initialization timescale is missing".to_string())
+                })?,
+                default_sample_duration: self.default_sample_duration,
+            },
+        };
+        let (next_sequence_number, next_event_id) =
+            self.validate_resumed_segment(segment_data, &restored)?;
+        self.next_sequence_number = next_sequence_number;
+        self.next_event_id = next_event_id;
+        Ok(())
+    }
+
+    fn validate_resumed_segment(
+        &self,
+        segment_data: &[u8],
+        restored: &RestoredInitState,
+    ) -> Result<(u64, u32)> {
         use crate::live_video::verifiable_segment_info::parse_vsi;
 
         let event = super::verifiable_segment_info::extract_vsi_emsg_from_segment(segment_data)?
@@ -417,13 +700,8 @@ impl LiveVideoVsiSigner {
             })?;
 
         let parsed = parse_vsi(&event.message_data)?;
-        let active_manifest_id = self.active_manifest_id.as_deref().ok_or_else(|| {
-            Error::BadParam(
-                "restore_manifest_id_from_signed_init must be called before resume_from_segment"
-                    .to_string(),
-            )
-        })?;
-        let media_info = parse_media_segment(segment_data, self.default_sample_duration)?;
+        let media_info =
+            parse_media_segment(segment_data, restored.init_info.default_sample_duration)?;
         if parsed.segment_info_map.sequence_number != u64::from(media_info.sequence_number) {
             return Err(Error::BadParam(
                 "resumed VSI sequenceNumber does not match moof/mfhd.sequence_number".to_string(),
@@ -434,66 +712,96 @@ impl LiveVideoVsiSigner {
                 "resumed VSI kid does not match the configured session key".to_string(),
             ));
         }
-        if parsed.segment_info_map.manifest_id != active_manifest_id {
+        if parsed.segment_info_map.manifest_id != restored.manifest_id {
             return Err(Error::BadParam(
                 "resumed VSI manifestId does not match the restored initialization manifest"
                     .to_string(),
             ));
         }
-        if self.track_id != Some(media_info.track_id) {
+        if restored.init_info.track_id != media_info.track_id {
             return Err(Error::BadParam(
                 "resumed VSI media track does not match the restored initialization track"
                     .to_string(),
             ));
         }
-        if event.presentation_time_delta != 0
-            || self.track_timescale != Some(event.timescale)
-            || event.event_duration != media_info.duration_ticks
-            || event.id == 0
-        {
-            return Err(Error::BadParam(
-                "resumed VSI emsg timing or id does not match the restored init and media segment"
-                    .to_string(),
-            ));
-        }
-        if crate::crypto::cose::signing_alg_from_sign1(&parsed.sign1).map_err(|_| {
-            Error::BadParam("resumed VSI has no supported protected alg".to_string())
-        })? != SigningAlg::Ed25519
-        {
-            return Err(Error::BadParam(
-                "resumed VSI protected alg does not match the Ed25519 session key".to_string(),
-            ));
-        }
-        if parsed.sign1.unprotected.alg.is_some() {
-            return Err(Error::BadParam(
-                "resumed VSI alg must not appear in the unprotected header".to_string(),
-            ));
-        }
-        let signature = ed25519_dalek::Signature::from_slice(&parsed.sign1.signature)
-            .map_err(|e| Error::BadParam(format!("invalid resumed Ed25519 signature: {e}")))?;
-        self.session_signing_key
-            .verifying_key()
-            .verify_strict(&parsed.sign1.tbs_data(b""), &signature)
-            .map_err(|e| Error::BadParam(format!("resumed VSI signature is invalid: {e}")))?;
-        let resumed_iat = protected_iat(&parsed.sign1)?;
-        self.ensure_key_valid_at(resumed_iat)?;
-        if parsed.segment_info_map.sequence_number < self.min_sequence_number {
+        if parsed.segment_info_map.sequence_number < restored.session_key.min_sequence_number {
             return Err(Error::BadParam(
                 "resumed VSI sequenceNumber is below the session key minSequenceNumber".to_string(),
             ));
         }
-
+        let expected_event_id = parsed
+            .segment_info_map
+            .sequence_number
+            .checked_sub(restored.session_key.min_sequence_number)
+            .and_then(|offset| offset.checked_add(1))
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or_else(|| {
+                Error::BadParam(
+                    "resumed VSI sequenceNumber cannot map to a valid emsg id".to_string(),
+                )
+            })?;
+        if event.presentation_time_delta != 0
+            || restored.init_info.timescale != event.timescale
+            || event.event_duration != media_info.duration_ticks
+            || event.id != expected_event_id
+        {
+            return Err(Error::BadParam(
+                "resumed VSI emsg timing or id does not match the restored init, sequence, and media segment"
+                    .to_string(),
+            ));
+        }
+        let tbs = parsed.sign1.tbs_data(b"");
+        super::session_key_validation::verify_cose_sign1_signature(
+            &parsed.sign1,
+            &self.session_cose_key,
+            &tbs,
+        )
+        .map_err(|e| Error::BadParam(format!("resumed VSI signature is invalid: {e}")))?;
+        let resumed_iat = protected_iat(&parsed.sign1)?;
+        ensure_key_valid_at(
+            &restored.session_key.created_at,
+            restored.session_key.validity_period,
+            resumed_iat,
+        )?;
         verify_segment_bmff_hash(segment_data, &parsed.segment_info_map.bmff_hash)?;
-        self.next_sequence_number = parsed
+        let next_sequence_number = parsed
             .segment_info_map
             .sequence_number
             .checked_add(1)
             .ok_or_else(|| Error::BadParam("resumed VSI sequenceNumber overflow".to_string()))?;
-        self.next_event_id = event
+        let next_event_id = event
             .id
             .checked_add(1)
             .ok_or_else(|| Error::BadParam("resumed VSI emsg id overflow".to_string()))?;
-        Ok(())
+        Ok((next_sequence_number, next_event_id))
+    }
+
+    fn validate_signed_init_state(
+        &self,
+        signed_init_data: &[u8],
+        format: &str,
+    ) -> Result<RestoredInitState> {
+        let init_info = parse_init_segment(signed_init_data)?;
+        let (manifest_id, session_key) =
+            self.read_and_validate_init_manifest(signed_init_data, format)?;
+        self.validate_session_key_metadata(&session_key)?;
+        Ok(RestoredInitState {
+            manifest_id,
+            session_key,
+            init_info,
+        })
+    }
+
+    fn apply_restored_init_state(&mut self, restored: RestoredInitState, reset_sequence: bool) {
+        self.active_manifest_id = Some(restored.manifest_id);
+        self.apply_session_key_metadata(&restored.session_key);
+        self.track_id = Some(restored.init_info.track_id);
+        self.track_timescale = Some(restored.init_info.timescale);
+        self.default_sample_duration = restored.init_info.default_sample_duration;
+        if reset_sequence {
+            self.next_sequence_number = restored.session_key.min_sequence_number;
+            self.next_event_id = 1;
+        }
     }
 
     /// Reads back `signed_data`'s active manifest and, if it has a label, stores it as
@@ -547,11 +855,11 @@ impl LiveVideoVsiSigner {
         })?;
         let signed_key = &session_key.key;
         if kid_from_cose_key(signed_key).as_deref() != Some(self.kid.as_slice())
-            || signing_alg_from_cose_key(signed_key) != Some(SigningAlg::Ed25519)
+            || signing_alg_from_cose_key(signed_key) != Some(self.algorithm)
             || cose_key_to_der(signed_key) != cose_key_to_der(&self.session_cose_key)
         {
             return Err(Error::BadParam(
-                "signed initialization session kid, algorithm, or public key does not match the configured Ed25519 session key"
+                "signed initialization session kid, algorithm, or public key does not match the configured session key"
                     .to_string(),
             ));
         }
@@ -614,7 +922,7 @@ impl LiveVideoVsiSigner {
         self.min_sequence_number = session_key.min_sequence_number;
         self.created_at = session_key.created_at.clone();
         self.validity_period = session_key.validity_period;
-        self.signer_binding = session_key.signer_binding.clone();
+        self.signer_binding = Some(session_key.signer_binding.clone());
         if self.next_sequence_number < self.min_sequence_number {
             self.next_sequence_number = self.min_sequence_number;
         }
@@ -631,59 +939,74 @@ impl LiveVideoVsiSigner {
         .ok_or_else(|| Error::BadParam("session key signerBinding is malformed".to_string()))?;
         let sign1 = coset::CoseSign1::from_tagged_slice(&binding_bytes)
             .map_err(|e| Error::BadParam(format!("invalid signerBinding COSE_Sign1: {e}")))?;
-        if sign1.payload.is_some()
-            || sign1.unprotected.alg.is_some()
-            || crate::crypto::cose::signing_alg_from_sign1(&sign1).map_err(|_| {
-                Error::BadParam("signerBinding has invalid protected alg".to_string())
-            })? != SigningAlg::Ed25519
-        {
+        if sign1.payload.is_some() {
             return Err(Error::BadParam(
-                "signerBinding must be detached and use protected EdDSA".to_string(),
+                "signerBinding payload must be detached".to_string(),
             ));
         }
         let external_payload = c2pa_cbor::to_vec(&c2pa_cbor::Value::Bytes(ee_cert_der.to_vec()))
             .map_err(|e| {
                 Error::BadParam(format!("failed to encode signerBinding certificate: {e}"))
             })?;
-        let signature = ed25519_dalek::Signature::from_slice(&sign1.signature)
-            .map_err(|e| Error::BadParam(format!("invalid signerBinding signature: {e}")))?;
-        self.session_signing_key
-            .verifying_key()
-            .verify_strict(&sign1.tbs_detached_data(&external_payload, b""), &signature)
-            .map_err(|e| Error::BadParam(format!("signerBinding verification failed: {e}")))
+        let tbs = sign1.tbs_detached_data(&external_payload, b"");
+        super::session_key_validation::verify_cose_sign1_signature(
+            &sign1,
+            &self.session_cose_key,
+            &tbs,
+        )
+        .map_err(|e| Error::BadParam(format!("signerBinding verification failed: {e}")))
     }
 
     fn ensure_key_valid_at(&self, unix_seconds: i64) -> Result<()> {
-        use chrono::DateTime;
+        ensure_key_valid_at(&self.created_at, self.validity_period, unix_seconds)
+    }
 
-        let created_at: DateTime<chrono::Utc> = self.created_at.0.parse().map_err(|_| {
-            Error::BadParam("session key createdAt is not a valid RFC 3339 datetime".to_string())
-        })?;
-        let validity = i64::try_from(self.validity_period)
-            .map_err(|_| Error::BadParam("session key validityPeriod overflow".to_string()))?;
-        let created_at = created_at.timestamp();
-        let expires_at = created_at
-            .checked_add(validity)
-            .ok_or_else(|| Error::BadParam("session key validity window overflow".to_string()))?;
-        if unix_seconds < created_at || unix_seconds > expires_at {
-            return Err(Error::BadParam(
-                "session key is outside its published validity period".to_string(),
-            ));
+    fn ensure_signer_binding(&mut self) -> Result<()> {
+        if self.signer_binding.is_none() {
+            self.signer_binding = Some(build_signer_binding(
+                &self.manifest_signer_ee_cert_der,
+                self.algorithm,
+                self.session_signer.as_ref(),
+                &self.session_cose_key,
+            )?);
         }
         Ok(())
     }
 
-    fn build_session_keys_assertion(&self) -> SessionKeys {
-        SessionKeys {
+    fn build_session_keys_assertion(&self) -> Result<SessionKeys> {
+        let signer_binding = self.signer_binding.clone().ok_or_else(|| {
+            Error::BadParam("VSI signerBinding has not been established".to_string())
+        })?;
+        Ok(SessionKeys {
             keys: vec![SessionKey {
                 key: self.session_cose_key.clone(),
                 min_sequence_number: self.min_sequence_number,
                 created_at: self.created_at.clone(),
                 validity_period: self.validity_period,
-                signer_binding: self.signer_binding.clone(),
+                signer_binding,
             }],
-        }
+        })
     }
+}
+
+fn ensure_key_valid_at(created_at: &DateT, validity_period: u64, unix_seconds: i64) -> Result<()> {
+    use chrono::DateTime;
+
+    let created_at: DateTime<chrono::Utc> = created_at.0.parse().map_err(|_| {
+        Error::BadParam("session key createdAt is not a valid RFC 3339 datetime".to_string())
+    })?;
+    let validity = i64::try_from(validity_period)
+        .map_err(|_| Error::BadParam("session key validityPeriod overflow".to_string()))?;
+    let created_at = created_at.timestamp();
+    let expires_at = created_at
+        .checked_add(validity)
+        .ok_or_else(|| Error::BadParam("session key validity window overflow".to_string()))?;
+    if unix_seconds < created_at || unix_seconds > expires_at {
+        return Err(Error::BadParam(
+            "session key is outside its published validity period".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ── BMFF hash helper ─────────────────────────────────────────────────────────
@@ -765,19 +1088,21 @@ fn verify_segment_bmff_hash(full_segment: &[u8], bmff_hash_value: &c2pa_cbor::Va
 // ── Signer binding (§18.25.2) ────────────────────────────────────────────────
 //
 // Per the spec the `signerBinding` is a **detached** COSE_Sign1 where:
-//   - the **session key** signs (EdDSA since we use Ed25519),
+//   - the **session key** signs,
 //   - the **payload** is the signer's end-entity certificate encoded as a CBOR
 //     byte string (used in Sig_structure but NOT carried in the COSE_Sign1).
 
 fn build_signer_binding(
     ee_cert_der: &[u8],
-    session_signing_key: &SigningKey,
+    algorithm: SigningAlg,
+    session_signer: &dyn VsiSessionSigner,
+    session_cose_key: &c2pa_cbor::Value,
 ) -> Result<c2pa_cbor::Value> {
     let external_payload = c2pa_cbor::to_vec(&c2pa_cbor::Value::Bytes(ee_cert_der.to_vec()))
         .map_err(|e| Error::BadParam(format!("failed to CBOR-encode EE certificate: {e}")))?;
 
     let protected = HeaderBuilder::new()
-        .algorithm(iana::Algorithm::EdDSA)
+        .algorithm(cose_algorithm(algorithm)?)
         .build();
 
     let mut sign1 = CoseSign1Builder::new().protected(protected).build();
@@ -785,8 +1110,14 @@ fn build_signer_binding(
     // signerBinding is a detached-payload COSE_Sign1: the cert bytes are the
     // external payload, not AAD. Use tbs_detached_data per RFC 9052 §4.4.
     let tbs = sign1.tbs_detached_data(&external_payload, b"");
-    let signature: ed25519_dalek::Signature = Ed25519Signer::sign(session_signing_key, &tbs);
-    sign1.signature = signature.to_bytes().to_vec();
+    sign1.signature = session_signer.sign(VsiSigningPurpose::SignerBinding, &tbs)?;
+    validate_callback_signature(algorithm, &sign1.signature)?;
+    super::session_key_validation::verify_cose_sign1_signature(&sign1, session_cose_key, &tbs)
+        .map_err(|e| {
+            Error::BadParam(format!(
+                "VSI signerBinding callback signature is invalid: {e}"
+            ))
+        })?;
 
     let binding_bytes = sign1
         .to_tagged_vec()
@@ -805,14 +1136,23 @@ fn build_signer_binding(
 
 fn build_vsi_cose_sign1(
     segment_info_map: &SegmentInfoMap,
-    signing_key: &SigningKey,
+    algorithm: SigningAlg,
+    session_signer: &dyn VsiSessionSigner,
+    session_cose_key: &c2pa_cbor::Value,
     kid: &[u8],
     iat: i64,
 ) -> Result<Vec<u8>> {
-    let mut sign1 = build_vsi_cose_sign1_unsigned(segment_info_map, kid, iat)?;
+    let mut sign1 = build_vsi_cose_sign1_unsigned(segment_info_map, algorithm, kid, iat)?;
     let tbs = sign1.tbs_data(b"");
-    let signature: ed25519_dalek::Signature = signing_key.sign(&tbs);
-    sign1.signature = signature.to_bytes().to_vec();
+    sign1.signature = session_signer.sign(
+        VsiSigningPurpose::Vsi {
+            sequence_number: segment_info_map.sequence_number,
+        },
+        &tbs,
+    )?;
+    validate_callback_signature(algorithm, &sign1.signature)?;
+    super::session_key_validation::verify_cose_sign1_signature(&sign1, session_cose_key, &tbs)
+        .map_err(|e| Error::BadParam(format!("VSI callback signature is invalid: {e}")))?;
 
     sign1
         .to_tagged_vec()
@@ -821,11 +1161,12 @@ fn build_vsi_cose_sign1(
 
 fn build_vsi_cose_sign1_dummy(
     segment_info_map: &SegmentInfoMap,
+    algorithm: SigningAlg,
     kid: &[u8],
     iat: i64,
 ) -> Result<Vec<u8>> {
-    let mut sign1 = build_vsi_cose_sign1_unsigned(segment_info_map, kid, iat)?;
-    sign1.signature = vec![0; ed25519_dalek::SIGNATURE_LENGTH];
+    let mut sign1 = build_vsi_cose_sign1_unsigned(segment_info_map, algorithm, kid, iat)?;
+    sign1.signature = vec![0; 64];
     sign1
         .to_tagged_vec()
         .map_err(|e| Error::BadParam(format!("failed to encode dummy COSE_Sign1: {e}")))
@@ -833,6 +1174,7 @@ fn build_vsi_cose_sign1_dummy(
 
 fn build_vsi_cose_sign1_unsigned(
     segment_info_map: &SegmentInfoMap,
+    algorithm: SigningAlg,
     kid: &[u8],
     iat: i64,
 ) -> Result<coset::CoseSign1> {
@@ -845,7 +1187,7 @@ fn build_vsi_cose_sign1_unsigned(
     // wall-clock time, which matters for any validation run after the fact (e.g. archival/VOD
     // validation of a recording), since the key's validity window is anchored to createdAt.
     let protected = HeaderBuilder::new()
-        .algorithm(iana::Algorithm::EdDSA)
+        .algorithm(cose_algorithm(algorithm)?)
         .text_value("iat".to_string(), coset::cbor::value::Value::from(iat))
         .build();
     let unprotected = HeaderBuilder::new().key_id(kid.to_vec()).build();
@@ -855,6 +1197,31 @@ fn build_vsi_cose_sign1_unsigned(
         .unprotected(unprotected)
         .payload(payload)
         .build())
+}
+
+fn cose_algorithm(algorithm: SigningAlg) -> Result<iana::Algorithm> {
+    match algorithm {
+        SigningAlg::Ed25519 => Ok(iana::Algorithm::EdDSA),
+        SigningAlg::Es256 => Ok(iana::Algorithm::ES256),
+        _ => Err(Error::BadParam(
+            "VSI session signing supports only Ed25519 and ES256".to_string(),
+        )),
+    }
+}
+
+fn validate_callback_signature(algorithm: SigningAlg, signature: &[u8]) -> Result<()> {
+    if signature.len() != 64 {
+        let format = if algorithm == SigningAlg::Es256 {
+            "64-byte P1363 r||s"
+        } else {
+            "64 raw bytes"
+        };
+        return Err(Error::BadParam(format!(
+            "VSI {algorithm:?} callback must return exactly {format}, got {} bytes",
+            signature.len()
+        )));
+    }
+    Ok(())
 }
 
 fn protected_iat(sign1: &coset::CoseSign1) -> Result<i64> {
@@ -936,6 +1303,8 @@ pub fn moof_sequence_number(segment_data: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    use std::sync::Mutex;
 
     use super::*;
     use crate::{
@@ -1133,6 +1502,17 @@ mod tests {
         (timescale, event_duration, id)
     }
 
+    fn overwrite_emsg_id(signed_segment: &mut [u8], id: u32) {
+        assert_eq!(&signed_segment[4..8], b"emsg");
+        let emsg_size = u32::from_be_bytes(signed_segment[..4].try_into().unwrap()) as usize;
+        let body = &signed_segment[8..emsg_size];
+        let fields = &body[4..];
+        let mut pos = fields.iter().position(|&byte| byte == 0).unwrap() + 1;
+        pos += fields[pos..].iter().position(|&byte| byte == 0).unwrap() + 1;
+        let id_offset = 8 + 4 + pos + 12;
+        signed_segment[id_offset..id_offset + 4].copy_from_slice(&id.to_be_bytes());
+    }
+
     fn make_test_signer() -> EphemeralSigner {
         EphemeralSigner::new("test-vsi.local").unwrap()
     }
@@ -1141,6 +1521,49 @@ mod tests {
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed).unwrap();
         SigningKey::from_bytes(&seed)
+    }
+
+    fn es256_cose_key(signing_key: &p256::ecdsa::SigningKey, kid: &[u8]) -> c2pa_cbor::Value {
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(c2pa_cbor::Value::Integer(1), c2pa_cbor::Value::Integer(2));
+        map.insert(
+            c2pa_cbor::Value::Integer(2),
+            c2pa_cbor::Value::Bytes(kid.to_vec()),
+        );
+        map.insert(c2pa_cbor::Value::Integer(3), c2pa_cbor::Value::Integer(-7));
+        map.insert(c2pa_cbor::Value::Integer(-1), c2pa_cbor::Value::Integer(1));
+        map.insert(
+            c2pa_cbor::Value::Integer(-2),
+            c2pa_cbor::Value::Bytes(point.x().unwrap().to_vec()),
+        );
+        map.insert(
+            c2pa_cbor::Value::Integer(-3),
+            c2pa_cbor::Value::Bytes(point.y().unwrap().to_vec()),
+        );
+        c2pa_cbor::Value::Map(map)
+    }
+
+    fn es256_config(
+        signing_key: &p256::ecdsa::SigningKey,
+        kid: &[u8],
+        min_sequence_number: u64,
+    ) -> VsiSessionConfig {
+        VsiSessionConfig {
+            algorithm: SigningAlg::Es256,
+            kid: kid.to_vec(),
+            public_cose_key_cbor: c2pa_cbor::to_vec(&es256_cose_key(signing_key, kid)).unwrap(),
+            min_sequence_number,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            validity_period_secs: 3600,
+        }
+    }
+
+    fn es256_signature(signing_key: &p256::ecdsa::SigningKey, tbs: &[u8]) -> Vec<u8> {
+        use p256::ecdsa::signature::Signer as _;
+
+        let signature: p256::ecdsa::Signature = signing_key.sign(tbs);
+        signature.to_bytes().to_vec()
     }
 
     /// A manifest with a `c2pa.created` action, required for `sign_init_segment`'s internal
@@ -1216,7 +1639,7 @@ mod tests {
         let signer = make_test_signer();
         let mut vsi_signer = make_vsi_signer(&signer, b"key-1", 1);
 
-        let session_keys = vsi_signer.build_session_keys_assertion();
+        let session_keys = vsi_signer.build_session_keys_assertion().unwrap();
         let ee_cert_der = signer.certs().unwrap().into_iter().next().unwrap();
         let mut validator = LiveVideoValidator::new();
         initialize_test_validator(&mut validator);
@@ -1276,7 +1699,7 @@ mod tests {
         let signer = make_test_signer();
         let vsi_signer = make_vsi_signer(&signer, b"key-1", 1);
 
-        let session_keys = vsi_signer.build_session_keys_assertion();
+        let session_keys = vsi_signer.build_session_keys_assertion().unwrap();
         let ee_cert_der = signer.certs().unwrap().into_iter().next().unwrap();
 
         let mut validator = LiveVideoValidator::new();
@@ -1334,7 +1757,17 @@ mod tests {
     #[test]
     fn resume_from_segment_advances_sequence_number() {
         let signer = make_test_signer();
-        let mut vsi_signer = make_vsi_signer(&signer, b"k", 1);
+        let session_key = make_test_signing_key();
+        let mut vsi_signer = LiveVideoVsiSigner::from_signing_key(
+            r#"{"assertions": []}"#,
+            &signer,
+            session_key.clone(),
+            b"k".to_vec(),
+            1,
+            3600,
+        )
+        .unwrap();
+        initialize_test_signer(&mut vsi_signer);
 
         let seg1 = vsi_signer
             .sign_media_segment(&make_test_segment(1))
@@ -1344,12 +1777,16 @@ mod tests {
         let mut resumed_signer = LiveVideoVsiSigner::from_signing_key(
             r#"{"assertions": []}"#,
             &signer,
-            vsi_signer.session_signing_key.clone(),
+            session_key,
             b"k".to_vec(),
             1,
             3600,
         )
         .unwrap();
+        // This test bypasses signed-init restoration, so copy the published
+        // key timestamp explicitly instead of relying on two constructors to
+        // run within the same wall-clock second.
+        resumed_signer.created_at = vsi_signer.created_at.clone();
         initialize_test_signer(&mut resumed_signer);
         resumed_signer.resume_from_segment(&seg1).unwrap();
         assert_eq!(resumed_signer.next_sequence_number(), 2);
@@ -1460,6 +1897,9 @@ mod tests {
             3600,
         )
         .unwrap();
+        // This test bypasses signed-init restoration, so preserve the first
+        // signer's published key timestamp explicitly.
+        signer2.created_at = signer1.created_at.clone();
         initialize_test_signer(&mut signer2);
         signer2.resume_from_segment(&seg1).unwrap();
         let seg2 = signer2.sign_media_segment(&make_test_segment(2)).unwrap();
@@ -1471,7 +1911,7 @@ mod tests {
         assert_eq!(map1.sequence_number, 1);
         assert_eq!(map2.sequence_number, 2);
 
-        let session_keys = signer2.build_session_keys_assertion();
+        let session_keys = signer2.build_session_keys_assertion().unwrap();
         let ee_cert_der = signer.certs().unwrap().into_iter().next().unwrap();
         let mut validator = LiveVideoValidator::new();
         initialize_test_validator(&mut validator);
@@ -1613,5 +2053,359 @@ mod tests {
         );
         assert_eq!(map1.sequence_number, 1);
         assert_eq!(map2.sequence_number, 2);
+    }
+
+    #[test]
+    fn es256_callback_signs_exact_structures_and_validates() {
+        crate::settings::set_settings_value("verify.verify_trust", false).unwrap();
+        let init_data =
+            include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
+        let manifest_signer = make_test_signer();
+        let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+        let config = es256_config(&session_key, b"es256-session", 1);
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let callback_key = Arc::clone(&session_key);
+        let callback_observations = Arc::clone(&observations);
+        let callback = move |purpose, tbs: &[u8]| {
+            callback_observations
+                .lock()
+                .unwrap()
+                .push((purpose, tbs.to_vec()));
+            Ok(es256_signature(&callback_key, tbs))
+        };
+
+        let mut vsi_signer = LiveVideoVsiSigner::from_session_signer(
+            test_manifest_json_with_actions(),
+            &manifest_signer,
+            config,
+            callback,
+        )
+        .unwrap();
+        assert!(observations.lock().unwrap().is_empty());
+
+        let signed_init = vsi_signer
+            .sign_init_segment(init_data, "video/mp4", &manifest_signer)
+            .unwrap();
+        let signed_media = vsi_signer
+            .sign_media_segment(&make_test_segment(1))
+            .unwrap();
+        let observed = observations.lock().unwrap().clone();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, VsiSigningPurpose::SignerBinding);
+        assert_eq!(observed[1].0, VsiSigningPurpose::Vsi { sequence_number: 1 });
+
+        let session_keys = vsi_signer.build_session_keys_assertion().unwrap();
+        let binding_bytes = super::super::session_key_validation::extract_signer_binding_bytes(
+            &session_keys.keys[0].signer_binding,
+        )
+        .unwrap();
+        let binding = coset::CoseSign1::from_tagged_slice(&binding_bytes).unwrap();
+        let ee_cert_der = manifest_signer.certs().unwrap().into_iter().next().unwrap();
+        let external_payload =
+            c2pa_cbor::to_vec(&c2pa_cbor::Value::Bytes(ee_cert_der.clone())).unwrap();
+        assert_eq!(
+            observed[0].1,
+            binding.tbs_detached_data(&external_payload, b"")
+        );
+        let event =
+            super::super::verifiable_segment_info::extract_vsi_emsg_from_segment(&signed_media)
+                .unwrap()
+                .unwrap();
+        let parsed = super::super::verifiable_segment_info::parse_vsi(&event.message_data).unwrap();
+        assert_eq!(observed[1].1, parsed.sign1.tbs_data(b""));
+
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = StatusTracker::default();
+        validator
+            .validate_init_segment(&signed_init, &mut tracker)
+            .unwrap();
+        validator
+            .validate_session_keys(
+                &session_keys,
+                vsi_signer.active_manifest_id().unwrap(),
+                Some(&ee_cert_der),
+                &mut tracker,
+            )
+            .unwrap();
+        validator
+            .validate_verifiable_segment_info(&signed_media, &mut tracker)
+            .unwrap();
+        assert!(tracker.filter_errors().next().is_none());
+    }
+
+    #[test]
+    fn generic_constructor_rejects_algorithm_key_and_kid_mismatches() {
+        let manifest_signer = make_test_signer();
+        let session_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let valid = es256_config(&session_key, b"correct-kid", 1);
+
+        let mut wrong_algorithm = valid.clone();
+        wrong_algorithm.algorithm = SigningAlg::Ed25519;
+        assert!(LiveVideoVsiSigner::from_session_signer(
+            r#"{"assertions": []}"#,
+            &manifest_signer,
+            wrong_algorithm,
+            |_, _: &[u8]| Err(Error::BadParam("must not sign".to_string())),
+        )
+        .is_err());
+
+        let mut wrong_kid = valid.clone();
+        wrong_kid.kid = b"wrong-kid".to_vec();
+        assert!(LiveVideoVsiSigner::from_session_signer(
+            r#"{"assertions": []}"#,
+            &manifest_signer,
+            wrong_kid,
+            |_, _: &[u8]| Err(Error::BadParam("must not sign".to_string())),
+        )
+        .is_err());
+
+        let mut invalid_point = valid;
+        let mut cose_key: c2pa_cbor::Value =
+            c2pa_cbor::from_slice(&invalid_point.public_cose_key_cbor).unwrap();
+        if let c2pa_cbor::Value::Map(map) = &mut cose_key {
+            map.insert(
+                c2pa_cbor::Value::Integer(-2),
+                c2pa_cbor::Value::Bytes(vec![0; 32]),
+            );
+            map.insert(
+                c2pa_cbor::Value::Integer(-3),
+                c2pa_cbor::Value::Bytes(vec![0; 32]),
+            );
+        }
+        invalid_point.public_cose_key_cbor = c2pa_cbor::to_vec(&cose_key).unwrap();
+        assert!(LiveVideoVsiSigner::from_session_signer(
+            r#"{"assertions": []}"#,
+            &manifest_signer,
+            invalid_point,
+            |_, _: &[u8]| Err(Error::BadParam("must not sign".to_string())),
+        )
+        .is_err());
+    }
+
+    #[derive(Clone, Copy)]
+    enum CallbackFailure {
+        Der,
+        Short,
+        Oversized,
+        Corrupt,
+        Error,
+    }
+
+    #[test]
+    fn callback_failures_do_not_advance_media_state() {
+        for failure in [
+            CallbackFailure::Der,
+            CallbackFailure::Short,
+            CallbackFailure::Oversized,
+            CallbackFailure::Corrupt,
+            CallbackFailure::Error,
+        ] {
+            let manifest_signer = make_test_signer();
+            let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+            let config = es256_config(&session_key, b"failure-key", 1);
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let callback_key = Arc::clone(&session_key);
+            let callback_observations = Arc::clone(&observations);
+            let callback = move |purpose, tbs: &[u8]| {
+                callback_observations.lock().unwrap().push(purpose);
+                if purpose == VsiSigningPurpose::SignerBinding {
+                    return Ok(es256_signature(&callback_key, tbs));
+                }
+                match failure {
+                    CallbackFailure::Der => {
+                        use p256::ecdsa::signature::Signer as _;
+                        let signature: p256::ecdsa::Signature = callback_key.sign(tbs);
+                        Ok(signature.to_der().as_bytes().to_vec())
+                    }
+                    CallbackFailure::Short => Ok(vec![0; 63]),
+                    CallbackFailure::Oversized => Ok(vec![0; 65]),
+                    CallbackFailure::Corrupt => Ok(vec![0; 64]),
+                    CallbackFailure::Error => {
+                        Err(Error::BadParam("callback refused signing".to_string()))
+                    }
+                }
+            };
+            let mut vsi_signer = LiveVideoVsiSigner::from_session_signer(
+                r#"{"assertions": []}"#,
+                &manifest_signer,
+                config,
+                callback,
+            )
+            .unwrap();
+            vsi_signer.ensure_signer_binding().unwrap();
+            initialize_test_signer(&mut vsi_signer);
+
+            assert!(vsi_signer
+                .sign_media_segment(&make_test_segment(1))
+                .is_err());
+            assert_eq!(vsi_signer.next_sequence_number(), 1);
+            assert_eq!(vsi_signer.next_event_id, 1);
+            assert_eq!(
+                observations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|purpose| matches!(purpose, VsiSigningPurpose::Vsi { .. }))
+                    .count(),
+                1,
+                "the draft sizing pass must not invoke the callback"
+            );
+        }
+    }
+
+    #[test]
+    fn es256_callback_recovers_artifacts_without_signing_and_resumes() {
+        crate::settings::set_settings_value("verify.verify_trust", false).unwrap();
+        let init_data =
+            include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
+        let manifest_signer = make_test_signer();
+        let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+        let config = es256_config(&session_key, b"recover-key", 1);
+
+        let first_key = Arc::clone(&session_key);
+        let mut first = LiveVideoVsiSigner::from_session_signer(
+            test_manifest_json_with_actions(),
+            &manifest_signer,
+            config.clone(),
+            move |_, tbs: &[u8]| Ok(es256_signature(&first_key, tbs)),
+        )
+        .unwrap();
+        let signed_init = first
+            .sign_init_segment(init_data, "video/mp4", &manifest_signer)
+            .unwrap();
+        let segment1 = first.sign_media_segment(&make_test_segment(1)).unwrap();
+
+        let init_only_observations = Arc::new(Mutex::new(Vec::new()));
+        let init_only_key = Arc::clone(&session_key);
+        let callback_observations = Arc::clone(&init_only_observations);
+        let mut init_only = LiveVideoVsiSigner::from_session_signer(
+            r#"{"assertions": []}"#,
+            &manifest_signer,
+            config.clone(),
+            move |purpose, tbs: &[u8]| {
+                callback_observations.lock().unwrap().push(purpose);
+                Ok(es256_signature(&init_only_key, tbs))
+            },
+        )
+        .unwrap();
+        init_only
+            .recover_from_artifacts(&signed_init, None, "video/mp4")
+            .unwrap();
+        assert!(init_only_observations.lock().unwrap().is_empty());
+        assert_eq!(init_only.next_sequence_number(), 1);
+        assert_eq!(init_only.next_event_id, 1);
+
+        let recovered_observations = Arc::new(Mutex::new(Vec::new()));
+        let recovered_key = Arc::clone(&session_key);
+        let callback_observations = Arc::clone(&recovered_observations);
+        let mut recovered = LiveVideoVsiSigner::from_session_signer(
+            r#"{"assertions": []}"#,
+            &manifest_signer,
+            config.clone(),
+            move |purpose, tbs: &[u8]| {
+                callback_observations.lock().unwrap().push(purpose);
+                Ok(es256_signature(&recovered_key, tbs))
+            },
+        )
+        .unwrap();
+        recovered
+            .recover_from_artifacts(&signed_init, Some(&segment1), "video/mp4")
+            .unwrap();
+        assert!(recovered_observations.lock().unwrap().is_empty());
+        assert_eq!(recovered.next_sequence_number(), 2);
+        let segment2 = recovered.sign_media_segment(&make_test_segment(2)).unwrap();
+        assert_eq!(
+            recovered_observations.lock().unwrap().as_slice(),
+            &[VsiSigningPurpose::Vsi { sequence_number: 2 }]
+        );
+
+        let failed_observations = Arc::new(Mutex::new(Vec::new()));
+        let failed_key = Arc::clone(&session_key);
+        let callback_observations = Arc::clone(&failed_observations);
+        let mut failed = LiveVideoVsiSigner::from_session_signer(
+            r#"{"assertions": []}"#,
+            &manifest_signer,
+            config,
+            move |purpose, tbs: &[u8]| {
+                callback_observations.lock().unwrap().push(purpose);
+                Ok(es256_signature(&failed_key, tbs))
+            },
+        )
+        .unwrap();
+        let mut tampered = segment1.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(failed
+            .recover_from_artifacts(&signed_init, Some(&tampered), "video/mp4")
+            .is_err());
+        assert!(failed.active_manifest_id().is_none());
+        assert_eq!(failed.next_sequence_number(), 1);
+        assert!(failed_observations.lock().unwrap().is_empty());
+
+        // emsg.id is outside both the COSE payload and bmffHash exclusion, so
+        // recovery must enforce the deterministic sequence-to-id invariant.
+        let mut tampered_id = segment1.clone();
+        overwrite_emsg_id(&mut tampered_id, 99);
+        assert!(failed
+            .recover_from_artifacts(&signed_init, Some(&tampered_id), "video/mp4")
+            .is_err());
+        assert!(failed.active_manifest_id().is_none());
+        assert_eq!(failed.next_sequence_number(), 1);
+        assert!(failed_observations.lock().unwrap().is_empty());
+
+        let session_keys = recovered.build_session_keys_assertion().unwrap();
+        let ee_cert_der = manifest_signer.certs().unwrap().into_iter().next().unwrap();
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = StatusTracker::default();
+        validator
+            .validate_init_segment(&signed_init, &mut tracker)
+            .unwrap();
+        validator
+            .validate_session_keys(
+                &session_keys,
+                recovered.active_manifest_id().unwrap(),
+                Some(&ee_cert_der),
+                &mut tracker,
+            )
+            .unwrap();
+        validator
+            .validate_verifiable_segment_info(&segment1, &mut tracker)
+            .unwrap();
+        validator
+            .validate_verifiable_segment_info(&segment2, &mut tracker)
+            .unwrap();
+        assert!(tracker.filter_errors().next().is_none());
+    }
+
+    #[test]
+    fn signer_binding_callback_failure_leaves_session_uninitialized() {
+        let init_data =
+            include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
+        let manifest_signer = make_test_signer();
+        let session_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let config = es256_config(&session_key, b"binding-failure", 1);
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let callback_observations = Arc::clone(&observations);
+        let mut vsi_signer = LiveVideoVsiSigner::from_session_signer(
+            test_manifest_json_with_actions(),
+            &manifest_signer,
+            config,
+            move |purpose, _: &[u8]| {
+                callback_observations.lock().unwrap().push(purpose);
+                Err(Error::BadParam("binding authorization denied".to_string()))
+            },
+        )
+        .unwrap();
+
+        assert!(vsi_signer
+            .sign_init_segment(init_data, "video/mp4", &manifest_signer)
+            .is_err());
+        assert_eq!(
+            observations.lock().unwrap().as_slice(),
+            &[VsiSigningPurpose::SignerBinding]
+        );
+        assert!(vsi_signer.active_manifest_id().is_none());
+        assert!(vsi_signer.signer_binding.is_none());
+        assert_eq!(vsi_signer.next_sequence_number(), 1);
+        assert_eq!(vsi_signer.next_event_id, 1);
     }
 }

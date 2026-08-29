@@ -13,6 +13,7 @@
 
 use c2pa_raw_crypto::validator_for_signing_alg;
 use coset::TaggedCborSerializable;
+use pkcs8::DecodePublicKey;
 
 use super::{
     cose_key::{cose_key_to_der, kid_from_cose_key, signing_alg_from_cose_key},
@@ -337,30 +338,8 @@ impl LiveVideoValidator {
         sign1: &coset::CoseSign1,
         session_key: &SessionKey,
     ) -> std::result::Result<(), String> {
-        let alg = signing_alg_from_cose_key(&session_key.key).ok_or_else(|| {
-            "unsupported or inconsistent key type, curve, or alg in session COSE_Key".to_string()
-        })?;
-
-        let protected_alg = crate::crypto::cose::signing_alg_from_sign1(sign1)
-            .map_err(|_| "COSE_Sign1 must contain a supported protected alg".to_string())?;
-        if protected_alg != alg || sign1.unprotected.alg.is_some() {
-            return Err(
-                "COSE_Sign1 protected alg must agree with the session COSE_Key and must not be duplicated in the unprotected header"
-                    .to_string(),
-            );
-        }
-
-        let public_key_der = cose_key_to_der(&session_key.key)
-            .ok_or_else(|| "failed to convert session key to DER".to_string())?;
-
-        let validator = validator_for_signing_alg(alg)
-            .ok_or_else(|| format!("no validator available for {alg:?}"))?;
-
         let tbs = sign1.tbs_data(b"");
-
-        validator
-            .validate(&sign1.signature, &tbs, &public_key_der)
-            .map_err(|e| format!("COSE_Sign1 signature verification failed: {e}"))
+        verify_cose_sign1_signature(sign1, &session_key.key, &tbs)
     }
 
     /// Verifies the `signerBinding` detached COSE_Sign1 on a session key (§18.25.2).
@@ -410,42 +389,6 @@ impl LiveVideoValidator {
             );
         }
 
-        let Some(alg) = signing_alg_from_cose_key(&key.key) else {
-            return reject_signer_binding(
-                "signerBinding: unsupported or missing algorithm in session COSE_Key",
-                tracker,
-            );
-        };
-        let protected_alg = match crate::crypto::cose::signing_alg_from_sign1(&sign1) {
-            Ok(alg) => alg,
-            Err(_) => {
-                return reject_signer_binding(
-                    "signerBinding must contain a supported protected alg",
-                    tracker,
-                );
-            }
-        };
-        if protected_alg != alg || sign1.unprotected.alg.is_some() {
-            return reject_signer_binding(
-                "signerBinding protected alg must agree with the session COSE_Key and must not be duplicated in the unprotected header",
-                tracker,
-            );
-        }
-
-        let Some(session_public_key_der) = cose_key_to_der(&key.key) else {
-            return reject_signer_binding(
-                "failed to convert session COSE_Key to DER for signerBinding verification",
-                tracker,
-            );
-        };
-
-        let Some(validator) = validator_for_signing_alg(alg) else {
-            return reject_signer_binding(
-                format!("no signature validator available for {alg:?}"),
-                tracker,
-            );
-        };
-
         let external_payload = c2pa_cbor::to_vec(&c2pa_cbor::Value::Bytes(ee_cert_der.to_vec()))
             .map_err(|e| {
                 let _ = fail_validation(
@@ -459,7 +402,7 @@ impl LiveVideoValidator {
         // signerBinding is a detached-payload COSE_Sign1: the cert bytes are the
         // external payload, not AAD. Use tbs_detached_data per RFC 9052 §4.4.
         let tbs = sign1.tbs_detached_data(&external_payload, b"");
-        if let Err(e) = validator.validate(&sign1.signature, &tbs, &session_public_key_der) {
+        if let Err(e) = verify_cose_sign1_signature(&sign1, &key.key, &tbs) {
             return reject_signer_binding(
                 format!("signerBinding signature verification failed: {e}"),
                 tracker,
@@ -468,6 +411,52 @@ impl LiveVideoValidator {
 
         Ok(true)
     }
+}
+
+/// Verifies a COSE_Sign1 signature over an already assembled Sig_structure.
+///
+/// Signing and recovery use this same path as validation so callback output is
+/// checked against the published COSE_Key before any bytes or state are committed.
+pub(super) fn verify_cose_sign1_signature(
+    sign1: &coset::CoseSign1,
+    cose_key: &c2pa_cbor::Value,
+    tbs: &[u8],
+) -> std::result::Result<(), String> {
+    let alg = signing_alg_from_cose_key(cose_key).ok_or_else(|| {
+        "unsupported or inconsistent key type, curve, or alg in session COSE_Key".to_string()
+    })?;
+
+    let protected_alg = crate::crypto::cose::signing_alg_from_sign1(sign1)
+        .map_err(|_| "COSE_Sign1 must contain a supported protected alg".to_string())?;
+    if protected_alg != alg || sign1.unprotected.alg.is_some() {
+        return Err(
+            "COSE_Sign1 protected alg must agree with the session COSE_Key and must not be duplicated in the unprotected header"
+                .to_string(),
+        );
+    }
+
+    let public_key_der = cose_key_to_der(cose_key)
+        .ok_or_else(|| "failed to convert session key to DER".to_string())?;
+
+    // Keep Ed25519 validation strict across signing, normal validation, and
+    // artifact recovery. This rejects non-canonical and weak-key signatures
+    // that a backend's generic Ed25519 verifier might otherwise accept.
+    if alg == crate::SigningAlg::Ed25519 {
+        let public_key = ed25519_dalek::VerifyingKey::from_public_key_der(&public_key_der)
+            .map_err(|e| format!("invalid Ed25519 session public key: {e}"))?;
+        let signature = ed25519_dalek::Signature::try_from(sign1.signature.as_slice())
+            .map_err(|e| format!("invalid Ed25519 session signature encoding: {e}"))?;
+        return public_key
+            .verify_strict(tbs, &signature)
+            .map_err(|e| format!("COSE_Sign1 signature verification failed: {e}"));
+    }
+
+    let validator = validator_for_signing_alg(alg)
+        .ok_or_else(|| format!("no validator available for {alg:?}"))?;
+
+    validator
+        .validate(&sign1.signature, tbs, &public_key_der)
+        .map_err(|e| format!("COSE_Sign1 signature verification failed: {e}"))
 }
 
 /// Records a `livevideo.sessionkey.invalid` failure and returns `Ok(false)`, the shared shape

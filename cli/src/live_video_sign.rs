@@ -229,28 +229,39 @@ pub fn sign_live_video_vsi(
             )
         })?;
         let format = format_from_path(init_path).unwrap_or_else(|| "video/mp4".to_string());
-        vsi_signer
-            .restore_manifest_id_from_signed_init(&signed_init_data, &format)
-            .with_context(|| {
-                format!("Failed to restore manifest ID from signed init: {signed_init_path:?}")
-            })?;
-
         let prev_data = fs::read(prev_path)
             .with_context(|| format!("Failed to read previous segment: {prev_path:?}"))?;
         vsi_signer
-            .resume_from_segment(&prev_data)
-            .with_context(|| format!("Failed to resume from segment: {prev_path:?}"))?;
+            .recover_from_artifacts(&signed_init_data, Some(&prev_data), &format)
+            .with_context(|| {
+                format!(
+                    "Failed to recover from signed init {signed_init_path:?} and segment {prev_path:?}"
+                )
+            })?;
     } else {
         let signed_init_path = output_path_for(init_path, output_dir)?;
         if signed_init_path.exists() {
+            if let Some(existing_segment) = segment_paths
+                .iter()
+                .map(|path| output_path_for(path, output_dir))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .find(|path| path.exists())
+            {
+                bail!(
+                    "Signed media output already exists at {existing_segment:?}; init-only recovery cannot safely restore sequence state. Resume with --previous-segment pointing to the last committed signed segment."
+                );
+            }
             let signed_init_data = fs::read(&signed_init_path).with_context(|| {
                 format!("Failed to read existing signed init segment: {signed_init_path:?}")
             })?;
             let format = format_from_path(init_path).unwrap_or_else(|| "video/mp4".to_string());
             vsi_signer
-                .restore_manifest_id_from_signed_init(&signed_init_data, &format)
+                .recover_from_artifacts(&signed_init_data, None, &format)
                 .with_context(|| {
-                    format!("Failed to restore existing signed init: {signed_init_path:?}")
+                    format!(
+                        "Failed to recover the unpublished session from existing signed init: {signed_init_path:?}"
+                    )
                 })?;
         } else {
             // First invocation: sign the init segment and capture its manifest ID.

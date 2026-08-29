@@ -48,6 +48,8 @@ tokio = { version = "1.52", features = ["rt-multi-thread", "rt"] }
 tokio = { version = "1.52", features = ["rt", "macros", "io-util", "time"] }
 
 [dev-dependencies]
+c2pa_cbor = "0.77.2"
+p256 = { version = "0.13.2", features = ["ecdsa"] }
 tempfile = "3.27.0"
 
 [build-dependencies]
