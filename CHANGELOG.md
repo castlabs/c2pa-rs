@@ -18,6 +18,8 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
   follow that mapping cannot be resumed; non-canonical Ed25519 signatures are rejected.
 * Add explicit-time live-video VSI media signing while keeping protected `iat` mandatory. The
   supplied Unix timestamp drives key-validity checks, sizing, final signatures, and callbacks.
+* Add an allocation-free experimental C FFI probe for reading the 32-bit
+  `moof/mfhd.sequence_number` from a live-video media segment.
 
 ## [0.89.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.2...c2pa-v0.89.3)
 _13 July 2026_

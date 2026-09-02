@@ -114,6 +114,36 @@ pub struct C2paLiveVideoVsiSigner {
     signer: LiveVideoVsiSigner,
 }
 
+/// Reads the ISO BMFF `moof/mfhd.sequence_number` from one media segment.
+///
+/// The output is a `u32` because ISO/IEC 14496-12 defines the field as an
+/// unsigned 32-bit integer. Returns zero on success or -1 on failure. When
+/// `sequence_number` is non-null, it is set to zero before input validation and
+/// remains zero on failure. No live-video session, key, callback, or allocation
+/// is involved.
+///
+/// # Safety
+///
+/// `media_segment` must point to a readable buffer of exactly
+/// `media_segment_len` bytes, and `sequence_number` must point to writable
+/// `u32` storage.
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_live_video_moof_sequence_number(
+    media_segment: *const c_uchar,
+    media_segment_len: usize,
+    sequence_number: *mut u32,
+) -> c_int {
+    ptr_or_return_int!(sequence_number);
+    *sequence_number = 0;
+    let media_segment = bytes_or_return_int!(media_segment, media_segment_len, "media_segment");
+    let parsed = ok_or_return_int!(c2pa::live_video::moof_sequence_number(media_segment)
+        .ok_or_else(|| c2pa::Error::BadParam(
+            "media segment must contain exactly one moof/traf and a valid mfhd".to_string()
+        )));
+    *sequence_number = parsed;
+    0
+}
+
 /// Creates a stateful local Ed25519 VSI signing session.
 ///
 /// The context is borrowed and retained internally. It must have a manifest signer configured.
@@ -597,6 +627,148 @@ mod tests {
         let mfhd = media.windows(4).position(|bytes| bytes == b"mfhd").unwrap();
         media[mfhd + 8..mfhd + 12].copy_from_slice(&sequence_number.to_be_bytes());
         media
+    }
+
+    fn bmff_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&u32::try_from(8 + payload.len()).unwrap().to_be_bytes());
+        data.extend_from_slice(box_type);
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn probe_media_segment(sequence_number: u32) -> Vec<u8> {
+        let mut mfhd_payload = vec![0; 4];
+        mfhd_payload.extend_from_slice(&sequence_number.to_be_bytes());
+        let mfhd = bmff_box(b"mfhd", &mfhd_payload);
+        let traf = bmff_box(b"traf", &[]);
+        bmff_box(b"moof", &[mfhd, traf].concat())
+    }
+
+    #[test]
+    fn ffi_moof_sequence_probe_reads_nonzero_fixture() {
+        let media = include_bytes!(fixture_path!("bunny/bunny_791182bps/BigBuckBunny_2s5.m4s"));
+        let expected = c2pa::live_video::moof_sequence_number(media).unwrap();
+        assert_ne!(expected, 0);
+        let mut sequence_number = 0;
+
+        assert_eq!(
+            unsafe {
+                c2pa_live_video_moof_sequence_number(
+                    media.as_ptr(),
+                    media.len(),
+                    &mut sequence_number,
+                )
+            },
+            0
+        );
+        assert_eq!(sequence_number, expected);
+
+        let media = probe_media_segment(37);
+        assert_eq!(
+            unsafe {
+                c2pa_live_video_moof_sequence_number(
+                    media.as_ptr(),
+                    media.len(),
+                    &mut sequence_number,
+                )
+            },
+            0
+        );
+        assert_eq!(sequence_number, 37);
+
+        let media = probe_media_segment(0);
+        sequence_number = 99;
+        assert_eq!(
+            unsafe {
+                c2pa_live_video_moof_sequence_number(
+                    media.as_ptr(),
+                    media.len(),
+                    &mut sequence_number,
+                )
+            },
+            0
+        );
+        assert_eq!(sequence_number, 0);
+    }
+
+    #[test]
+    fn ffi_moof_sequence_probe_rejects_invalid_box_layouts() {
+        let valid = probe_media_segment(37);
+        let duplicate_moof = [valid.as_slice(), valid.as_slice()].concat();
+
+        let mfhd = bmff_box(b"mfhd", &[0, 0, 0, 0, 0, 0, 0, 37]);
+        let duplicate_mfhd = bmff_box(
+            b"moof",
+            &[
+                mfhd.as_slice(),
+                mfhd.as_slice(),
+                bmff_box(b"traf", &[]).as_slice(),
+            ]
+            .concat(),
+        );
+
+        let traf = bmff_box(b"traf", &[]);
+        let duplicate_traf = bmff_box(
+            b"moof",
+            &[
+                bmff_box(b"mfhd", &[0, 0, 0, 0, 0, 0, 0, 37]).as_slice(),
+                traf.as_slice(),
+                traf.as_slice(),
+            ]
+            .concat(),
+        );
+        let no_moof = bmff_box(b"mdat", &[]);
+
+        let cases: &[&[u8]] = &[
+            b"",
+            b"not bmff",
+            no_moof.as_slice(),
+            duplicate_moof.as_slice(),
+            duplicate_mfhd.as_slice(),
+            duplicate_traf.as_slice(),
+        ];
+        for media in cases {
+            let mut sequence_number = 99;
+            let result = unsafe {
+                c2pa_live_video_moof_sequence_number(
+                    media.as_ptr(),
+                    media.len(),
+                    &mut sequence_number,
+                )
+            };
+            assert_eq!(result, -1);
+            assert_eq!(sequence_number, 0);
+        }
+    }
+
+    #[test]
+    fn ffi_moof_sequence_probe_validates_pointers_and_lengths() {
+        let media = probe_media_segment(37);
+
+        assert_eq!(
+            unsafe {
+                c2pa_live_video_moof_sequence_number(
+                    media.as_ptr(),
+                    media.len(),
+                    std::ptr::null_mut(),
+                )
+            },
+            -1
+        );
+
+        for (input, len) in [
+            (std::ptr::null(), 0),
+            (std::ptr::null(), 1),
+            (media.as_ptr(), 0),
+        ] {
+            let mut sequence_number = 99;
+            assert_eq!(
+                unsafe { c2pa_live_video_moof_sequence_number(input, len, &mut sequence_number) },
+                -1
+            );
+            assert_eq!(sequence_number, 0);
+        }
     }
 
     #[test]
