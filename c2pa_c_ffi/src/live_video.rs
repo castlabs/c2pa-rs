@@ -294,6 +294,39 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_sign_media_segment(
     len
 }
 
+/// Signs one media segment at an explicit Unix timestamp and advances the
+/// session counter exactly once on success.
+///
+/// The timestamp is encoded as the mandatory protected COSE `iat`, drives the
+/// session-key validity check, and is included in the callback TBS. The returned
+/// byte buffer is tracked and must be released with `c2pa_free()`.
+///
+/// # Safety
+///
+/// `signer` must be a valid live-video handle. `media_segment` must remain readable for this
+/// call. `signed_segment` must point to writable pointer storage.
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_live_video_vsi_signer_sign_media_segment_at(
+    signer: *mut C2paLiveVideoVsiSigner,
+    media_segment: *const c_uchar,
+    media_segment_len: usize,
+    signing_time_unix_seconds: i64,
+    signed_segment: *mut *const c_uchar,
+) -> i64 {
+    let signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
+    let media_segment = bytes_or_return_int!(media_segment, media_segment_len, "media_segment");
+    ptr_or_return_int!(signed_segment);
+    *signed_segment = std::ptr::null();
+
+    let signed = ok_or_return_int!(signer
+        .signer
+        .sign_media_segment_at(media_segment, signing_time_unix_seconds));
+    let len = ok_or_return_int!(i64::try_from(signed.len())
+        .map_err(|_| { c2pa::Error::BadParam("signed media segment is too large".to_string()) }));
+    *signed_segment = to_c_bytes(signed);
+    len
+}
+
 /// Recovers a VSI session from previously published signed artifacts.
 ///
 /// The signed init is mandatory. Pass `previous_media_segment = NULL` and
@@ -729,11 +762,32 @@ mod tests {
                 )
             );
 
+            let mut invalid_output = std::ptr::dangling::<c_uchar>();
+            assert_eq!(
+                c2pa_live_video_vsi_signer_sign_media_segment_at(
+                    live,
+                    media.as_ptr(),
+                    media.len(),
+                    1_577_836_799,
+                    &mut invalid_output,
+                ),
+                -1
+            );
+            assert!(invalid_output.is_null());
+            assert_eq!(state.observations.len(), 1);
+            let mut next = 0;
+            assert_eq!(
+                c2pa_live_video_vsi_signer_next_sequence_number(live, &mut next),
+                0
+            );
+            assert_eq!(next, u64::from(sequence));
+
             let mut signed_media = std::ptr::null();
-            let media_len = c2pa_live_video_vsi_signer_sign_media_segment(
+            let media_len = c2pa_live_video_vsi_signer_sign_media_segment_at(
                 live,
                 media.as_ptr(),
                 media.len(),
+                1_577_836_800,
                 &mut signed_media,
             );
             assert!(media_len > media.len() as i64);
@@ -763,7 +817,6 @@ mod tests {
                 0
             );
             assert!(recovered_state.observations.is_empty());
-            let mut next = 0;
             assert_eq!(
                 c2pa_live_video_vsi_signer_next_sequence_number(recovered, &mut next),
                 0

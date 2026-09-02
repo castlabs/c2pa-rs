@@ -16,6 +16,8 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 * Tighten experimental VSI validation and recovery by requiring the deterministic `emsg.id`
   sequence mapping and strict Ed25519 verification. Older experimental artifacts that did not
   follow that mapping cannot be resumed; non-canonical Ed25519 signatures are rejected.
+* Add explicit-time live-video VSI media signing while keeping protected `iat` mandatory. The
+  supplied Unix timestamp drives key-validity checks, sizing, final signatures, and callbacks.
 
 ## [0.89.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.2...c2pa-v0.89.3)
 _13 July 2026_

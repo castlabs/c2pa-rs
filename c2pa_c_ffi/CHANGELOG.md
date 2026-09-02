@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Add an experimental synchronous callback constructor for non-exportable
   Ed25519/ES256 VSI session keys, explicit signing purpose and sequence
   metadata, and validated signed-init/previous-segment recovery.
+* Add `c2pa_live_video_vsi_signer_sign_media_segment_at` for deterministic,
+  explicit-time VSI signing with a mandatory protected `iat`.
 
 ## [0.88.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-c-ffi-v0.87.0...c2pa-c-ffi-v0.88.0)
 _11 June 2026_

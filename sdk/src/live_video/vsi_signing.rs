@@ -472,6 +472,20 @@ impl LiveVideoVsiSigner {
     /// sequence number, a `bmffHash` covering the segment data excluding VSI
     /// `emsg` boxes, and the `manifestId` from the signed init segment per §19.4.
     pub fn sign_media_segment(&mut self, segment_data: &[u8]) -> Result<Vec<u8>> {
+        let signing_time_unix_seconds = chrono::Utc::now().timestamp();
+        self.sign_media_segment_at(segment_data, signing_time_unix_seconds)
+    }
+
+    /// Signs a media segment at an explicit Unix timestamp.
+    ///
+    /// `signing_time_unix_seconds` is encoded as the mandatory protected COSE
+    /// `iat`, used for session-key validity checks, and included in the exact
+    /// Sig_structure passed to a callback-backed session signer.
+    pub fn sign_media_segment_at(
+        &mut self,
+        segment_data: &[u8],
+        signing_time_unix_seconds: i64,
+    ) -> Result<Vec<u8>> {
         if super::verifiable_segment_info::contains_c2pa_vsi_scheme(segment_data) {
             return Err(Error::BadParam(
                 "media segment already contains a C2PA VSI emsg box".to_string(),
@@ -525,7 +539,7 @@ impl LiveVideoVsiSigner {
         let next_sequence_number = sequence_number.checked_add(1).ok_or_else(|| {
             Error::BadParam("VSI sequenceNumber cannot advance past u64::MAX".to_string())
         })?;
-        let iat = chrono::Utc::now().timestamp();
+        let iat = signing_time_unix_seconds;
         self.ensure_key_valid_at(iat)?;
 
         // Two passes: the offset-prefix (§18.6.2) must reflect each box's absolute offset
@@ -990,7 +1004,14 @@ impl LiveVideoVsiSigner {
 }
 
 fn ensure_key_valid_at(created_at: &DateT, validity_period: u64, unix_seconds: i64) -> Result<()> {
-    use chrono::DateTime;
+    use chrono::{DateTime, TimeZone};
+
+    chrono::Utc
+        .timestamp_opt(unix_seconds, 0)
+        .single()
+        .ok_or_else(|| {
+            Error::BadParam("VSI signing time is outside the supported range".to_string())
+        })?;
 
     let created_at: DateTime<chrono::Utc> = created_at.0.parse().map_err(|_| {
         Error::BadParam("session key createdAt is not a valid RFC 3339 datetime".to_string())
@@ -1181,8 +1202,8 @@ fn build_vsi_cose_sign1_unsigned(
     let payload = c2pa_cbor::to_vec(segment_info_map)
         .map_err(|e| Error::BadParam(format!("failed to encode SegmentInfoMap: {e}")))?;
 
-    // Per §19.4.1, the protected header may carry an `iat` field: a `NumericDate` (RFC 8392)
-    // giving the "claimed time of signing". Populating it lets a validator check the segment
+    // The live-video profile requires a protected `iat` field: a `NumericDate` (RFC 8392)
+    // giving the "claimed time of signing". It lets a validator check the segment
     // against the session key's validity period using this claimed time rather than its own
     // wall-clock time, which matters for any validation run after the fact (e.g. archival/VOD
     // validation of a recording), since the key's validity window is anchored to createdAt.
@@ -1614,6 +1635,104 @@ mod tests {
             vsi_payload.is_some(),
             "VSI emsg payload not found in signed segment"
         );
+    }
+
+    #[test]
+    fn explicit_time_is_protected_iat_and_produces_stable_callback_tbs() {
+        let manifest_signer = make_test_signer();
+        let session_key = Arc::new(p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap());
+        let mut config = es256_config(&session_key, b"explicit-time", 1);
+        config.created_at = "2020-01-01T00:00:00Z".to_string();
+        config.validity_period_secs = 60;
+        let signing_time = 1_577_836_830;
+
+        let make_signer = |observations: Arc<Mutex<Vec<Vec<u8>>>>| {
+            let callback_key = Arc::clone(&session_key);
+            let mut signer = LiveVideoVsiSigner::from_session_signer(
+                r#"{"assertions": []}"#,
+                &manifest_signer,
+                config.clone(),
+                move |purpose, tbs: &[u8]| {
+                    assert_eq!(purpose, VsiSigningPurpose::Vsi { sequence_number: 1 });
+                    observations.lock().unwrap().push(tbs.to_vec());
+                    Ok(es256_signature(&callback_key, tbs))
+                },
+            )
+            .unwrap();
+            initialize_test_signer(&mut signer);
+            signer
+        };
+
+        let first_observations = Arc::new(Mutex::new(Vec::new()));
+        let second_observations = Arc::new(Mutex::new(Vec::new()));
+        let mut first = make_signer(Arc::clone(&first_observations));
+        let mut second = make_signer(Arc::clone(&second_observations));
+        let input = make_test_segment(1);
+        let signed = first.sign_media_segment_at(&input, signing_time).unwrap();
+        second.sign_media_segment_at(&input, signing_time).unwrap();
+
+        let event = super::super::verifiable_segment_info::extract_vsi_emsg_from_segment(&signed)
+            .unwrap()
+            .unwrap();
+        let parsed = super::super::verifiable_segment_info::parse_vsi(&event.message_data).unwrap();
+        assert_eq!(protected_iat(&parsed.sign1).unwrap(), signing_time);
+        assert_eq!(first_observations.lock().unwrap().len(), 1);
+        assert_eq!(second_observations.lock().unwrap().len(), 1);
+        let first_tbs = first_observations.lock().unwrap()[0].clone();
+        let second_tbs = second_observations.lock().unwrap()[0].clone();
+        assert_eq!(
+            first_tbs, second_tbs,
+            "the same restored public state, input, and explicit time must produce identical TBS"
+        );
+    }
+
+    #[test]
+    fn explicit_time_validity_boundaries_are_inclusive_and_transactional() {
+        let manifest_signer = make_test_signer();
+        let session_key = Arc::new(p256::ecdsa::SigningKey::from_slice(&[22u8; 32]).unwrap());
+        let mut config = es256_config(&session_key, b"validity-boundaries", 1);
+        config.created_at = "2020-01-01T00:00:00Z".to_string();
+        config.validity_period_secs = 60;
+        let created_at = 1_577_836_800;
+        let expires_at = created_at + 60;
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let callback_key = Arc::clone(&session_key);
+        let callback_observations = Arc::clone(&observations);
+        let mut signer = LiveVideoVsiSigner::from_session_signer(
+            r#"{"assertions": []}"#,
+            &manifest_signer,
+            config,
+            move |purpose, tbs: &[u8]| {
+                callback_observations.lock().unwrap().push(purpose);
+                Ok(es256_signature(&callback_key, tbs))
+            },
+        )
+        .unwrap();
+        initialize_test_signer(&mut signer);
+
+        assert!(signer
+            .sign_media_segment_at(&make_test_segment(1), created_at - 1)
+            .is_err());
+        assert_eq!(signer.next_sequence_number(), 1);
+        assert_eq!(signer.next_event_id, 1);
+        assert!(observations.lock().unwrap().is_empty());
+
+        signer
+            .sign_media_segment_at(&make_test_segment(1), created_at)
+            .unwrap();
+        signer
+            .sign_media_segment_at(&make_test_segment(2), expires_at)
+            .unwrap();
+        assert_eq!(signer.next_sequence_number(), 3);
+        assert_eq!(signer.next_event_id, 3);
+        assert_eq!(observations.lock().unwrap().len(), 2);
+
+        assert!(signer
+            .sign_media_segment_at(&make_test_segment(3), expires_at + 1)
+            .is_err());
+        assert_eq!(signer.next_sequence_number(), 3);
+        assert_eq!(signer.next_event_id, 3);
+        assert_eq!(observations.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -2260,7 +2379,10 @@ mod tests {
             include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
         let manifest_signer = make_test_signer();
         let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
-        let config = es256_config(&session_key, b"recover-key", 1);
+        let mut config = es256_config(&session_key, b"recover-key", 1);
+        config.created_at = "2020-01-01T00:00:00Z".to_string();
+        config.validity_period_secs = 1_000_000_000;
+        let historical_signing_time = 1_577_836_801;
 
         let first_key = Arc::clone(&session_key);
         let mut first = LiveVideoVsiSigner::from_session_signer(
@@ -2273,7 +2395,9 @@ mod tests {
         let signed_init = first
             .sign_init_segment(init_data, "video/mp4", &manifest_signer)
             .unwrap();
-        let segment1 = first.sign_media_segment(&make_test_segment(1)).unwrap();
+        let segment1 = first
+            .sign_media_segment_at(&make_test_segment(1), historical_signing_time)
+            .unwrap();
 
         let init_only_observations = Arc::new(Mutex::new(Vec::new()));
         let init_only_key = Arc::clone(&session_key);
@@ -2313,7 +2437,9 @@ mod tests {
             .unwrap();
         assert!(recovered_observations.lock().unwrap().is_empty());
         assert_eq!(recovered.next_sequence_number(), 2);
-        let segment2 = recovered.sign_media_segment(&make_test_segment(2)).unwrap();
+        let segment2 = recovered
+            .sign_media_segment_at(&make_test_segment(2), historical_signing_time + 1)
+            .unwrap();
         assert_eq!(
             recovered_observations.lock().unwrap().as_slice(),
             &[VsiSigningPurpose::Vsi { sequence_number: 2 }]
