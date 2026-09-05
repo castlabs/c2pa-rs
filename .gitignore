@@ -19,3 +19,6 @@ cli/target
 .cursor/rules/manifest.json
 .cursor/rules/security-global/*
 .cursor/rules/security-lang/*
+
+# Python release-qualification helpers.
+/scripts/**/__pycache__/
