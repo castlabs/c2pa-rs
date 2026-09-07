@@ -48,7 +48,7 @@ jobs:
             native: libc2pa_c.so
             c2patool: c2patool
             import_library: ""
-          - os: windows-2025
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
             native: c2pa_c.dll
             c2patool: c2patool.exe
