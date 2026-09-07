@@ -585,6 +585,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("C:\\Strawberry\\perl\\bin\\perl.exe", text)
         self.assertIn("-MLocale::Maketext::Simple", text)
         self.assertIn("$env:GITHUB_PATH", text)
+        self.assertIn("export PERL='C:\\Strawberry\\perl\\bin\\perl.exe'", text)
+        self.assertLess(
+            text.index("export PERL='C:\\Strawberry\\perl\\bin\\perl.exe'"),
+            text.index("cargo +1.88.0 build --locked --release"),
+        )
         self.assertIn("cargo +nightly-2026-01-16 fmt --all -- --check", text)
         self.assertIn('CARGO_BUILD_JOBS: "1"', text)
         self.assertIn("timeout-minutes: 240", text)

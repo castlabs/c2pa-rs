@@ -137,6 +137,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export PERL='C:\Strawberry\perl\bin\perl.exe'
+            "$PERL" -MLocale::Maketext::Simple -e '1'
+          fi
           rm -f "target/${{ matrix.target }}/release/c2pa.h"
           touch c2pa_c_ffi/build.rs
           cargo +1.88.0 build --locked --release --manifest-path c2pa_c_ffi/Cargo.toml --target "${{ matrix.target }}" --no-default-features --features "$FFI_FEATURES"
