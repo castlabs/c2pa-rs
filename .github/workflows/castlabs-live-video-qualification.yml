@@ -78,6 +78,20 @@ jobs:
           toolchain: nightly-2026-01-16
           components: rustfmt
 
+      - name: Select complete Windows Perl for vendored OpenSSL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $perl = "C:\Strawberry\perl\bin\perl.exe"
+          if (-not (Test-Path -LiteralPath $perl -PathType Leaf)) {
+            throw "the pinned Windows runner does not provide Strawberry Perl"
+          }
+          & $perl -MLocale::Maketext::Simple -e "1"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Strawberry Perl is missing Locale::Maketext::Simple"
+          }
+          "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
