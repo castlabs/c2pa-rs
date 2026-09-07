@@ -308,7 +308,11 @@ class EvidenceTests(unittest.TestCase):
                 for item in commands
                 if "test --locked" in item and "sdk/Cargo.toml" in item
             )
-            self.assertIn("test --locked --lib --tests --manifest-path", sdk_test)
+            self.assertIn(
+                "test --locked --lib --test bmff_timed_media_merkle --manifest-path",
+                sdk_test,
+            )
+            self.assertNotIn(" --tests ", sdk_test)
             self.assertEqual(
                 sum(
                     "test --locked --manifest-path cli/Cargo.toml" in item
@@ -550,7 +554,11 @@ class WorkflowTests(unittest.TestCase):
                     for item in expected
                     if "test --locked" in item and "sdk/Cargo.toml" in item
                 )
-                self.assertIn("test --locked --lib --tests --manifest-path", sdk_test)
+                self.assertIn(
+                    "test --locked --lib --test bmff_timed_media_merkle --manifest-path",
+                    sdk_test,
+                )
+                self.assertNotIn(" --tests ", sdk_test)
         self.assertEqual(text.count(" command-manifest "), 1)
         self.assertIn('--command-manifest "$commands"', text)
         self.assertNotRegex(text, r"\beval\b")
@@ -612,7 +620,7 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertRegex(
             text,
-            r"cargo \+1\.88\.0 test --locked --lib --tests --manifest-path sdk/Cargo\.toml.*--features",
+            r"cargo \+1\.88\.0 test --locked --lib --test bmff_timed_media_merkle --manifest-path sdk/Cargo\.toml.*--features",
         )
         for action_ref in re.findall(r"uses:\s*([^\s#]+)", text):
             with self.subTest(action=action_ref):

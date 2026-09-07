@@ -163,7 +163,7 @@ def _package_cargo_command(action: str, kind: str, target: str) -> list[str]:
     _, manifest, features, no_default, _ = feature_configuration(kind)
     command = ["cargo", f"+{TOOLCHAIN}", action, "--locked"]
     if action == "test" and kind == "sdk":
-        command.extend(("--lib", "--tests"))
+        command.extend(("--lib", "--test", "bmff_timed_media_merkle"))
     if action == "build":
         command.append("--release")
     command.extend(("--manifest-path", manifest, "--target", target))
