@@ -303,6 +303,12 @@ class EvidenceTests(unittest.TestCase):
             commands = evidence["qualification"]["commands"]
             self.assertEqual(commands, qualification.cargo_commands(target))
             self.assertEqual(len(commands), 10)
+            sdk_test = next(
+                item
+                for item in commands
+                if "test --locked" in item and "sdk/Cargo.toml" in item
+            )
+            self.assertIn("test --locked --lib --tests --manifest-path", sdk_test)
             self.assertEqual(
                 sum(
                     "test --locked --manifest-path cli/Cargo.toml" in item
@@ -536,10 +542,15 @@ class WorkflowTests(unittest.TestCase):
         text = WORKFLOW.read_text(encoding="utf-8")
         for target in qualification.SUPPORTED_TARGETS:
             with self.subTest(target=target):
-                self.assertEqual(
-                    _normalized_workflow_cargo_commands(text, target),
-                    qualification.cargo_commands(target),
+                actual = _normalized_workflow_cargo_commands(text, target)
+                expected = qualification.cargo_commands(target)
+                self.assertEqual(actual, expected)
+                sdk_test = next(
+                    item
+                    for item in expected
+                    if "test --locked" in item and "sdk/Cargo.toml" in item
                 )
+                self.assertIn("test --locked --lib --tests --manifest-path", sdk_test)
         self.assertEqual(text.count(" command-manifest "), 1)
         self.assertIn('--command-manifest "$commands"', text)
         self.assertNotRegex(text, r"\beval\b")
@@ -598,6 +609,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertRegex(
             text,
             r"cargo \+1\.88\.0 test --locked --manifest-path cli/Cargo\.toml.*--features",
+        )
+        self.assertRegex(
+            text,
+            r"cargo \+1\.88\.0 test --locked --lib --tests --manifest-path sdk/Cargo\.toml.*--features",
         )
         for action_ref in re.findall(r"uses:\s*([^\s#]+)", text):
             with self.subTest(action=action_ref):

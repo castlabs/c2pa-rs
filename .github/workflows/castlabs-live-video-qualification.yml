@@ -97,7 +97,7 @@ jobs:
         run: cargo +nightly-2026-01-16 fmt --all -- --check
 
       - name: Qualify SDK including live-video tests
-        run: cargo +1.88.0 test --locked --manifest-path sdk/Cargo.toml --target ${{ matrix.target }} --no-default-features --features "${{ env.SDK_FEATURES }}"
+        run: cargo +1.88.0 test --locked --lib --tests --manifest-path sdk/Cargo.toml --target ${{ matrix.target }} --no-default-features --features "${{ env.SDK_FEATURES }}"
         env:
           RUST_BACKTRACE: "1"
 

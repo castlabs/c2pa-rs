@@ -162,6 +162,8 @@ def artifact_build_path(target: str, logical_name: str) -> str:
 def _package_cargo_command(action: str, kind: str, target: str) -> list[str]:
     _, manifest, features, no_default, _ = feature_configuration(kind)
     command = ["cargo", f"+{TOOLCHAIN}", action, "--locked"]
+    if action == "test" and kind == "sdk":
+        command.extend(("--lib", "--tests"))
     if action == "build":
         command.append("--release")
     command.extend(("--manifest-path", manifest, "--target", target))
