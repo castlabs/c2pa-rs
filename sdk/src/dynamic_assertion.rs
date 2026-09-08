@@ -34,6 +34,9 @@ pub enum DynamicAssertionContent {
     Json(String),
 
     /// The assertion is a binary blob with a content type.
+    ///
+    /// Reserved-placeholder Builder signing does not currently support Binary
+    /// replacement and returns an error rather than signing the placeholder.
     Binary(String, Vec<u8>),
 }
 
@@ -56,7 +59,9 @@ pub trait DynamicAssertion {
     /// This function will be called by the [`Builder`] API if the hard
     /// binding assertion in use requires that the assertion size be locked
     /// down in order to complete file layout (i.e. when using a data hash
-    /// assertion).
+    /// assertion). Current reserved-placeholder Builder paths use this value to
+    /// construct an exact serialized placeholder; unrepresentable sizes fail
+    /// during placeholder construction.
     ///
     /// [`Builder`]: crate::Builder
     fn reserve_size(&self) -> Result<usize>;
@@ -66,11 +71,14 @@ pub trait DynamicAssertion {
     /// The `label` parameter will contain the final assigned label for
     /// this assertion.
     ///
-    /// If the hard binding assertion requires that the assertion size
-    /// be predicted in advance, then `size` will contain the number of bytes
-    /// specified by a previous call to `reserve_size`. In that case, the
-    /// resulting binary content *MUST* exactly match the specified size;
-    /// otherwise, the overall manifest generation process will fail.
+    /// For current reserved-placeholder Builder paths, `size` is `Some` with
+    /// the exact content length of the resolved placeholder stored in the
+    /// Claim. The serialized CBOR or JSON assertion data *MUST* have exactly
+    /// that length; the stored placeholder, rather than a later
+    /// `reserve_size` call, is authoritative. Any padding must remain valid
+    /// semantic content (for example, an assertion-defined padding field); the
+    /// SDK does not append arbitrary bytes. Binary replacement is unsupported
+    /// in this path and returns an error rather than leaving the placeholder.
     ///
     /// The `claim` structure will contain information about the preliminary
     /// C2PA claim as known at the time of this call.
@@ -104,7 +112,9 @@ pub trait AsyncDynamicAssertion: MaybeSync + MaybeSend {
     /// This function will be called by the [`Builder`] API if the hard
     /// binding assertion in use requires that the assertion size be locked
     /// down in order to complete file layout (i.e. when using a data hash
-    /// assertion).
+    /// assertion). Current reserved-placeholder Builder paths use this value to
+    /// construct an exact serialized placeholder; unrepresentable sizes fail
+    /// during placeholder construction.
     ///
     /// [`Builder`]: crate::Builder
     fn reserve_size(&self) -> Result<usize>;
@@ -114,11 +124,14 @@ pub trait AsyncDynamicAssertion: MaybeSync + MaybeSend {
     /// The `label` parameter will contain the final assigned label for
     /// this assertion.
     ///
-    /// If the hard binding assertion requires that the assertion size
-    /// be predicted in advance, then `size` will contain the number of bytes
-    /// specified by a previous call to `reserve_size`. In that case, the
-    /// resulting binary content *MUST* exactly match the specified size;
-    /// otherwise, the overall manifest generation process will fail.
+    /// For current reserved-placeholder Builder paths, `size` is `Some` with
+    /// the exact content length of the resolved placeholder stored in the
+    /// Claim. The serialized CBOR or JSON assertion data *MUST* have exactly
+    /// that length; the stored placeholder, rather than a later
+    /// `reserve_size` call, is authoritative. Any padding must remain valid
+    /// semantic content (for example, an assertion-defined padding field); the
+    /// SDK does not append arbitrary bytes. Binary replacement is unsupported
+    /// in this path and returns an error rather than leaving the placeholder.
     ///
     /// The `claim` structure will contain information about the preliminary
     /// C2PA claim as known at the time of this call.

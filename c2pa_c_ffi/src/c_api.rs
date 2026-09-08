@@ -280,7 +280,9 @@ pub type SignerCallback = unsafe extern "C" fn(
 /// The callback receives the resolved assertion label, reserved output size,
 /// and a JSON array of partial-claim entries. Each entry contains `url`, `alg`,
 /// and a standard-base64 `hash`. It writes CBOR assertion content to `out_data`
-/// and returns the number of bytes written, or a negative value on error.
+/// and returns the number of bytes written, or a negative value on error. The
+/// returned byte count must exactly equal `reserve_size` (and
+/// `out_data_max_len`).
 pub type DynamicAssertionCallback = unsafe extern "C" fn(
     context: *const c_void,
     label: *const c_char,
@@ -353,9 +355,12 @@ impl DynamicAssertion for FfiDynamicAssertion {
             )));
         }
         let written = written as usize;
-        if written > output_capacity {
+        // The C API always exposes a fixed registered output capacity. Enforce
+        // that reservation even if an internal caller does not pass `size`.
+        // Arbitrary CBOR cannot be safely padded without changing its meaning.
+        if written != output_capacity {
             return Err(c2pa::Error::BadParam(format!(
-                "dynamic assertion callback for '{}' reported {written} bytes, exceeding output capacity {output_capacity}",
+                "dynamic assertion callback for '{}' returned the wrong reserved size: expected {output_capacity} bytes, actual {written}",
                 self.params.label
             )));
         }
@@ -3006,8 +3011,14 @@ pub unsafe extern "C" fn c2pa_signer_create(
 /// The callback and the pointee addressed by `context` remain owned by the
 /// caller and must remain valid and safe to call for the lifetime of the signer
 /// or owning context. Callback input strings and the output buffer are valid
-/// only for the duration of each callback invocation. The callback must never
-/// write more than `out_data_max_len` bytes.
+/// only for the duration of each callback invocation. `reserve_size` and
+/// `out_data_max_len` contain the registered assertion reservation, and the
+/// callback must return exactly that many bytes. Returning fewer or more bytes
+/// violates the dynamic-assertion contract; callers must produce correctly
+/// padded assertion content. `reserve_size` must be greater than zero. Some
+/// non-zero sizes cannot be represented exactly by the SDK's supported CBOR
+/// placeholder encoding; registration succeeds, but signing then fails with
+/// guidance to choose a representable larger size.
 ///
 /// Returns 0 on success or -1 on error. Call [`c2pa_error`] for details.
 ///
@@ -3038,6 +3049,13 @@ pub unsafe extern "C" fn c2pa_signer_add_dynamic_assertion(
         return -1;
     };
     let label = cstr_or_return_int!(label);
+    if reserve_size == 0 {
+        CimplError::from(c2pa::Error::BadParam(format!(
+            "dynamic assertion '{label}' reserve_size must be greater than zero"
+        )))
+        .set_last();
+        return -1;
+    }
 
     signer.dynamic_assertions.push(FfiDynamicAssertionParams {
         label,
@@ -4474,6 +4492,22 @@ mod tests {
             -17
         }
 
+        unsafe extern "C" fn callback_undersized(
+            _context: *const c_void,
+            _label: *const c_char,
+            _reserve_size: usize,
+            _partial_claim_json: *const c_char,
+            out_data: *mut c_uchar,
+            out_data_max_len: usize,
+        ) -> isize {
+            let content = [0xa1, 0x61, b'i', 0x61, b'x'];
+            if out_data.is_null() || out_data_max_len < content.len() {
+                return -1;
+            }
+            std::ptr::copy_nonoverlapping(content.as_ptr(), out_data, content.len());
+            content.len() as isize
+        }
+
         unsafe extern "C" fn callback_oversized(
             _context: *const c_void,
             _label: *const c_char,
@@ -4488,7 +4522,9 @@ mod tests {
         let (signer, builder) = setup_signer_and_builder_for_signing_tests();
         unsafe { c2pa_free(builder as *mut c_void) };
         let error_label = CString::new("com.example.error").unwrap();
+        let undersized_label = CString::new("com.example.undersized").unwrap();
         let oversized_label = CString::new("com.example.oversized").unwrap();
+        let zero_label = CString::new("com.example.zero").unwrap();
         assert_eq!(
             unsafe {
                 c2pa_signer_add_dynamic_assertion(
@@ -4496,6 +4532,18 @@ mod tests {
                     std::ptr::null(),
                     Some(callback_error),
                     error_label.as_ptr(),
+                    8,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                c2pa_signer_add_dynamic_assertion(
+                    signer,
+                    std::ptr::null(),
+                    Some(callback_undersized),
+                    undersized_label.as_ptr(),
                     8,
                 )
             },
@@ -4521,10 +4569,41 @@ mod tests {
             .expect("callback error should fail");
         assert!(error.to_string().contains("error code -17"));
         let error = dynamic_assertions[1]
+            .content("com.example.undersized", Some(8), &PartialClaim::default())
+            .err()
+            .expect("undersized callback result should fail");
+        assert!(error.to_string().contains("com.example.undersized"));
+        assert!(error.to_string().contains("expected 8 bytes, actual 5"));
+
+        let error = dynamic_assertions[1]
+            .content("com.example.undersized", None, &PartialClaim::default())
+            .err()
+            .expect("the C callback's registered capacity is always exact");
+        assert!(error.to_string().contains("com.example.undersized"));
+        assert!(error.to_string().contains("expected 8 bytes, actual 5"));
+
+        let error = dynamic_assertions[2]
             .content("com.example.oversized", Some(8), &PartialClaim::default())
             .err()
             .expect("oversized callback result should fail");
-        assert!(error.to_string().contains("exceeding output capacity 8"));
+        assert!(error.to_string().contains("com.example.oversized"));
+        assert!(error.to_string().contains("expected 8 bytes, actual 9"));
+
+        assert_eq!(
+            unsafe {
+                c2pa_signer_add_dynamic_assertion(
+                    signer,
+                    std::ptr::null(),
+                    Some(callback_error),
+                    zero_label.as_ptr(),
+                    0,
+                )
+            },
+            -1
+        );
+        let error = CimplError::last_message().unwrap();
+        assert!(error.contains("com.example.zero"));
+        assert!(error.contains("reserve_size must be greater than zero"));
 
         assert_eq!(
             unsafe {

@@ -1329,6 +1329,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        dynamic_assertion::{DynamicAssertion, DynamicAssertionContent, PartialClaim},
         live_video::{
             verifiable_segment_info::extract_vsi_payload_from_segment, LiveVideoValidator,
         },
@@ -1536,6 +1537,93 @@ mod tests {
 
     fn make_test_signer() -> EphemeralSigner {
         EphemeralSigner::new("test-vsi.local").unwrap()
+    }
+
+    const TEST_DYNAMIC_ASSERTION_LABEL: &str = "com.example.vsi-dynamic";
+
+    struct TestDynamicAssertion {
+        short: bool,
+        invocations: Arc<Mutex<Vec<(String, Option<usize>)>>>,
+    }
+
+    impl DynamicAssertion for TestDynamicAssertion {
+        fn label(&self) -> String {
+            TEST_DYNAMIC_ASSERTION_LABEL.to_string()
+        }
+
+        fn reserve_size(&self) -> Result<usize> {
+            Ok(64)
+        }
+
+        fn content(
+            &self,
+            label: &str,
+            size: Option<usize>,
+            _claim: &PartialClaim,
+        ) -> Result<DynamicAssertionContent> {
+            self.invocations
+                .lock()
+                .unwrap()
+                .push((label.to_string(), size));
+            if self.short {
+                return Ok(DynamicAssertionContent::Cbor(vec![
+                    0xa1, 0x61, b'i', 0x61, b'x',
+                ]));
+            }
+
+            // One-entry CBOR map with an encoded length of exactly 64 bytes.
+            let mut content = vec![b'x'; 64];
+            content[..6].copy_from_slice(&[0xa1, 0x62, b'i', b'd', 0x78, 58]);
+            Ok(DynamicAssertionContent::Cbor(content))
+        }
+    }
+
+    struct DynamicEphemeralSigner {
+        signer: EphemeralSigner,
+        short: bool,
+        invocations: Arc<Mutex<Vec<(String, Option<usize>)>>>,
+    }
+
+    impl Signer for DynamicEphemeralSigner {
+        fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+            self.signer.sign(data)
+        }
+
+        fn alg(&self) -> SigningAlg {
+            self.signer.alg()
+        }
+
+        fn certs(&self) -> Result<Vec<Vec<u8>>> {
+            self.signer.certs()
+        }
+
+        fn reserve_size(&self) -> usize {
+            self.signer.reserve_size()
+        }
+
+        fn dynamic_assertions(&self) -> Vec<Box<dyn DynamicAssertion>> {
+            vec![Box::new(TestDynamicAssertion {
+                short: self.short,
+                invocations: Arc::clone(&self.invocations),
+            })]
+        }
+    }
+
+    fn make_dynamic_test_signer(
+        short: bool,
+    ) -> (
+        DynamicEphemeralSigner,
+        Arc<Mutex<Vec<(String, Option<usize>)>>>,
+    ) {
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        (
+            DynamicEphemeralSigner {
+                signer: make_test_signer(),
+                short,
+                invocations: Arc::clone(&invocations),
+            },
+            invocations,
+        )
     }
 
     fn make_test_signing_key() -> SigningKey {
@@ -1986,6 +2074,90 @@ mod tests {
             !info_map.manifest_id.is_empty(),
             "manifestId must be populated from the signed init segment per §19.4"
         );
+    }
+
+    #[test]
+    fn exact_size_dynamic_assertion_signs_vsi_init_and_media() {
+        crate::settings::set_settings_value("verify.verify_trust", false).unwrap();
+        let init_data =
+            include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
+        let (manifest_signer, invocations) = make_dynamic_test_signer(false);
+        let mut vsi_signer = LiveVideoVsiSigner::from_signing_key(
+            test_manifest_json_with_actions(),
+            &manifest_signer,
+            make_test_signing_key(),
+            b"dynamic-exact".to_vec(),
+            1,
+            3600,
+        )
+        .unwrap();
+
+        let signed_init = vsi_signer
+            .sign_init_segment(init_data, "video/mp4", &manifest_signer)
+            .unwrap();
+        assert_eq!(
+            invocations.lock().unwrap().as_slice(),
+            &[(TEST_DYNAMIC_ASSERTION_LABEL.to_string(), Some(64))]
+        );
+
+        let reader = Reader::from_context(Context::new())
+            .with_stream("video/mp4", std::io::Cursor::new(&signed_init))
+            .unwrap();
+        let failed_statuses: Vec<_> = reader
+            .validation_status()
+            .unwrap_or_default()
+            .iter()
+            .filter(|status| {
+                !status.passed()
+                    && status.code() != crate::validation_status::SIGNING_CREDENTIAL_UNTRUSTED
+            })
+            .collect();
+        assert!(
+            failed_statuses.is_empty(),
+            "signed init validation failures: {failed_statuses:?}"
+        );
+        let manifest = reader.active_manifest().unwrap();
+        let assertion: serde_json::Value = manifest
+            .find_assertion(TEST_DYNAMIC_ASSERTION_LABEL)
+            .unwrap();
+        assert_eq!(assertion["id"], "x".repeat(58));
+
+        let signed_media = vsi_signer
+            .sign_media_segment(&make_test_segment(1))
+            .unwrap();
+        assert!(extract_vsi_payload_from_segment(&signed_media).is_some());
+    }
+
+    #[test]
+    fn short_dynamic_assertion_fails_vsi_init_before_embedding() {
+        crate::settings::set_settings_value("verify.verify_trust", false).unwrap();
+        let init_data =
+            include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
+        let (manifest_signer, invocations) = make_dynamic_test_signer(true);
+        let mut vsi_signer = LiveVideoVsiSigner::from_signing_key(
+            test_manifest_json_with_actions(),
+            &manifest_signer,
+            make_test_signing_key(),
+            b"dynamic-short".to_vec(),
+            1,
+            3600,
+        )
+        .unwrap();
+
+        // This is generic DynamicAssertion reservation enforcement at assertion
+        // replacement, not a VSI incompatibility or final BMFF-layout failure.
+        let error = vsi_signer
+            .sign_init_segment(init_data, "video/mp4", &manifest_signer)
+            .expect_err("short dynamic assertion must fail init signing");
+        let message = error.to_string();
+        assert!(message.contains(TEST_DYNAMIC_ASSERTION_LABEL));
+        assert!(message.contains("expected 64 bytes, actual 5"));
+        assert!(!message.contains("assertion.bmffHash.mismatch"));
+        assert_eq!(
+            invocations.lock().unwrap().as_slice(),
+            &[(TEST_DYNAMIC_ASSERTION_LABEL.to_string(), Some(64))]
+        );
+        assert!(vsi_signer.active_manifest_id().is_none());
     }
 
     #[test]

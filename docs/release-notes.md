@@ -2,6 +2,28 @@
 
 Refer to the [CHANGELOG](https://github.com/contentauth/c2pa-rs/blob/main/CHANGELOG.md) for detailed changes derived from Git commit history.
 
+## Version 0.91.0-dev
+
+### Dynamic assertion reservations
+
+Dynamic assertion reservations are now enforced exactly for supported content
+across one-shot, split, fragmented, and live-video signing. The placeholder
+stored in the claim is the reservation authority: CBOR and JSON callbacks must
+return exactly that many content bytes. Short callback output that was
+previously accepted is now rejected.
+
+This compatibility tightening applies whenever a reservation exists, including
+compressed and detached remote or sidecar flows whose final asset layout does
+not itself require equal preliminary and final JUMBF lengths. The exact
+callback-content contract is independent of whether the surrounding layout is
+size-sensitive.
+
+Reservation sizes that cannot be represented exactly by the supported CBOR
+placeholder encoding fail during placeholder or signing setup with guidance to
+choose a representable larger size. Reserved Binary dynamic assertion
+replacement is not supported and now returns an error instead of silently
+retaining and signing the placeholder.
+
 ## Version 0.88.0
 
 ### Removal of deprecated APIs

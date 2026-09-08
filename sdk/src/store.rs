@@ -2561,17 +2561,30 @@ impl Store {
         // Two passes since we are accessing two fields in self.
         let mut assertions = Vec::new();
         for da in dyn_assertions.iter() {
+            let label = da.label();
             let reserve_size = da.reserve_size()?;
             let data1 = c2pa_cbor::ser::to_vec_packed(&vec![0; reserve_size])?;
             let cbor_delta = data1.len() - reserve_size;
-            let payload_size = reserve_size.checked_sub(cbor_delta).ok_or_else(|| {
+            let mut payload_size = reserve_size.checked_sub(cbor_delta).ok_or_else(|| {
                 Error::BadParam(format!(
-                    "dynamic assertion '{}' reserve size {reserve_size} is too small",
-                    da.label()
+                    "dynamic assertion '{label}' reserve size {reserve_size} cannot form an exact placeholder with the supported CBOR encoding; choose a representable/larger reserve size"
                 ))
             })?;
-            let da_data = c2pa_cbor::ser::to_vec_packed(&vec![0; payload_size])?;
-            assertions.push(UserCbor::new(&da.label(), da_data));
+            let mut da_data = c2pa_cbor::ser::to_vec_packed(&vec![0; payload_size])?;
+
+            // Correct once when subtracting the header estimate crossed to a
+            // shorter CBOR array-length header (for example at 24 or 256).
+            if da_data.len() < reserve_size {
+                payload_size += reserve_size - da_data.len();
+                da_data = c2pa_cbor::ser::to_vec_packed(&vec![0; payload_size])?;
+            }
+            if da_data.len() != reserve_size {
+                return Err(Error::BadParam(format!(
+                    "dynamic assertion '{label}' reserve size {reserve_size} cannot form an exact placeholder with the supported CBOR encoding (candidate serialized to {} bytes); choose a representable/larger reserve size",
+                    da_data.len()
+                )));
+            }
+            assertions.push(UserCbor::new(&label, da_data));
         }
 
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
@@ -2635,6 +2648,9 @@ impl Store {
 
     /// Write the dynamic assertions to the manifest.
     /// Supports multiple assertions with the same preferred label.
+    /// CBOR and JSON content must exactly fill each assertion's reservation.
+    /// Returns whether at least one placeholder was replaced. Binary content is
+    /// rejected because this path cannot replace its reserved CBOR placeholder.
     #[async_generic(async_signature(
         &mut self,
         dyn_assertions: &[Box<dyn AsyncDynamicAssertion>],
@@ -2652,6 +2668,7 @@ impl Store {
 
         let preferred_labels: Vec<String> = dyn_assertions.iter().map(|da| da.label()).collect();
         let resolved_labels = self.resolve_dynamic_assertion_labels(&preferred_labels)?;
+        let mut modified = false;
 
         for ((da, preferred_label), resolved_label) in dyn_assertions
             .iter()
@@ -2666,11 +2683,28 @@ impl Store {
                 }
             }
 
-            let da_size = da.reserve_size()?;
+            let target_instance = labels::instance(resolved_label);
+            let stored_size = {
+                let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+                let mut targets = pc.claim_assertion_store().iter().filter(|assertion| {
+                    assertion.label() == *resolved_label && assertion.instance() == target_instance
+                });
+                let target = targets.next().ok_or_else(|| {
+                    Error::BadParam(format!(
+                        "dynamic assertion '{resolved_label}' has no resolved placeholder target for instance {target_instance}"
+                    ))
+                })?;
+                if targets.next().is_some() {
+                    return Err(Error::BadParam(format!(
+                        "dynamic assertion '{resolved_label}' resolved to multiple placeholder targets for instance {target_instance}"
+                    )));
+                }
+                target.assertion().data().len()
+            };
             let da_data = if _sync {
-                da.content(resolved_label, Some(da_size), &callback_view)?
+                da.content(resolved_label, Some(stored_size), &callback_view)?
             } else {
-                da.content(resolved_label, Some(da_size), &callback_view)
+                da.content(resolved_label, Some(stored_size), &callback_view)
                     .await?
             };
 
@@ -2681,14 +2715,26 @@ impl Store {
                 DynamicAssertionContent::Json(data) => {
                     User::new(preferred_label, &data).to_assertion()?
                 }
-                DynamicAssertionContent::Binary(_format, _data) => {
-                    continue;
+                DynamicAssertionContent::Binary(format, _data) => {
+                    // No replacement would leave the reserved placeholder in the
+                    // signed claim and keep `modified` false, so reject explicitly.
+                    return Err(Error::BadParam(format!(
+                        "dynamic assertion '{resolved_label}' returned unsupported Binary content type '{format}'; reserved Binary dynamic assertion replacement is not supported"
+                    )));
                 }
             };
+            // The resolved stored placeholder is the reservation authority;
+            // final content must preserve its proven exact serialized size.
+            let actual_size = assertion.data().len();
+            if actual_size != stored_size {
+                return Err(Error::BadParam(format!(
+                    "dynamic assertion '{resolved_label}' returned the wrong reserved size: expected {stored_size} bytes, actual {actual_size}"
+                )));
+            }
 
-            let instance = labels::instance(resolved_label);
             let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
-            pc.replace_assertion_by_instance(assertion, instance)?;
+            pc.replace_assertion_by_instance(assertion, target_instance)?;
+            modified = true;
 
             *preliminary_claim = PartialClaim::default();
             for assertion_uri in pc.assertions() {
@@ -2696,7 +2742,7 @@ impl Store {
             }
         }
 
-        Ok(true)
+        Ok(modified)
     }
 
     #[cfg(feature = "file_io")]
@@ -2954,7 +3000,9 @@ impl Store {
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
         pc.set_signature_val(sig);
 
-        // regenerate the JUMBF with the signature
+        // Assertion content reservations were enforced during replacement.
+        // This separate equality check is the fragmented path's final layout
+        // guard before replacing the init-segment placeholders.
         let final_jumbf = self.to_jumbf_internal(signer.reserve_size())?;
         if final_jumbf.len() != unsigned_jumbf.len() {
             return Err(Error::JumbfCreationError);
@@ -2966,6 +3014,22 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    /// Whether final JUMBF must retain the preliminary embedded asset layout.
+    /// Call only after `start_save_stream`, once compression and hard-binding
+    /// selection have reached their effective state.
+    fn requires_embedded_manifest_layout_match(format: &str, claim: &Claim) -> bool {
+        let embedded = matches!(
+            claim.remote_manifest(),
+            RemoteManifest::NoRemote | RemoteManifest::EmbedWithRemote(_)
+        );
+        if !embedded || claim.compressed() {
+            return false;
+        }
+
+        is_bmff_format(format)
+            || (!claim.data_hash_assertions().is_empty() && claim.box_hash_assertions().is_empty())
     }
 
     /// Embed the claims store as JUMBF into a stream. Updates XMP with provenance
@@ -3011,8 +3075,7 @@ impl Store {
         let input_len = io_utils::stream_len(input_stream)?;
         let mut intermediate_stream = io_utils::stream_with_fs_fallback(threshold, input_len)?;
 
-        #[allow(unused_mut)] // Not mutable in the non-async case.
-        self.start_save_stream(
+        let preliminary_jumbf = self.start_save_stream(
             format,
             input_stream,
             &mut intermediate_stream,
@@ -3020,6 +3083,11 @@ impl Store {
             context,
         )?;
         intermediate_stream.rewind()?;
+
+        let enforce_embedded_manifest_layout = {
+            let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+            Self::requires_embedded_manifest_layout_match(format, pc)
+        };
 
         let mut preliminary_claim = PartialClaim::default();
         {
@@ -3053,6 +3121,16 @@ impl Store {
 
         // update the JUMBF with the signature
         let jumbf_bytes = self.to_jumbf_internal(signer.reserve_size())?;
+
+        // Assertion content size is enforced during replacement. This separate
+        // invariant protects embedded, uncompressed BMFF and DataHash layouts
+        // whose hard binding was calculated against the preliminary JUMBF.
+        if modified
+            && enforce_embedded_manifest_layout
+            && jumbf_bytes.len() != preliminary_jumbf.len()
+        {
+            return Err(Error::JumbfCreationError);
+        }
 
         output_stream.rewind()?;
         match self.finish_save_stream(jumbf_bytes, format, &mut intermediate_stream, output_stream)
@@ -4459,8 +4537,93 @@ pub mod tests {
             test::{create_test_claim, create_test_streams, fixture_path},
             test_signer::{async_test_signer, test_signer},
         },
-        ClaimGeneratorInfo, DigitalSourceType, SigningAlg,
+        ClaimGeneratorInfo, DigitalSourceType, Reader, SigningAlg,
     };
+
+    const RESERVED_DYNAMIC_LABEL: &str = "com.example.reserved-dynamic";
+
+    #[derive(Clone, Copy)]
+    enum ReservedDynamicOutput {
+        Exact,
+        Short,
+        Binary,
+    }
+
+    struct ReservedDynamicAssertion {
+        output: ReservedDynamicOutput,
+    }
+
+    impl DynamicAssertion for ReservedDynamicAssertion {
+        fn label(&self) -> String {
+            RESERVED_DYNAMIC_LABEL.to_string()
+        }
+
+        fn reserve_size(&self) -> Result<usize> {
+            Ok(64)
+        }
+
+        fn content(
+            &self,
+            _label: &str,
+            size: Option<usize>,
+            _claim: &PartialClaim,
+        ) -> Result<DynamicAssertionContent> {
+            assert_eq!(size, Some(64));
+            match self.output {
+                ReservedDynamicOutput::Short => Ok(DynamicAssertionContent::Cbor(vec![
+                    0xa1, 0x61, b'i', 0x61, b'x',
+                ])),
+                ReservedDynamicOutput::Binary => Ok(DynamicAssertionContent::Binary(
+                    "application/octet-stream".to_string(),
+                    vec![0; 64],
+                )),
+                ReservedDynamicOutput::Exact => {
+                    // One-entry CBOR map with an encoded length of exactly 64 bytes.
+                    let mut content = vec![b'x'; 64];
+                    content[..6].copy_from_slice(&[0xa1, 0x62, b'i', b'd', 0x78, 58]);
+                    Ok(DynamicAssertionContent::Cbor(content))
+                }
+            }
+        }
+    }
+
+    struct ReservedDynamicSigner {
+        signer: Box<dyn Signer>,
+        output: ReservedDynamicOutput,
+    }
+
+    impl ReservedDynamicSigner {
+        fn new(output: ReservedDynamicOutput) -> Self {
+            Self {
+                signer: test_signer(SigningAlg::Ps256),
+                output,
+            }
+        }
+    }
+
+    impl Signer for ReservedDynamicSigner {
+        fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+            self.signer.sign(data)
+        }
+
+        fn alg(&self) -> SigningAlg {
+            self.signer.alg()
+        }
+
+        fn certs(&self) -> Result<Vec<Vec<u8>>> {
+            self.signer.certs()
+        }
+
+        fn reserve_size(&self) -> usize {
+            self.signer.reserve_size()
+        }
+
+        fn dynamic_assertions(&self) -> Vec<Box<dyn DynamicAssertion>> {
+            vec![Box::new(ReservedDynamicAssertion {
+                output: self.output,
+            })]
+        }
+    }
 
     fn create_editing_claim(claim: &mut Claim) -> Result<&mut Claim> {
         let uuid_str = "deadbeefdeadbeefdeadbeefdeadbeef";
@@ -7454,6 +7617,435 @@ pub mod tests {
     }
 
     #[test]
+    fn test_embedded_manifest_layout_match_classification() {
+        fn data_hash_claim() -> Claim {
+            let mut claim = create_test_claim().unwrap();
+            let mut data_hash = DataHash::new("source_hash", "sha256");
+            data_hash.set_hash(vec![0; 32]);
+            claim.add_assertion(&data_hash).unwrap();
+            claim
+        }
+
+        let data_hash = data_hash_claim();
+        assert!(Store::requires_embedded_manifest_layout_match(
+            "image/jpeg",
+            &data_hash
+        ));
+
+        let mut data_and_box_hash = data_hash_claim();
+        data_and_box_hash
+            .add_assertion(&BoxHash { boxes: Vec::new() })
+            .unwrap();
+        assert!(!Store::requires_embedded_manifest_layout_match(
+            "image/jpeg",
+            &data_and_box_hash
+        ));
+        assert!(Store::requires_embedded_manifest_layout_match(
+            "video/mp4",
+            &data_and_box_hash
+        ));
+
+        let mut compressed = data_hash_claim();
+        compressed.set_compressed_manifest(true);
+        assert!(!Store::requires_embedded_manifest_layout_match(
+            "image/jpeg",
+            &compressed
+        ));
+
+        let mut sidecar = data_hash_claim();
+        sidecar.set_external_manifest();
+        assert!(!Store::requires_embedded_manifest_layout_match(
+            "image/jpeg",
+            &sidecar
+        ));
+
+        let mut remote = data_hash_claim();
+        remote
+            .set_remote_manifest("https://example.com/manifest.c2pa")
+            .unwrap();
+        assert!(!Store::requires_embedded_manifest_layout_match(
+            "image/jpeg",
+            &remote
+        ));
+
+        let mut embedded_remote = data_hash_claim();
+        embedded_remote
+            .set_embed_remote_manifest("https://example.com/manifest.c2pa")
+            .unwrap();
+        assert!(Store::requires_embedded_manifest_layout_match(
+            "image/jpeg",
+            &embedded_remote
+        ));
+    }
+
+    #[test]
+    fn test_embedded_data_hash_exact_dynamic_assertion_preserves_layout() {
+        let context = Context::new();
+        let (format, mut input_stream, mut output_stream) =
+            create_test_streams("earth_apollo17.jpg");
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let signer = ReservedDynamicSigner::new(ReservedDynamicOutput::Exact);
+
+        store
+            .save_to_stream(
+                format,
+                &mut input_stream,
+                &mut output_stream,
+                &signer,
+                &context,
+            )
+            .expect("exact dynamic assertion must preserve embedded DataHash layout");
+        let claim = store.provenance_claim().unwrap();
+        assert!(!claim.data_hash_assertions().is_empty());
+        assert!(claim.box_hash_assertions().is_empty());
+        assert!(Store::requires_embedded_manifest_layout_match(
+            format, claim
+        ));
+
+        let reader = Reader::from_context(Context::new())
+            .with_stream(format, output_stream)
+            .unwrap();
+        assert_eq!(reader.validation_status(), None);
+        let assertion: serde_json::Value = reader
+            .active_manifest()
+            .unwrap()
+            .find_assertion(RESERVED_DYNAMIC_LABEL)
+            .unwrap();
+        assert_eq!(assertion["id"], "x".repeat(58));
+    }
+
+    #[test]
+    fn test_dynamic_assertion_uses_stored_placeholder_when_reserve_size_changes() {
+        struct ChangingReservation {
+            reserve_calls: Arc<Mutex<usize>>,
+            callback_sizes: Arc<Mutex<Vec<Option<usize>>>>,
+        }
+
+        impl DynamicAssertion for ChangingReservation {
+            fn label(&self) -> String {
+                "com.example.changing-reservation".to_string()
+            }
+
+            fn reserve_size(&self) -> Result<usize> {
+                let mut calls = self.reserve_calls.lock().unwrap();
+                let size = if *calls == 0 { 64 } else { 65 };
+                *calls += 1;
+                Ok(size)
+            }
+
+            fn content(
+                &self,
+                _label: &str,
+                size: Option<usize>,
+                _claim: &PartialClaim,
+            ) -> Result<DynamicAssertionContent> {
+                self.callback_sizes.lock().unwrap().push(size);
+                let mut content = vec![b'x'; 64];
+                content[..6].copy_from_slice(&[0xa1, 0x62, b'i', b'd', 0x78, 58]);
+                Ok(DynamicAssertionContent::Cbor(content))
+            }
+        }
+
+        let reserve_calls = Arc::new(Mutex::new(0));
+        let callback_sizes = Arc::new(Mutex::new(Vec::new()));
+        let assertions: Vec<Box<dyn DynamicAssertion>> = vec![Box::new(ChangingReservation {
+            reserve_calls: Arc::clone(&reserve_calls),
+            callback_sizes: Arc::clone(&callback_sizes),
+        })];
+        let context = Context::new();
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        store
+            .add_dynamic_assertion_placeholders(&assertions)
+            .unwrap();
+
+        // Demonstrate that a later declaration differs. Replacement must not
+        // consult it or let it override the 64-byte placeholder already stored.
+        assert_eq!(assertions[0].reserve_size().unwrap(), 65);
+        let mut preliminary_claim = PartialClaim::default();
+        for assertion in store.provenance_claim().unwrap().assertions() {
+            preliminary_claim.add_assertion(assertion);
+        }
+        assert!(store
+            .write_dynamic_assertions(&assertions, &mut preliminary_claim)
+            .unwrap());
+
+        assert_eq!(*reserve_calls.lock().unwrap(), 2);
+        assert_eq!(callback_sizes.lock().unwrap().as_slice(), &[Some(64)]);
+        let final_assertion = store
+            .provenance_claim()
+            .unwrap()
+            .claim_assertion_store()
+            .iter()
+            .find(|assertion| assertion.label_raw() == "com.example.changing-reservation")
+            .unwrap();
+        assert_eq!(final_assertion.assertion().data().len(), 64);
+    }
+
+    #[test]
+    fn test_dynamic_assertion_placeholder_reservation_boundaries_are_exact_or_rejected() {
+        struct ReservationOnly(usize);
+
+        impl DynamicAssertion for ReservationOnly {
+            fn label(&self) -> String {
+                format!("com.example.reservation-{}", self.0)
+            }
+
+            fn reserve_size(&self) -> Result<usize> {
+                Ok(self.0)
+            }
+
+            fn content(
+                &self,
+                _label: &str,
+                _size: Option<usize>,
+                _claim: &PartialClaim,
+            ) -> Result<DynamicAssertionContent> {
+                unreachable!("placeholder test does not generate final content")
+            }
+        }
+
+        for reserve_size in [
+            23usize, 24, 25, 26, 27, 64, 255, 256, 257, 258, 259, 260, 8192, 65535, 65536, 65537,
+            65538, 65539, 65540, 65541,
+        ] {
+            let context = Context::new();
+            let mut store = Store::from_context(&context);
+            store.commit_claim(create_test_claim().unwrap()).unwrap();
+            let label = format!("com.example.reservation-{reserve_size}");
+            let assertions: Vec<Box<dyn DynamicAssertion>> =
+                vec![Box::new(ReservationOnly(reserve_size))];
+            let result = store.add_dynamic_assertion_placeholders(&assertions);
+
+            if matches!(reserve_size, 25 | 258 | 65539 | 65540) {
+                let error = result.expect_err("unrepresentable reservation must fail early");
+                let message = error.to_string();
+                assert!(message.contains(&label));
+                assert!(message.contains(&format!("reserve size {reserve_size}")));
+                assert!(message.contains("representable/larger"));
+                continue;
+            }
+
+            result.expect("representable reservation must create a placeholder");
+            let placeholder = store
+                .provenance_claim()
+                .unwrap()
+                .claim_assertion_store()
+                .iter()
+                .find(|assertion| assertion.label_raw() == label)
+                .unwrap();
+            assert_eq!(
+                placeholder.assertion().data().len(),
+                reserve_size,
+                "placeholder length must exactly match reservation {reserve_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bmff_dynamic_assertion_reservation_is_checked_before_embedding() {
+        fn sign_bmff(
+            output: ReservedDynamicOutput,
+            with_box_hash: bool,
+        ) -> (Result<Vec<u8>>, Cursor<Vec<u8>>) {
+            let mut context = Context::new();
+            context.settings_mut().verify.verify_after_sign = false;
+            let (format, mut input_stream, mut output_stream) = create_test_streams("video1.mp4");
+            let mut store = Store::from_context(&context);
+            let mut claim = create_test_claim().unwrap();
+            if with_box_hash {
+                claim.add_assertion(&BoxHash { boxes: Vec::new() }).unwrap();
+            }
+            store.commit_claim(claim).unwrap();
+            let signer = ReservedDynamicSigner::new(output);
+            let result = store.save_to_stream(
+                format,
+                &mut input_stream,
+                &mut output_stream,
+                &signer,
+                &context,
+            );
+            (result, output_stream)
+        }
+
+        // A short callback result violates the generic DynamicAssertion contract;
+        // it is not a live-video-specific BMFF incompatibility.
+        let (result, output_stream) = sign_bmff(ReservedDynamicOutput::Short, false);
+        let error = result.expect_err("short dynamic assertion must fail");
+        let message = error.to_string();
+        assert!(message.contains(RESERVED_DYNAMIC_LABEL));
+        assert!(message.contains("expected 64 bytes, actual 5"));
+        assert!(output_stream.get_ref().is_empty());
+
+        let (result, output_stream) = sign_bmff(ReservedDynamicOutput::Exact, false);
+        result.expect("exact-size dynamic assertion should sign");
+        let reader = Reader::from_context(Context::new())
+            .with_stream("video/mp4", output_stream)
+            .unwrap();
+        assert_eq!(reader.validation_status(), None);
+        let manifest = reader.active_manifest().unwrap();
+        let assertion: serde_json::Value = manifest.find_assertion(RESERVED_DYNAMIC_LABEL).unwrap();
+        assert_eq!(assertion["id"], "x".repeat(58));
+
+        // An additional BoxHash does not exempt an embedded, uncompressed BMFF
+        // from the preliminary/final layout invariant.
+        let (result, output_stream) = sign_bmff(ReservedDynamicOutput::Exact, true);
+        result.expect("embedded BMFF with BoxHash should retain an exact layout");
+        assert!(!output_stream.get_ref().is_empty());
+    }
+
+    #[test]
+    fn test_sign_manifest_enforces_dynamic_assertion_reservation_for_box_hash() {
+        fn box_hash_store(context: &Context) -> Store {
+            let mut claim = create_test_claim().unwrap();
+            claim.add_assertion(&BoxHash { boxes: Vec::new() }).unwrap();
+            let mut store = Store::from_context(context);
+            store.commit_claim(claim).unwrap();
+            store
+        }
+
+        let mut context = Context::new();
+        context.settings_mut().verify.verify_after_sign = false;
+
+        let short_signer = ReservedDynamicSigner::new(ReservedDynamicOutput::Short);
+        let mut short_store = box_hash_store(&context);
+        short_store
+            .add_dynamic_assertion_placeholders(&short_signer.dynamic_assertions())
+            .unwrap();
+        let error = short_store
+            .sign_manifest(&short_signer, &context)
+            .expect_err("split signing must reject short dynamic assertion content");
+        let message = error.to_string();
+        assert!(message.contains(RESERVED_DYNAMIC_LABEL));
+        assert!(message.contains("expected 64 bytes, actual 5"));
+
+        let exact_signer = ReservedDynamicSigner::new(ReservedDynamicOutput::Exact);
+        let mut exact_store = box_hash_store(&context);
+        exact_store
+            .add_dynamic_assertion_placeholders(&exact_signer.dynamic_assertions())
+            .unwrap();
+        let jumbf = exact_store
+            .sign_manifest(&exact_signer, &context)
+            .expect("exact dynamic assertion must preserve direct BoxHash signing");
+        let mut report = StatusTracker::default();
+        let restored = Store::from_jumbf_with_context(&jumbf, &mut report, &context).unwrap();
+        assert!(restored
+            .provenance_claim()
+            .unwrap()
+            .assertion_hashed_uri_from_label(RESERVED_DYNAMIC_LABEL)
+            .is_some());
+    }
+
+    #[test]
+    fn test_compressed_non_bmff_exact_dynamic_assertion_does_not_require_jumbf_equality() {
+        let mut context = Context::new();
+        context.settings_mut().verify.verify_after_sign = false;
+        let (format, mut input_stream, mut output_stream) =
+            create_test_streams("earth_apollo17.jpg");
+        let mut claim = create_test_claim().unwrap();
+        claim.set_compressed_manifest(true);
+        let mut store = Store::from_context(&context);
+        store.commit_claim(claim).unwrap();
+        let signer = ReservedDynamicSigner::new(ReservedDynamicOutput::Exact);
+
+        store
+            .save_to_stream(
+                format,
+                &mut input_stream,
+                &mut output_stream,
+                &signer,
+                &context,
+            )
+            .expect("compressed non-BMFF signing must not require equal JUMBF lengths");
+
+        output_stream.rewind().unwrap();
+        let mut report = StatusTracker::default();
+        let restored =
+            Store::from_stream(format, &mut output_stream, &mut report, &Context::new()).unwrap();
+        assert!(!report.has_any_error(), "validation report: {report:#?}");
+        let claim = restored.provenance_claim().unwrap();
+        assert!(!claim.box_hash_assertions().is_empty());
+        assert!(claim
+            .assertion_hashed_uri_from_label(RESERVED_DYNAMIC_LABEL)
+            .is_some());
+    }
+
+    #[test]
+    fn test_remote_and_sidecar_exact_dynamic_assertions_preserve_detached_flows() {
+        for remote in [false, true] {
+            let mut context = Context::new();
+            context.settings_mut().verify.verify_after_sign = false;
+            let (format, mut input_stream, mut output_stream) =
+                create_test_streams("earth_apollo17.jpg");
+            let mut claim = create_test_claim().unwrap();
+            claim.set_compressed_manifest(true);
+            if remote {
+                claim
+                    .set_remote_manifest("https://example.com/manifest.c2pa")
+                    .unwrap();
+            } else {
+                claim.set_external_manifest();
+            }
+            let mut store = Store::from_context(&context);
+            store.commit_claim(claim).unwrap();
+            let signer = ReservedDynamicSigner::new(ReservedDynamicOutput::Exact);
+
+            let manifest = store
+                .save_to_stream(
+                    format,
+                    &mut input_stream,
+                    &mut output_stream,
+                    &signer,
+                    &context,
+                )
+                .expect("detached manifest signing must not require equal JUMBF lengths");
+            assert!(!manifest.is_empty());
+            assert!(!output_stream.get_ref().is_empty());
+
+            let mut report = StatusTracker::default();
+            let restored = Store::from_manifest_data_and_stream(
+                &manifest,
+                format,
+                &mut output_stream,
+                &mut report,
+                &Context::new(),
+            )
+            .unwrap();
+            assert!(!report.has_any_error(), "validation report: {report:#?}");
+            assert!(restored
+                .provenance_claim()
+                .unwrap()
+                .assertion_hashed_uri_from_label(RESERVED_DYNAMIC_LABEL)
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn test_binary_dynamic_assertion_is_rejected_before_signing() {
+        let context = Context::new();
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let signer = ReservedDynamicSigner::new(ReservedDynamicOutput::Binary);
+        let dynamic_assertions = signer.dynamic_assertions();
+        store
+            .add_dynamic_assertion_placeholders(&dynamic_assertions)
+            .unwrap();
+        let mut preliminary_claim = PartialClaim::default();
+        for assertion in store.provenance_claim().unwrap().assertions() {
+            preliminary_claim.add_assertion(assertion);
+        }
+
+        let error = store
+            .write_dynamic_assertions(&dynamic_assertions, &mut preliminary_claim)
+            .expect_err("Binary dynamic assertion content must not retain its placeholder");
+        let message = error.to_string();
+        assert!(message.contains(RESERVED_DYNAMIC_LABEL));
+        assert!(message.contains("Binary"));
+        assert!(message.contains("not supported"));
+    }
+
+    #[test]
     fn test_bmff_jumbf_generation_qt() {
         let context = crate::context::Context::new();
 
@@ -8836,6 +9428,60 @@ pub mod tests {
 
         assert!(!report.has_any_error());
         // std::fs::write("target/test.jpg", result).unwrap();
+    }
+
+    #[c2pa_test_async]
+    async fn test_async_binary_dynamic_assertion_is_rejected_before_signing() {
+        use async_trait::async_trait;
+
+        struct BinaryDynamicAssertion;
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl AsyncDynamicAssertion for BinaryDynamicAssertion {
+            fn label(&self) -> String {
+                "com.example.async-binary".to_string()
+            }
+
+            fn reserve_size(&self) -> Result<usize> {
+                Ok(64)
+            }
+
+            async fn content(
+                &self,
+                _label: &str,
+                _size: Option<usize>,
+                _claim: &PartialClaim,
+            ) -> Result<DynamicAssertionContent> {
+                Ok(DynamicAssertionContent::Binary(
+                    "application/octet-stream".to_string(),
+                    vec![0; 64],
+                ))
+            }
+        }
+
+        let context = Context::new();
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let assertions: Vec<Box<dyn AsyncDynamicAssertion>> =
+            vec![Box::new(BinaryDynamicAssertion)];
+        store
+            .add_dynamic_assertion_placeholders_async(&assertions)
+            .await
+            .unwrap();
+        let mut preliminary_claim = PartialClaim::default();
+        for assertion in store.provenance_claim().unwrap().assertions() {
+            preliminary_claim.add_assertion(assertion);
+        }
+
+        let error = store
+            .write_dynamic_assertions_async(&assertions, &mut preliminary_claim)
+            .await
+            .expect_err("async Binary dynamic assertion content must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("com.example.async-binary"));
+        assert!(message.contains("Binary"));
+        assert!(message.contains("not supported"));
     }
 
     #[test]
