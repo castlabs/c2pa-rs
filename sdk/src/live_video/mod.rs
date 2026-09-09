@@ -40,11 +40,17 @@ pub(crate) mod cose_key;
 mod segment_manifest_validation;
 mod session_key_validation;
 mod signing;
+mod trusted_vsi;
 pub mod verifiable_segment_info;
 mod vsi_signing;
 
 pub use ed25519_dalek::SigningKey as Ed25519SessionKey;
 pub use signing::LiveVideoSigner;
+pub use trusted_vsi::{
+    TrustedVsiCapabilities, TrustedVsiExhaustionReason, TrustedVsiInitUuidReservation,
+    TrustedVsiMediaEmsgReservation, TrustedVsiPrehashedSession, TrustedVsiSigningPurpose,
+    TrustedVsiStatus, VsiSigningContextV1,
+};
 pub use vsi_signing::{
     moof_sequence_number, LiveVideoVsiSigner, VsiSessionConfig, VsiSessionSigner, VsiSigningPurpose,
 };
