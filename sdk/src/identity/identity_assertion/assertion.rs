@@ -41,6 +41,7 @@ use crate::{
     },
     jumbf::labels::to_assertion_uri,
     log_current_item, log_item,
+    settings::TrustListKind,
     status_tracker::StatusTracker,
     validation_status::{CAWG_X509_SIGNATURE_MISMATCH, CAWG_X509_SIGNATURE_VALIDATED},
     Manifest, Reader,
@@ -320,27 +321,22 @@ impl IdentityAssertion {
             // Load the trust handler settings. Don't worry about status as these
             // are checked during setting generation.
 
-            let cose_verifier = if settings.cawg_trust.verify_trust_list {
-                if let Some(ta) = &settings.cawg_trust.trust_anchors {
-                    let _ = ctp.add_trust_anchors(ta.as_bytes());
-                }
+            if let Some(anchors) = &settings.trust.anchors_for_trust_kind(TrustListKind::CAWG) {
+                for anchor in anchors {
+                    let _ = ctp.add_trust_anchors(
+                        anchor.trust_anchors.as_bytes(),
+                        anchor.trust_uri.as_deref().unwrap_or(""),
+                        anchor.trust_kind.clone().into(),
+                        anchor.trust_config.clone(),
+                    );
 
-                if let Some(pa) = &settings.cawg_trust.user_anchors {
-                    let _ = ctp.add_user_trust_anchors(pa.as_bytes());
+                    if let Some(al) = &anchor.allowed_list {
+                        let _ =
+                            ctp.add_end_entity_credentials_for(al.as_bytes(), TrustListKind::CAWG);
+                    }
                 }
-
-                if let Some(tc) = &settings.cawg_trust.trust_config {
-                    ctp.add_valid_ekus(tc.as_bytes());
-                }
-
-                if let Some(al) = &settings.cawg_trust.allowed_list {
-                    let _ = ctp.add_end_entity_credentials(al.as_bytes());
-                }
-
-                Verifier::VerifyTrustPolicy(Cow::Owned(ctp))
-            } else {
-                Verifier::IgnoreProfileAndTrustPolicy
-            };
+            }
+            let cose_verifier = Verifier::VerifyTrustPolicy(Cow::Owned(ctp));
 
             let mut signer_payload_cbor: Vec<u8> = vec![];
             c2pa_cbor::to_writer(&mut signer_payload_cbor, &self.signer_payload).map_err(|_| {
@@ -354,21 +350,23 @@ impl IdentityAssertion {
                 match parse_cose_sign1(&self.signature, &signer_payload_cbor, status_tracker) {
                     Ok(cose_sign1) => {
                         let verify_result = if _sync {
-                            cose_verifier.verify_signature(
+                            cose_verifier.verify_signature_for(
                                 &self.signature,
                                 &signer_payload_cbor,
                                 &[],
                                 None,
                                 status_tracker,
+                                TrustListKind::CAWG,
                             )
                         } else {
                             cose_verifier
-                                .verify_signature_async(
+                                .verify_signature_for_async(
                                     &self.signature,
                                     &signer_payload_cbor,
                                     &[],
                                     None,
                                     status_tracker,
+                                    TrustListKind::CAWG,
                                 )
                                 .await
                         };

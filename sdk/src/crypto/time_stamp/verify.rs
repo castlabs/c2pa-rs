@@ -34,6 +34,7 @@ use crate::{
         },
     },
     log_item,
+    settings::TrustListKind,
     status_tracker::StatusTracker,
     validation_status::{
         TIMESTAMP_MALFORMED, TIMESTAMP_MISMATCH, TIMESTAMP_OUTSIDE_VALIDITY, TIMESTAMP_TRUSTED,
@@ -492,14 +493,14 @@ pub fn verify_time_stamp(
 
         // the certificate must be on the trust list to be considered valid
         if verify_trust {
-            let mut adjusted_ctp = ctp.clone();
+            let mut adjusted_ctp = CertificateTrustPolicy::default();
 
             // Order certificates from leaf to root before trust validation
             let ordered_cert_ders = order_certificates_leaf_to_root(&cert_ders, cert_pos)?;
 
             // make sure this is a timestamping EKU
             adjusted_ctp.clear_ekus();
-            adjusted_ctp.add_valid_ekus(TIMESTAMP_OID_STR.as_bytes()); // timestamp signing EKU
+            adjusted_ctp.add_mandatory_ekus(TIMESTAMP_OID_STR.as_bytes()); // timestamp signing EKU
             if check_end_entity_certificate_profile(
                 &ordered_cert_ders[0],
                 &adjusted_ctp,
@@ -520,38 +521,55 @@ pub fn verify_time_stamp(
                 continue;
             }
 
-            if adjusted_ctp
-                .check_certificate_trust(
-                    &ordered_cert_ders[0..],
-                    &ordered_cert_ders[0],
-                    Some(signing_time),
-                )
-                .is_err()
-            {
-                log_item!(
-                    "",
-                    format!("timestamp cert untrusted: {}", &common_name),
-                    "verify_time_stamp"
-                )
-                .validation_status(TIMESTAMP_UNTRUSTED)
-                .informational(&mut current_validation_log);
+            match ctp.check_certificate_trust_for(
+                &ordered_cert_ders[0..],
+                &ordered_cert_ders[0],
+                Some(signing_time),
+                TrustListKind::TSA,
+            ) {
+                Err(_) => {
+                    log_item!(
+                        "",
+                        format!("timestamp cert untrusted: {}", &common_name),
+                        "verify_time_stamp"
+                    )
+                    .validation_status(TIMESTAMP_UNTRUSTED)
+                    .informational(&mut current_validation_log);
 
-                last_err = TimeStampError::Untrusted;
-                continue;
+                    last_err = TimeStampError::Untrusted;
+                    continue;
+                }
+                Ok((_trust_type, trust_uri)) => {
+                    log_item!(
+                        "",
+                        format!(
+                            "timestamp cert trusted: {}, trust list: {}",
+                            &common_name, &trust_uri
+                        ),
+                        "verify_time_stamp"
+                    )
+                    .validation_status(TIMESTAMP_TRUSTED)
+                    .set_trust_list_uri(&trust_uri)
+                    .success(&mut current_validation_log);
+
+                    validation_log.append(&current_validation_log);
+                    return Ok(tst);
+                }
             }
+        } else {
+            // this is the 1.x backward compatibility case, since there were no trust lists for timestamps
+            log_item!(
+                "",
+                format!("legacy timestamp cert trusted: {}", &common_name),
+                "verify_time_stamp"
+            )
+            .validation_status(TIMESTAMP_TRUSTED)
+            .success(&mut current_validation_log);
+
+            // If we find a valid value, we're done.
+            validation_log.append(&current_validation_log);
+            return Ok(tst);
         }
-
-        log_item!(
-            "",
-            format!("timestamp cert trusted: {}", &common_name),
-            "verify_time_stamp"
-        )
-        .validation_status(TIMESTAMP_TRUSTED)
-        .success(&mut current_validation_log);
-
-        // If we find a valid value, we're done.
-        validation_log.append(&current_validation_log);
-        return Ok(tst);
     }
 
     validation_log.append(&current_validation_log);
@@ -860,4 +878,94 @@ fn validate_timestamp_sig(
     validator
         .validate(&sig_val.to_bytes(), tbs, signing_key_der)
         .map_err(|_| TimeStampError::InvalidData)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use c2pa_macros::c2pa_test_async;
+
+    use super::*;
+    use crate::{
+        crypto::cose::{parse_cose_sign1, validate_cose_tst_info, validate_cose_tst_info_async},
+        store::Store,
+        Context,
+    };
+
+    #[c2pa_test_async]
+    async fn timestamp_trust_requires_tsa_purpose() {
+        let context = Context::new();
+        let (bytes, _) = Store::load_jumbf_from_stream(
+            "image/jpeg",
+            &mut Cursor::new(include_bytes!("../../../tests/fixtures/C.jpg")),
+            &context,
+        )
+        .unwrap();
+        let store = Store::from_jumbf(&bytes, &mut StatusTracker::default()).unwrap();
+        let claim = store.provenance_claim().unwrap();
+        let data = claim.data().unwrap();
+        let sign1 =
+            parse_cose_sign1(claim.signature_val(), &data, &mut StatusTracker::default()).unwrap();
+        // Pin the issuing CA from this fixed asset's TSA chain, not the unrelated
+        // C2PA test-root bundle. No production/default trust store is changed.
+        let token = crate::crypto::cose::timestamp_token_bytes_from_sign1(&sign1).unwrap();
+        let signed_data = signed_data_from_time_stamp_response(&token)
+            .unwrap()
+            .unwrap();
+        let mut tsa_anchors = String::new();
+        for certificate in signed_data.certificates.unwrap().to_vec() {
+            if let CertificateChoices::Certificate(certificate) = certificate {
+                let der = rasn::der::encode(&certificate).unwrap();
+                let (_, parsed) =
+                    x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
+                if parsed.is_ca() {
+                    tsa_anchors.push_str(&pem::encode(&pem::Pem::new("CERTIFICATE", der)));
+                }
+            }
+        }
+        assert!(!tsa_anchors.is_empty());
+        for kind in [
+            TrustListKind::Manifest,
+            TrustListKind::CAWG,
+            TrustListKind::TSA,
+        ] {
+            let mut policy = CertificateTrustPolicy::new();
+            policy.add_default_valid_ekus();
+            policy
+                .add_trust_anchors(
+                    tsa_anchors.as_bytes(),
+                    "urn:test:timestamp",
+                    kind.clone().into(),
+                    None,
+                )
+                .unwrap();
+            for asynchronous in [false, true] {
+                let mut log = StatusTracker::default();
+                let result = if asynchronous {
+                    validate_cose_tst_info_async(&sign1, &data, &policy, &mut log, true).await
+                } else {
+                    validate_cose_tst_info(&sign1, &data, &policy, &mut log, true)
+                };
+                assert_eq!(
+                    result.is_ok(),
+                    kind == TrustListKind::TSA,
+                    "kind={kind:?}, log={log:?}"
+                );
+                assert!(log.has_status(TIMESTAMP_VALIDATED));
+                assert_eq!(
+                    log.has_status(TIMESTAMP_TRUSTED),
+                    kind == TrustListKind::TSA
+                );
+                if kind == TrustListKind::TSA {
+                    assert!(log
+                        .logged_items()
+                        .iter()
+                        .any(|item| item.trust_list_uri.as_deref() == Some("urn:test:timestamp")));
+                } else {
+                    assert!(log.has_status(TIMESTAMP_UNTRUSTED));
+                }
+            }
+        }
+    }
 }

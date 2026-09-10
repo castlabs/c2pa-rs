@@ -24,7 +24,6 @@ mod integration_1 {
         validation_status::CAWG_X509_CREDENTIAL_UNTRUSTED,
         Builder, Context, Reader, Result, Settings, ValidationState,
     };
-    use c2pa_macros::c2pa_test_async;
     #[allow(unused)] // different code path for WASI
     use tempfile::{tempdir, TempDir};
 
@@ -307,8 +306,8 @@ mod integration_1 {
     }
 
     #[cfg(feature = "file_io")]
-    #[c2pa_test_async]
-    async fn test_cawg_signing_via_settings() -> Result<()> {
+    #[test]
+    fn test_cawg_signing_via_settings() -> Result<()> {
         let settings = Settings::new().with_toml(include_str!(
             "../tests/fixtures/test_settings_with_cawg_signing.toml"
         ))?;
