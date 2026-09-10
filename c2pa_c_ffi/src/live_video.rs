@@ -118,6 +118,8 @@ pub struct C2paLiveVideoVsiSigner {
 ///
 /// `has_sequence_number` and `has_event_id` distinguish absent values from
 /// zero. `exhaust_after_sign` marks the final usable identifier authorization.
+/// Expert Sig_structure signatures use purpose VSI, an assigned sequence, and
+/// `has_event_id = false`; exhaustion is derived solely from the sequence.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct C2paLiveVideoTrustedVsiSigningContextV1 {
@@ -220,7 +222,7 @@ unsafe fn clear_trusted_vsi_bytes(output: *mut *const c_uchar) {
 
 /// Returns the prehashed trusted VSI capability bit mask.
 ///
-/// Bits are: 1 split init UUID, 2 expert EMSG/Sig_structure, 4
+/// Bits are: 1 split init UUID, 2 expert Sig_structure, 4
 /// signer-composed EMSG, 8 recovery, 16 signing-context V1, and 32 full `u32`
 /// exhaustion handling. The current scaffold returns zero.
 #[no_mangle]
@@ -335,27 +337,42 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_commit_init_uuid(
     -1
 }
 
-/// Signs a caller-composed EMSG skeleton and exact COSE Sig_structure.
+/// Signs an exact caller-composed COSE Sig_structure without reconstruction.
 ///
 /// Returns the raw fixed-format signature length on success or -1 on failure.
-/// The current scaffold sets `signature` to NULL when writable and returns C
-/// `NotSupported` before invoking the callback. Successful bytes would be owned
-/// by `c2pa_free()`.
+/// `sequence_number` confirms the signer-assigned sequence. `sequence_max` is an
+/// optional inclusive ceiling (not below that sequence), present only when
+/// `has_sequence_max` is true. The packager owns EMSG construction and event IDs.
+/// The current scaffold independently clears every supplied output (NULL, 0, 0,
+/// false) and returns C `NotSupported` without inspecting input, invoking a
+/// callback, allocating signature bytes, or changing state. Successful bytes
+/// would be owned by `c2pa_free()`.
 ///
 /// # Safety
 ///
-/// When non-null, `signature` must point to writable pointer storage. Input
-/// buffers must be readable for their declared lengths when non-null.
+/// Each non-null output must point to writable storage of its declared type.
+/// The input buffer must be readable for its declared length when non-null.
+/// A non-null session must be a live tracked trusted-VSI handle.
 #[no_mangle]
-pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_sign_emsg_sig_structure(
+pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_sign_sig_structure(
     _session: *mut C2paLiveVideoTrustedVsiSession,
-    _emsg_skeleton: *const c_uchar,
-    _emsg_skeleton_len: usize,
     _sig_structure: *const c_uchar,
     _sig_structure_len: usize,
-    signature: *mut *const c_uchar,
+    output: *mut *const c_uchar,
+    sequence_number: *mut u32,
+    sequence_max: *mut u32,
+    has_sequence_max: *mut bool,
 ) -> i64 {
-    clear_trusted_vsi_bytes(signature);
+    clear_trusted_vsi_bytes(output);
+    if !sequence_number.is_null() {
+        *sequence_number = 0;
+    }
+    if !sequence_max.is_null() {
+        *sequence_max = 0;
+    }
+    if !has_sequence_max.is_null() {
+        *has_sequence_max = false;
+    }
     trusted_vsi_not_supported();
     -1
 }
@@ -1075,13 +1092,14 @@ mod tests {
 
             let mut output = std::ptr::dangling();
             assert_eq!(
-                c2pa_live_video_trusted_vsi_session_sign_emsg_sig_structure(
+                c2pa_live_video_trusted_vsi_session_sign_sig_structure(
                     session,
                     std::ptr::null(),
                     0,
-                    std::ptr::null(),
-                    0,
                     &mut output,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 ),
                 -1
             );
@@ -1178,6 +1196,61 @@ mod tests {
             );
             assert_eq!(status, C2paLiveVideoTrustedVsiStatusV1::default());
             assert_eq!(callback_calls, 0);
+        }
+    }
+
+    #[test]
+    fn ffi_trusted_vsi_expert_clears_each_supplied_output_independently() {
+        let sign: unsafe extern "C" fn(
+            *mut C2paLiveVideoTrustedVsiSession,
+            *const c_uchar,
+            usize,
+            *mut *const c_uchar,
+            *mut u32,
+            *mut u32,
+            *mut bool,
+        ) -> i64 = c2pa_live_video_trusted_vsi_session_sign_sig_structure;
+        // Exercise all nullable-output combinations, including no output storage.
+        for mask in 0..16 {
+            let mut output = std::ptr::dangling();
+            let mut sequence_number = u32::MAX;
+            let mut sequence_max = u32::MAX;
+            let mut has_sequence_max = true;
+            let result = unsafe {
+                sign(
+                    std::ptr::null_mut(),
+                    b"not CBOR".as_ptr(),
+                    8,
+                    if mask & 1 != 0 {
+                        &mut output
+                    } else {
+                        std::ptr::null_mut()
+                    },
+                    if mask & 2 != 0 {
+                        &mut sequence_number
+                    } else {
+                        std::ptr::null_mut()
+                    },
+                    if mask & 4 != 0 {
+                        &mut sequence_max
+                    } else {
+                        std::ptr::null_mut()
+                    },
+                    if mask & 8 != 0 {
+                        &mut has_sequence_max
+                    } else {
+                        std::ptr::null_mut()
+                    },
+                )
+            };
+            assert_eq!(result, -1);
+            assert_eq!(output.is_null(), mask & 1 != 0);
+            assert_eq!(sequence_number, if mask & 2 != 0 { 0 } else { u32::MAX });
+            assert_eq!(sequence_max, if mask & 4 != 0 { 0 } else { u32::MAX });
+            assert_eq!(has_sequence_max, mask & 8 == 0);
+            assert!(CimplError::last_message()
+                .as_deref()
+                .is_some_and(|message| message.starts_with("NotSupported:")));
         }
     }
 

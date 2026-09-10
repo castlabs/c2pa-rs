@@ -4,9 +4,11 @@ on:
   pull_request:
     branches:
       - feat/live-video-vsi
+      - feat/trusted-vsi-api-surface
   push:
     branches:
       - feat/live-video-vsi
+      - feat/trusted-vsi-api-surface
     tags:
       - "castlabs-live-video-v*"
   workflow_dispatch:

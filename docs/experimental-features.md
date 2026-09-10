@@ -105,3 +105,59 @@ The following table lists the experimental features currently present in the SDK
 | C2PA Live Video | `unstable_live_video` | Implements C2PA Technical Specification section 19 (Live Video) for DASH/HLS fMP4 streams: both the per-segment C2PA Manifest Box method (§19.3) and the Verifiable Segment Info method (§19.4), including `signerBinding` verification (§19.7.3), per-segment `bmffHash` validation (§19.4.1), CLI subcommands, and feature-gated VSI C APIs. VSI sessions support local Ed25519 keys and synchronous non-exportable-key callbacks for Ed25519 or ES256, with explicit signer-binding/media purpose metadata, artifact recovery, and explicit-time media signing. The C API also provides the allocation-free `c2pa_live_video_moof_sequence_number` probe: its output is `uint32_t` because the BMFF field is exactly 32 bits; it returns 0 on success or -1 on failure and resets any non-null output to zero before validating the media buffer. Signed VSI media always carries a protected `iat`; callers may supply its Unix timestamp explicitly for durable queued signing, otherwise the signer samples the production clock once. The current signer requires a signed init and supports one CMAF track per representation; muxed or multi-`traf` segments are rejected. The §19.3 CLI signs one invocation only (plus init-only retry); persisted multi-invocation continuity is deferred. Contributed by Qualabs as a reference implementation for live provenance and hardened by Castlabs for the live-video profile. | Qualabs ([@N1Knight](https://github.com/N1Knight)), Castlabs ([@mstattma](https://github.com/mstattma)) | [#2507](https://github.com/contentauth/c2pa-rs/issues/2507) |
 
 Castlabs release candidates for this feature use the separate [live-video release qualification](castlabs-live-video-qualification.md). These are controls for the Castlabs fork and are not a proposal for upstream disposition of the experimental feature; the blocking branch workflow does not alter the upstream experimental-feature or release workflows.
+
+### Disabled trusted-VSI API scaffold
+
+The `unstable_live_video` surface also reserves `TrustedVsiPrehashedSession` for
+trusted stream processors. This is an API-only scaffold, not a signing feature:
+`TrustedVsiCapabilities::current().bits()` and the C capability function return
+zero. Every constructor and operation fails with `Error::UnsupportedType` (C
+`NotSupported`) before callbacks, input parsing, signature allocation, or signing
+state changes. Existing complete-buffer VSI signing is unchanged.
+
+Expert media uses `sign_sig_structure(&[u8]) -> Result<TrustedVsiSignResult>`.
+The result has `signature: Vec<u8>`, `sequence_number: u32`, and
+`sequence_max: Option<u32>` (an optional inclusive ceiling, never lower than the
+assigned sequence). Capability value 2 is named `EXPERT_SIG_STRUCTURE_BIT`, with
+probe `supports_expert_sig_structure()`. The former unshipped expert EMSG skeleton
+method and symbol are removed, not retained as aliases.
+
+The frozen C ABI is:
+
+```c
+int64_t c2pa_live_video_trusted_vsi_session_sign_sig_structure(
+    struct C2paLiveVideoTrustedVsiSession *session,
+    const unsigned char *sig_structure,
+    uintptr_t sig_structure_len,
+    const unsigned char **output,
+    uint32_t *sequence_number,
+    uint32_t *sequence_max,
+    bool *has_sequence_max);
+```
+
+Success would return the signature length, with bytes released by `c2pa_free()`.
+The disabled path returns -1, sets `NotSupported`, and independently initializes
+each supplied output to NULL, 0, 0, or false, even when other output pointers are
+NULL. `usize` maps to `uintptr_t`/ctypes `c_size_t`, byte pointers to
+`POINTER(c_ubyte)` (output is a pointer to that pointer), sequence outputs to
+`POINTER(c_uint32)`, maximum presence to `POINTER(c_bool)`, and the return to
+`c_int64`. The session remains a mutable opaque pointer.
+
+The trusted packager owns EMSG construction/placement, event-ID allocation and
+exhaustion, COSE headers, `SegmentInfoMap`, hashes, manifest identity, and timing.
+The future signer owns ordered sequence allocation and signs the supplied bytes
+without reconstruction. The caller predicts its sequence and uses the returned
+sequence as confirmation; this API does not inspect the payload to compare it.
+Expert callbacks retain `VsiSigningContextV1` with purpose `Vsi`, an assigned
+sequence, no event ID (C `has_event_id = false`), and sequence-derived
+`exhaust_after_sign`. Signer-composed EMSG callbacks may also carry an event ID.
+
+Native split-init reservation/finalization/commit, composed EMSG operations,
+status, recovery, constructor configuration, and context types are retained as
+future target APIs. No trusted operation is enabled here. The future expert
+validator is limited to one canonical untagged four-element CBOR
+`["Signature1", protected_bstr, empty_external_aad_bstr, payload_bstr]` item with
+no trailing bytes, a canonical protected map matching the session algorithm,
+and the fixed profile signature shape. It must not decode or verify payload
+fields, hashes, EMSG, event IDs, or timing. That validator, signing, persistence,
+mode enforcement, recovery, and full-uint32 exhaustion are deferred.

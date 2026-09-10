@@ -25,7 +25,7 @@ use crate::{error::Error, Context, Result};
 /// Capability bits for prehashed trusted VSI signing.
 ///
 /// The bit assignments are stable: bit 0 (value 1) is split init UUID, bit 1
-/// (value 2) is expert EMSG/Sig_structure signing, bit 2 (value 4) is
+/// (value 2) is expert Sig_structure signing, bit 2 (value 4) is
 /// signer-composed EMSG, bit 3 (value 8) is recovery, bit 4 (value 16) is
 /// signing-context V1, and bit 5 (value 32) is full `u32` exhaustion handling.
 /// The current scaffold reports no capabilities.
@@ -34,18 +34,18 @@ use crate::{error::Error, Context, Result};
 pub struct TrustedVsiCapabilities(u64);
 
 impl TrustedVsiCapabilities {
-    /// Bit mask for split initialization-segment UUID support.
-    pub const SPLIT_INIT_UUID_BIT: u64 = 1;
-    /// Bit mask for expert EMSG/Sig_structure support.
-    pub const EXPERT_EMSG_SIG_STRUCTURE_BIT: u64 = 2;
-    /// Bit mask for signer-composed EMSG support.
-    pub const SIGNER_COMPOSED_EMSG_BIT: u64 = 4;
-    /// Bit mask for signed-artifact recovery support.
-    pub const RECOVERY_BIT: u64 = 8;
-    /// Bit mask for [`VsiSigningContextV1`] support.
-    pub const SIGNING_CONTEXT_V1_BIT: u64 = 16;
+    /// Bit mask for expert Sig_structure support.
+    pub const EXPERT_SIG_STRUCTURE_BIT: u64 = 2;
     /// Bit mask for safely signing through the full `u32` sequence space.
     pub const FULL_UINT32_EXHAUSTION_BIT: u64 = 32;
+    /// Bit mask for signed-artifact recovery support.
+    pub const RECOVERY_BIT: u64 = 8;
+    /// Bit mask for signer-composed EMSG support.
+    pub const SIGNER_COMPOSED_EMSG_BIT: u64 = 4;
+    /// Bit mask for [`VsiSigningContextV1`] support.
+    pub const SIGNING_CONTEXT_V1_BIT: u64 = 16;
+    /// Bit mask for split initialization-segment UUID support.
+    pub const SPLIT_INIT_UUID_BIT: u64 = 1;
 
     /// Returns the capabilities implemented by this build.
     pub const fn current() -> Self {
@@ -62,9 +62,9 @@ impl TrustedVsiCapabilities {
         self.0 & Self::SPLIT_INIT_UUID_BIT != 0
     }
 
-    /// Reports whether caller-composed EMSG/Sig_structure signing is supported.
-    pub const fn supports_expert_emsg_sig_structure(self) -> bool {
-        self.0 & Self::EXPERT_EMSG_SIG_STRUCTURE_BIT != 0
+    /// Reports whether exact caller-composed Sig_structure signing is supported.
+    pub const fn supports_expert_sig_structure(self) -> bool {
+        self.0 & Self::EXPERT_SIG_STRUCTURE_BIT != 0
     }
 
     /// Reports whether the SDK can compose a reserved EMSG around a supplied hash.
@@ -99,9 +99,10 @@ pub enum TrustedVsiSigningPurpose {
 
 /// Version-one authorization context for a trusted VSI signing callback.
 ///
-/// Optional sequence and event identifiers are absent for signatures that are
-/// not associated with a media EMSG. `exhaust_after_sign` tells an external
-/// signer that the authorized signature consumes the final usable identifier.
+/// Signer-binding signatures have neither a sequence nor an event identifier.
+/// Expert signatures use purpose `Vsi`, an assigned sequence, and no event ID;
+/// their `exhaust_after_sign` is derived solely from sequence exhaustion.
+/// Composed EMSG signatures also carry the reserved event identifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VsiSigningContextV1 {
     purpose: TrustedVsiSigningPurpose,
@@ -130,6 +131,17 @@ impl VsiSigningContextV1 {
     pub const fn exhaust_after_sign(&self) -> bool {
         self.exhaust_after_sign
     }
+}
+
+/// Result of signing an exact caller-composed COSE Sig_structure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedVsiSignResult {
+    /// Raw fixed-format COSE signature over the supplied bytes, without reconstruction.
+    pub signature: Vec<u8>,
+    /// Signer-assigned sequence, confirming the sequence predicted by the caller.
+    pub sequence_number: u32,
+    /// Optional inclusive ceiling, never below `sequence_number` when present.
+    pub sequence_max: Option<u32>,
 }
 
 /// Reserved initialization UUID bytes and their public manifest identifier.
@@ -308,12 +320,15 @@ impl TrustedVsiPrehashedSession {
         Err(Error::UnsupportedType)
     }
 
-    /// Signs a caller-composed EMSG skeleton and exact COSE Sig_structure.
-    pub fn sign_emsg_sig_structure(
-        &mut self,
-        _emsg_skeleton: &[u8],
-        _sig_structure: &[u8],
-    ) -> Result<Vec<u8>> {
+    /// Signs the exact caller-composed COSE Sig_structure without reconstruction.
+    ///
+    /// The trusted packager owns EMSG construction, event IDs, headers, and payload.
+    /// The session owns ordered sequence allocation; the returned sequence confirms
+    /// the caller's prediction without inspecting the payload. A future validator
+    /// will check only canonical CBOR/COSE framing, empty external AAD, and the
+    /// session algorithm/signature shape, not the SegmentInfoMap or EMSG contents.
+    /// This scaffold does not parse the input or invoke a callback.
+    pub fn sign_sig_structure(&mut self, _sig_structure: &[u8]) -> Result<TrustedVsiSignResult> {
         Err(Error::UnsupportedType)
     }
 
@@ -370,7 +385,8 @@ mod tests {
         let capabilities = TrustedVsiPrehashedSession::capabilities();
         assert_eq!(capabilities.bits(), 0);
         assert!(!capabilities.supports_split_init_uuid());
-        assert!(!capabilities.supports_expert_emsg_sig_structure());
+        assert_eq!(TrustedVsiCapabilities::EXPERT_SIG_STRUCTURE_BIT, 2);
+        assert!(!capabilities.supports_expert_sig_structure());
         assert!(!capabilities.supports_signer_composed_emsg());
         assert!(!capabilities.supports_recovery());
         assert!(!capabilities.supports_signing_context_v1());
@@ -416,7 +432,7 @@ mod tests {
             Err(Error::UnsupportedType)
         ));
         assert!(matches!(
-            session.sign_emsg_sig_structure(b"emsg", b"sig-structure"),
+            session.sign_sig_structure(b"sig-structure"),
             Err(Error::UnsupportedType)
         ));
         assert!(matches!(
@@ -432,5 +448,31 @@ mod tests {
             Err(Error::UnsupportedType)
         ));
         assert!(matches!(session.status(), Err(Error::UnsupportedType)));
+    }
+
+    #[test]
+    fn expert_result_and_context_use_sequence_without_event_id() {
+        let result = TrustedVsiSignResult {
+            signature: vec![0; 64],
+            sequence_number: u32::MAX,
+            sequence_max: Some(u32::MAX),
+        };
+        assert_eq!(result.sequence_max, Some(result.sequence_number));
+        let without_ceiling = TrustedVsiSignResult {
+            sequence_max: None,
+            ..result
+        };
+        assert_eq!(without_ceiling.signature.len(), 64);
+        assert_eq!(without_ceiling.sequence_max, None);
+        let context = VsiSigningContextV1 {
+            purpose: TrustedVsiSigningPurpose::Vsi,
+            sequence_number: Some(u32::MAX),
+            event_id: None,
+            exhaust_after_sign: true,
+        };
+        assert_eq!(context.purpose(), TrustedVsiSigningPurpose::Vsi);
+        assert_eq!(context.sequence_number(), Some(u32::MAX));
+        assert_eq!(context.event_id(), None);
+        assert!(context.exhaust_after_sign());
     }
 }

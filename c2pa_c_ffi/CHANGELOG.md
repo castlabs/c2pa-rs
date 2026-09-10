@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Experimental
+
+* Replace the unshipped expert EMSG skeleton symbol with
+  `c2pa_live_video_trusted_vsi_session_sign_sig_structure`. Inputs are the mutable
+  session pointer and exact Sig_structure bytes/length; outputs are the existing
+  allocated-byte pointer, `uint32_t` sequence, `uint32_t` inclusive sequence
+  maximum, and `bool` maximum-presence flag, in that order. Disabled calls clear
+  all supplied outputs independently and return -1 with `NotSupported`, without
+  callbacks, signature allocation, or state changes. All trusted capabilities
+  remain zero; no compatibility alias or CBOR/COSE validator is provided.
+
 ### Added
 
 * Add an experimental, feature-gated stateful C API for local Ed25519 C2PA

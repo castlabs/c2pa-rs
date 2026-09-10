@@ -11,6 +11,13 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ### Experimental
 
+* Reduce the disabled trusted-VSI expert API to `sign_sig_structure(&[u8])`,
+  returning `TrustedVsiSignResult` with raw signature, assigned `u32` sequence,
+  and optional inclusive sequence maximum. Remove the unshipped expert EMSG
+  skeleton method and C symbol without aliases. Capability bit 2 is now named
+  `EXPERT_SIG_STRUCTURE_BIT`; the capability mask remains zero. Split-init,
+  composed EMSG, status, recovery, and callback-context target APIs remain stubs;
+  complete-buffer VSI behavior is unchanged.
 * Add purpose-aware Ed25519/ES256 callback signing and validated artifact recovery to the
   experimental live-video VSI signer while preserving the local Ed25519 API.
 * Tighten experimental VSI validation and recovery by requiring the deterministic `emsg.id`

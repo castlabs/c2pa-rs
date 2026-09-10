@@ -1,6 +1,6 @@
 # Castlabs live-video release qualification
 
-The dedicated [Castlabs live-video qualification workflow](../.github/workflows/castlabs-live-video-qualification.yml) qualifies the `feat/live-video-vsi` branch without changing the upstream release workflows. These are release controls for the Castlabs fork and are not a proposal for upstream disposition of the experimental feature. The workflow is a blocking two-platform matrix for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`; no qualification command uses `continue-on-error`.
+The dedicated [Castlabs live-video qualification workflow](../.github/workflows/castlabs-live-video-qualification.yml) qualifies the `feat/live-video-vsi` and `feat/trusted-vsi-api-surface` branches without changing the upstream release workflows. These are release controls for the Castlabs fork and are not a proposal for upstream disposition of the experimental feature. The workflow is a blocking two-platform matrix for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`; no qualification command uses `continue-on-error`.
 
 ## Qualified source and feature profile
 
@@ -18,6 +18,16 @@ The SDK, C FFI, and feature-enabled `c2patool` test commands are hard gates on b
 
 ## Evidence and bundles
 
+Qualification also requires all disabled trusted-VSI exports, including the exact
+`c2pa_live_video_trusted_vsi_session_sign_sig_structure` prototype, and rejects
+the removed expert EMSG skeleton symbol in both native exports and generated
+header declarations. `verify-header` compiles `scripts/tests/trusted_vsi_abi.c`
+as C11 with warnings as errors against that generated header (`cc` on Linux,
+`clang` on Windows, or explicit `--compiler`). Its static assertions check the
+expert function type and retained V1 context/status layouts. Header checks also
+freeze the order of the two same-typed sequence outputs. Symbol presence is not
+capability activation: the trusted capability mask must remain zero.
+
 Each platform first generates `cargo-commands.json` from the qualification helper. CI runs the corresponding commands directly, without `eval`; structural tests parse every workflow Cargo run line and require its normalized command list to equal the generated manifest exactly. Evidence consumes and hashes that manifest rather than reconstructing an independent command list.
 
 Each platform emits `source-qualification.json` and its SHA-256 sidecar. The schema-versioned JSON records the Castlabs repository, exact source SHA, `Cargo.lock` digest and size, pinned release and rustfmt toolchains, Python version, target, `CARGO_BUILD_JOBS`, actual package manifest paths, separate no-default/requested-feature/profile facts, aggregate and individual resolved Cargo feature-report digests, the command-manifest digest, every artifact's filename/digest/size/role/build path, and runner facts.
@@ -26,7 +36,7 @@ Each platform emits `source-qualification.json` and its SHA-256 sidecar. The sch
 
 The platform-specific native files, evidence, command manifest, and feature reports are packed into a deterministic `tar.gz`. Archive paths are validated against traversal and absolute paths; entries are sorted and normalized to owner/group 0 and timestamp 0. Executables and shared libraries use mode `0755`; the header, Windows import library, checksums, and qualification records use mode `0644`. Gzip stores timestamp zero and no source filename. `SHA256SUMS` covers bundle contents, and a separate `.sha256` file covers the bundle itself. Generation refuses to overwrite any output and removes partial output on failure. Standard-library unit tests enforce evidence shape, path safety, archive determinism, normalization, no-clobber behavior, the absent gzip filename header, exact platform members, complete release-set verification, and workflow structure.
 
-Pull requests and pushes to `feat/live-video-vsi` run qualification and upload Actions artifacts without publishing a release. A push of a versioned `castlabs-live-video-v<major>.<minor>.<patch>[-prerelease][+build]` tag is an explicit release trigger: the workflow file is loaded from the tagged commit, the complete qualification matrix runs for that SHA, and the release job runs only after the matrix succeeds. The tag must be protected by a GitHub ruleset, must be the current GitHub ref, and must resolve exactly to the qualified source SHA.
+Pull requests and pushes to `feat/live-video-vsi` or `feat/trusted-vsi-api-surface` run qualification and upload Actions artifacts without publishing a release. A push of a versioned `castlabs-live-video-v<major>.<minor>.<patch>[-prerelease][+build]` tag is an explicit release trigger: the workflow file is loaded from the tagged commit, the complete qualification matrix runs for that SHA, and the release job runs only after the matrix succeeds. The tag must be protected by a GitHub ruleset, must be the current GitHub ref, and must resolve exactly to the qualified source SHA.
 
 Manual publication remains available by dispatching the workflow with `publish_release=true`, selecting the existing protected release tag as the workflow ref, and supplying that exact tag as `release_tag`. GitHub only exposes `workflow_dispatch` for workflow files present on the repository's default branch, so this manual path is unavailable until the qualification workflow has been merged there. The protected tag-push path does not have that prerequisite and works from a tagged feature commit containing the workflow. Manual dispatch with `publish_release=false`, branch pushes, and pull requests cannot enter the release job.
 

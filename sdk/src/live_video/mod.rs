@@ -48,8 +48,8 @@ pub use ed25519_dalek::SigningKey as Ed25519SessionKey;
 pub use signing::LiveVideoSigner;
 pub use trusted_vsi::{
     TrustedVsiCapabilities, TrustedVsiExhaustionReason, TrustedVsiInitUuidReservation,
-    TrustedVsiMediaEmsgReservation, TrustedVsiPrehashedSession, TrustedVsiSigningPurpose,
-    TrustedVsiStatus, VsiSigningContextV1,
+    TrustedVsiMediaEmsgReservation, TrustedVsiPrehashedSession, TrustedVsiSignResult,
+    TrustedVsiSigningPurpose, TrustedVsiStatus, VsiSigningContextV1,
 };
 pub use vsi_signing::{
     moof_sequence_number, LiveVideoVsiSigner, VsiSessionConfig, VsiSessionSigner, VsiSigningPurpose,

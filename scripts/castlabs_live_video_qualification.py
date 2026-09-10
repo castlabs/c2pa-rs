@@ -110,7 +110,29 @@ REQUIRED_SYMBOLS = (
     "c2pa_live_video_vsi_signer_recover",
     "c2pa_live_video_vsi_signer_sign_media_segment_at",
     "c2pa_live_video_moof_sequence_number",
+    "c2pa_live_video_trusted_vsi_capabilities",
+    "c2pa_live_video_trusted_vsi_session_create_callback_v1",
+    "c2pa_live_video_trusted_vsi_session_reserve_init_uuid",
+    "c2pa_live_video_trusted_vsi_session_reserved_manifest_id",
+    "c2pa_live_video_trusted_vsi_session_finalize_init_uuid",
+    "c2pa_live_video_trusted_vsi_session_commit_init_uuid",
+    "c2pa_live_video_trusted_vsi_session_sign_sig_structure",
+    "c2pa_live_video_trusted_vsi_session_reserve_media_emsg",
+    "c2pa_live_video_trusted_vsi_session_finalize_media_emsg",
+    "c2pa_live_video_trusted_vsi_session_recover",
+    "c2pa_live_video_trusted_vsi_session_status_v1",
 )
+REMOVED_SYMBOLS = (
+    "c2pa_live_video_trusted_vsi_session_sign_emsg_sig_structure",
+)
+TRUSTED_SIGN_PROTOTYPE = """int64_t c2pa_live_video_trusted_vsi_session_sign_sig_structure(
+    struct C2paLiveVideoTrustedVsiSession *_session,
+    const unsigned char *_sig_structure,
+    uintptr_t _sig_structure_len,
+    const unsigned char **output,
+    uint32_t *sequence_number,
+    uint32_t *sequence_max,
+    bool *has_sequence_max);"""
 
 
 def sha256_file(path: Path) -> str:
@@ -353,9 +375,13 @@ def verify_symbols(library: Path, target: str) -> None:
         text=True,
         stdout=subprocess.PIPE,
     )
-    missing = sorted(
-        set(REQUIRED_SYMBOLS) - parse_exported_symbols(result.stdout, target)
-    )
+    exports = parse_exported_symbols(result.stdout, target)
+    removed = sorted(set(REMOVED_SYMBOLS) & exports)
+    if removed:
+        raise RuntimeError(
+            "removed native exports are present: " + ", ".join(removed)
+        )
+    missing = sorted(set(REQUIRED_SYMBOLS) - exports)
     if missing:
         raise RuntimeError("missing defined exported symbols: " + ", ".join(missing))
     print(f"verified {len(REQUIRED_SYMBOLS)} required defined native exports")
@@ -398,18 +424,50 @@ def _validate_header_bytes(data: bytes, expected_version: str) -> None:
             f"c2pa.h version does not match workspace version {expected_version}"
         )
     declarations = parse_header_function_declarations(text)
+    removed = sorted(set(REMOVED_SYMBOLS) & declarations)
+    if removed:
+        raise ValueError(
+            "removed header declarations are present: " + ", ".join(removed)
+        )
     missing = [symbol for symbol in REQUIRED_SYMBOLS if symbol not in declarations]
     if missing:
         raise ValueError(
             "generated c2pa.h is missing declarations: " + ", ".join(missing)
         )
+    prototype = re.search(
+        r"\bint64_t\s+c2pa_live_video_trusted_vsi_session_sign_sig_structure\s*"
+        r"\([^;{}]*\)\s*;",
+        _strip_c_comments(text),
+    )
+    if prototype is None or re.sub(r"\s+", "", prototype.group()) != re.sub(
+        r"\s+", "", TRUSTED_SIGN_PROTOTYPE
+    ):
+        raise ValueError(
+            "generated c2pa.h has an incorrect trusted Sig_structure prototype"
+        )
 
 
-def verify_header(header: Path) -> None:
+def verify_header(header: Path, compiler: str | None = None) -> None:
     if not header.is_file() or header.is_symlink():
         raise ValueError(f"generated header must be a regular file: {header}")
     _validate_header_bytes(header.read_bytes(), workspace_version())
+    subprocess.run(
+        [
+            compiler or ("clang" if sys.platform == "win32" else "cc"),
+            "-std=c11",
+            "-Werror",
+            "-fsyntax-only",
+            "-DC2PA_UNSTABLE_LIVE_VIDEO",
+            "-DC2PA_FILE_IO",
+            "-DC2PA_DYNAMIC_LOADING=1",
+            "-I",
+            str(header.resolve().parent),
+            str(Path(__file__).resolve().parent / "tests" / "trusted_vsi_abi.c"),
+        ],
+        check=True,
+    )
     print(f"verified {len(REQUIRED_SYMBOLS)} required generated header declarations")
+    print("verified exact trusted Sig_structure prototype and C11 ABI assertions")
 
 
 def verify_c2patool_help(executable: Path) -> None:
@@ -1036,6 +1094,9 @@ def parser() -> argparse.ArgumentParser:
 
     header = commands.add_parser("verify-header")
     header.add_argument("--header", required=True)
+    header.add_argument(
+        "--compiler", help="C11 compiler (default: cc, or clang on Windows)"
+    )
 
     help_check = commands.add_parser("verify-c2patool-help")
     help_check.add_argument("--executable", required=True)
@@ -1076,7 +1137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "verify-symbols":
         verify_symbols(Path(args.library), args.target)
     elif args.command == "verify-header":
-        verify_header(Path(args.header))
+        verify_header(Path(args.header), args.compiler)
     elif args.command == "verify-c2patool-help":
         verify_c2patool_help(Path(args.executable))
     elif args.command == "evidence":
