@@ -20,6 +20,9 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
   supplied Unix timestamp drives key-validity checks, sizing, final signatures, and callbacks.
 * Add an allocation-free experimental C FFI probe for reading the 32-bit
   `moof/mfhd.sequence_number` from a live-video media segment.
+### Fixed
+
+* Generate fragment Merkle bindings when embedding manifests in supported single-track, single-file fragmented MP4 assets. Unsupported addressing, multiplexed layouts, and detached fragment signing fail explicitly; existing Merkle-bound files require an update manifest instead of ordinary re-signing.
 
 ## [0.89.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.2...c2pa-v0.89.3)
 _13 July 2026_
