@@ -892,6 +892,8 @@ where
 // Adjust absolute offsets in `iloc`, `stco`, `co64`, `saio`, `tfhd`, and `tfra`.
 // TFRA uses the replaced range in original-file coordinates; other handlers still
 // apply the delta unconditionally.
+// Validation is per table, not transactional: callers must discard output on error,
+// since earlier tables or entries may already have been patched.
 fn adjust_known_offsets<W: Write + ReadSeek + ?Sized>(
     output: &mut W,
     bmff_tree: &Arena<BoxInfo>,
@@ -1321,7 +1323,7 @@ fn adjust_known_offsets<W: Write + ReadSeek + ?Sized>(
             let trailing_size =
                 (length_size_of_traf_num + length_size_of_trun_num + length_size_of_sample_num + 3)
                     as usize;
-            bounded_entry_count(
+            let num_entries = bounded_entry_count(
                 num_entries,
                 output.stream_position()?,
                 box_end,
@@ -2240,7 +2242,8 @@ impl C2paWriter for BmffIO {
             std::io::copy(input_stream, output_stream)?;
         }
 
-        // Manipulating the UUID box means we may need some patch offsets if they are file absolute offsets.
+        // Same-size replacement needs no relocation. TFRA checks in the adjustment
+        // pass are not a general asset-validation pass and are skipped here at zero delta.
         if offset_adjust != 0 {
             // map box layout of current output file
             let (output_bmff_tree, output_bmff_map) = BMFFArena::from_stream(output_stream)?;

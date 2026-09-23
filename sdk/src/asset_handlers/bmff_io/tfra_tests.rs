@@ -286,6 +286,7 @@ fn synthetic(version: u8, middle: &[u8]) -> Vec<u8> {
 
 // Compare entire TFRA boxes, replacing only offsets with the intended moof's new position.
 // Entries may repeat a moof or skip moofs; no one-entry-per-moof assumption is made.
+// This checks TFRA preservation, not the correctness of other media-addressing fields.
 fn assert_targets(original: &[u8], current: &[u8]) {
     let (old_tree, old_map) = BMFFArena::from_stream(&mut Cursor::new(original)).unwrap();
     let (new_tree, new_map) = BMFFArena::from_stream(&mut Cursor::new(current)).unwrap();
@@ -435,4 +436,39 @@ fn bibin_fragmented_fixture_preserves_intended_moofs() {
         .unwrap();
     assert_targets(original, output.get_ref());
     assert_eq!(output.get_ref().as_slice(), original);
+}
+
+#[test]
+fn full_signing_preserves_tfra_targets() {
+    use crate::{
+        status_tracker::StatusTracker,
+        store::Store,
+        utils::{
+            test::{create_test_claim, test_context},
+            test_signer::test_signer,
+        },
+        SigningAlg,
+    };
+
+    let original = include_bytes!("../../../tests/fixtures/fragmented_mfra.mp4");
+    let context = test_context();
+    let signer = test_signer(SigningAlg::Ps256);
+    let mut store = Store::from_context(&context);
+    store.commit_claim(create_test_claim().unwrap()).unwrap();
+    let mut output = Cursor::new(Vec::new());
+    store
+        .save_to_stream(
+            "video/mp4",
+            &mut Cursor::new(original.as_slice()),
+            &mut output,
+            signer.as_ref(),
+            &context,
+        )
+        .unwrap();
+
+    assert_targets(original, output.get_ref());
+    output.rewind().unwrap();
+    let mut report = StatusTracker::default();
+    Store::from_stream("video/mp4", &mut output, &mut report, &context).unwrap();
+    assert!(!report.has_any_error(), "{report:?}");
 }
