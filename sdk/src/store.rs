@@ -169,6 +169,11 @@ impl Store {
 
         // use the incoming trust settings
         store.ctp.clear();
+        // `clear()` also drops the spec-default EKU allow-list (document
+        // signing, email protection, time stamping, OCSP, C2PA signing). Keep
+        // it: `trust.trust_config` adds EKUs, it does not have to restate the
+        // defaults for an otherwise compliant credential to be accepted.
+        store.ctp.add_default_valid_ekus();
 
         // Add all of the trust anchors
         if let Some(anchors) = &settings.trust.anchors {
