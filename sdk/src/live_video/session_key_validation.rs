@@ -650,7 +650,7 @@ mod tests {
         }
 
         pub fn generate_test_key_pair() -> (p256::ecdsa::SigningKey, c2pa_cbor::Value) {
-            let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+            let signing_key = p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng);
             let verifying_key = signing_key.verifying_key();
             let point = verifying_key.to_encoded_point(false);
 

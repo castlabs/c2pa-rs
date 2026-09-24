@@ -2352,7 +2352,7 @@ mod tests {
         let init_data =
             include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
         let manifest_signer = make_test_signer();
-        let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+        let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng));
         let config = es256_config(&session_key, b"es256-session", 1);
         let observations = Arc::new(Mutex::new(Vec::new()));
         let callback_key = Arc::clone(&session_key);
@@ -2427,7 +2427,7 @@ mod tests {
     #[test]
     fn generic_constructor_rejects_algorithm_key_and_kid_mismatches() {
         let manifest_signer = make_test_signer();
-        let session_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let session_key = p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng);
         let valid = es256_config(&session_key, b"correct-kid", 1);
 
         let mut wrong_algorithm = valid.clone();
@@ -2492,7 +2492,7 @@ mod tests {
             CallbackFailure::Error,
         ] {
             let manifest_signer = make_test_signer();
-            let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+            let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng));
             let config = es256_config(&session_key, b"failure-key", 1);
             let observations = Arc::new(Mutex::new(Vec::new()));
             let callback_key = Arc::clone(&session_key);
@@ -2550,7 +2550,7 @@ mod tests {
         let init_data =
             include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
         let manifest_signer = make_test_signer();
-        let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+        let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng));
         let mut config = es256_config(&session_key, b"recover-key", 1);
         config.created_at = "2020-01-01T00:00:00Z".to_string();
         config.validity_period_secs = 1_000_000_000;
@@ -2679,7 +2679,7 @@ mod tests {
         let init_data =
             include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
         let manifest_signer = make_test_signer();
-        let session_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let session_key = p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng);
         let config = es256_config(&session_key, b"binding-failure", 1);
         let observations = Arc::new(Mutex::new(Vec::new()));
         let callback_observations = Arc::clone(&observations);

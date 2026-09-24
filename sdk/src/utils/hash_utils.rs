@@ -25,7 +25,11 @@ use serde_json::Value;
 // direct sha functions
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
-use crate::{crypto::base64::encode, utils::io_utils::stream_len, Error, Result};
+use crate::{
+    crypto::base64::{decode_b64_wrapped, encode},
+    utils::io_utils::stream_len,
+    Error, Result,
+};
 
 const MAX_HASH_BUF: usize = 256 * 1024 * 1024; // cap memory usage to 256MB
 
@@ -151,6 +155,16 @@ impl Hasher {
             "sha512" => Ok(Hasher::SHA512(Sha512::new())),
             _ => Err(Error::UnsupportedType),
         }
+    }
+}
+
+/// Output size in bytes of a digest produced by the given hash algorithm.
+pub fn hash_size_by_alg(alg: &str) -> Result<usize> {
+    match alg {
+        "sha256" => Ok(<Sha256 as Digest>::output_size()),
+        "sha384" => Ok(<Sha384 as Digest>::output_size()),
+        "sha512" => Ok(<Sha512 as Digest>::output_size()),
+        _ => Err(Error::UnsupportedType),
     }
 }
 
@@ -604,6 +618,11 @@ pub fn concat_and_hash(alg: &str, left: &[u8], right: Option<&[u8]>) -> Vec<u8> 
 }
 
 /// replace byte arrays with base64 encoded strings
+///
+/// Also unwraps crJSON `b64'<base64>'` strings (as produced by
+/// [`crate::assertion::Assertion::as_json_object`] for CBOR byte strings) down to
+/// plain base64, since this is the legacy `Reader::json()` convention rather than
+/// the crJSON one.
 pub fn hash_to_b64(mut value: Value) -> Value {
     use std::collections::VecDeque;
 
@@ -614,8 +633,10 @@ pub fn hash_to_b64(mut value: Value) -> Value {
         match current {
             Value::Object(obj) => {
                 for (_, v) in obj.iter_mut() {
-                    if let Value::Array(hash_arr) = v {
-                        if !hash_arr.is_empty() && hash_arr.iter().all(|x| x.is_number()) {
+                    match v {
+                        Value::Array(hash_arr)
+                            if !hash_arr.is_empty() && hash_arr.iter().all(|x| x.is_number()) =>
+                        {
                             // Pre-allocate with capacity to avoid reallocations
                             let mut hash_bytes = Vec::with_capacity(hash_arr.len());
                             // Convert numbers to bytes safely
@@ -626,6 +647,12 @@ pub fn hash_to_b64(mut value: Value) -> Value {
                             }
                             *v = Value::String(encode(&hash_bytes));
                         }
+                        Value::String(s) => {
+                            if let Some(bytes) = decode_b64_wrapped(s) {
+                                *v = Value::String(encode(&bytes));
+                            }
+                        }
+                        _ => {}
                     }
                     queue.push_back(v);
                 }

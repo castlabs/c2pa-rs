@@ -179,7 +179,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_create_ed25519(
     let session_key = Ed25519SessionKey::from_bytes(&seed);
     seed.zeroize();
     let signer = ok_or_return_null!(LiveVideoVsiSigner::from_shared_context(
-        context,
+        &context,
         manifest_json,
         session_key,
         kid.to_vec(),
@@ -257,7 +257,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_create_callback(
         user_data: user_data as usize,
     };
     let signer = ok_or_return_null!(LiveVideoVsiSigner::from_shared_context_with_session_signer(
-        context,
+        &context,
         manifest_json,
         config,
         session_signer,
@@ -281,7 +281,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_sign_init_segment(
     format: *const c_char,
     signed_segment: *mut *const c_uchar,
 ) -> i64 {
-    let signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
+    let mut signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
     let init_segment = bytes_or_return_int!(init_segment, init_segment_len, "init_segment");
     let format = cstr_or_return_int!(format);
     ptr_or_return_int!(signed_segment);
@@ -312,7 +312,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_sign_media_segment(
     media_segment_len: usize,
     signed_segment: *mut *const c_uchar,
 ) -> i64 {
-    let signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
+    let mut signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
     let media_segment = bytes_or_return_int!(media_segment, media_segment_len, "media_segment");
     ptr_or_return_int!(signed_segment);
     *signed_segment = std::ptr::null();
@@ -343,7 +343,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_sign_media_segment_at(
     signing_time_unix_seconds: i64,
     signed_segment: *mut *const c_uchar,
 ) -> i64 {
-    let signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
+    let mut signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
     let media_segment = bytes_or_return_int!(media_segment, media_segment_len, "media_segment");
     ptr_or_return_int!(signed_segment);
     *signed_segment = std::ptr::null();
@@ -383,7 +383,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_recover(
     previous_media_segment_len: usize,
     format: *const c_char,
 ) -> c_int {
-    let signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
+    let mut signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
     let signed_init_segment = bytes_or_return_int!(
         signed_init_segment,
         signed_init_segment_len,
@@ -463,7 +463,6 @@ mod tests {
             c2pa_context_builder_set_settings, c2pa_context_builder_set_signer, c2pa_free,
             c2pa_settings_new, c2pa_settings_set_value, c2pa_signer_from_info, C2paSignerInfo,
         },
-        validate_pointer,
     };
 
     macro_rules! fixture_path {
@@ -807,7 +806,7 @@ mod tests {
                 &mut signed_init,
             );
             assert!(init_len > 0);
-            assert!(validate_pointer::<Box<[u8]>>(signed_init.cast_mut().cast()).is_ok());
+            assert!(!signed_init.is_null());
 
             assert_eq!(
                 c2pa_live_video_vsi_signer_active_manifest_id(live, &mut manifest_id),
@@ -826,7 +825,7 @@ mod tests {
                 &mut signed_media,
             );
             assert!(media_len > media.len() as i64);
-            assert!(validate_pointer::<Box<[u8]>>(signed_media.cast_mut().cast()).is_ok());
+            assert!(!signed_media.is_null());
             assert_eq!(
                 c2pa_live_video_vsi_signer_next_sequence_number(live, &mut next),
                 0
