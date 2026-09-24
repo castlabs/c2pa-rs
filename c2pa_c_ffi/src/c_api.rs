@@ -1505,7 +1505,7 @@ pub unsafe extern "C" fn c2pa_reader_from_fragmented_files_context(
     let asset_path = ok_or_return_null!(path_from_c(asset_path, "asset_path"));
     let fragment_paths = ok_or_return_null!(fragment_paths_from_c(fragments, fragments_count));
 
-    let reader = C2paReader::from_shared_context(context)
+    let reader = C2paReader::from_shared_context(&context)
         .with_fragmented_files(&asset_path, &fragment_paths);
     box_tracked!(ok_or_return_null!(reader))
 }
@@ -1646,7 +1646,10 @@ pub unsafe extern "C" fn c2pa_reader_detailed_json(reader_ptr: *mut C2paReader) 
 #[no_mangle]
 pub unsafe extern "C" fn c2pa_reader_crjson(reader_ptr: *mut C2paReader) -> *mut c_char {
     let c2pa_reader = deref_or_return_null!(reader_ptr, C2paReader);
-    to_c_string(c2pa_reader.crjson())
+    // Exporter failures must surface as errors, never as an empty `{}` that a
+    // caller could mistake for a successful crJSON document.
+    let crjson = ok_or_return_null!(c2pa_reader.crjson_checked());
+    to_c_string(crjson)
 }
 
 /// Returns the remote url of the manifest if it was obtained remotely.
@@ -2403,7 +2406,7 @@ pub unsafe extern "C" fn c2pa_builder_sign_fragmented(
 ) -> i64 {
     ptr_or_return_int!(manifest_bytes_ptr);
     *manifest_bytes_ptr = std::ptr::null();
-    let builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
+    let mut builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
     let signer = deref_mut_or_return_int!(signer_ptr, C2paSigner);
     let asset_path = ok_or_return_int!(path_from_c(asset_path, "asset_path"));
     let fragments_glob = ok_or_return_int!(path_from_c(fragments_glob, "fragments_glob"));
@@ -2444,7 +2447,7 @@ pub unsafe extern "C" fn c2pa_builder_sign_fragmented(
     };
 
     ok_or_return_int!(builder.sign_fragmented_files(
-        signer,
+        &*signer,
         &asset_path,
         &fragments_glob,
         &output_dir,
