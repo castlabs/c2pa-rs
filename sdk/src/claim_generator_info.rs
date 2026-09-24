@@ -107,8 +107,41 @@ impl ClaimGeneratorInfo {
         K: Into<String>,
         V: Into<Value>,
     {
-        self.other.insert(key.into(), value.into());
+        let key = key.into();
+        let value = value.into();
+        // `specVersion` is a typed field; keeping it in `other` as well would
+        // serialize a duplicate CBOR map key.
+        if key == "specVersion" {
+            if let Value::String(version) = &value {
+                self.spec_version = Some(version.clone());
+                return self;
+            }
+        }
+        self.other.insert(key, value);
         self
+    }
+
+    /// Move an untyped `specVersion` entry into the typed field.
+    ///
+    /// Returns an error if both are present with different values or the
+    /// untyped value is not a string.
+    pub(crate) fn normalize_spec_version(&mut self) -> crate::Result<()> {
+        if let Some(value) = self.other.remove("specVersion") {
+            let Value::String(version) = value else {
+                return Err(crate::Error::BadParam(
+                    "claim_generator_info specVersion must be a string".to_string(),
+                ));
+            };
+            match &self.spec_version {
+                Some(existing) if existing != &version => {
+                    return Err(crate::Error::BadParam(format!(
+                        "claim_generator_info specVersion conflict: {existing} vs {version}"
+                    )));
+                }
+                _ => self.spec_version = Some(version),
+            }
+        }
+        Ok(())
     }
 
     /// Gets additional values by key.

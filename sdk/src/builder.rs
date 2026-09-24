@@ -1681,6 +1681,9 @@ impl Builder {
             claim_generator_info.push(info);
         }
 
+        for info in claim_generator_info.iter_mut() {
+            info.normalize_spec_version()?;
+        }
         claim_generator_info[0].insert("org.contentauth.c2pa_rs", env!("CARGO_PKG_VERSION"));
 
         // Build the claim_generator string since this is required

@@ -214,10 +214,15 @@ impl TryFrom<ClaimGeneratorInfoSettings> for ClaimGeneratorInfo {
                     ClaimGeneratorInfoOperatingSystem::Other(name) => name,
                 })
             },
-            spec_version: None,
+            spec_version: value
+                .other
+                .get("specVersion")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             other: value
                 .other
                 .into_iter()
+                .filter(|(key, _)| key != "specVersion")
                 .map(|(key, value)| {
                     serde_json::to_value(value)
                         .map(|value| (key, value))
@@ -247,10 +252,15 @@ impl TryFrom<&ClaimGeneratorInfoSettings> for ClaimGeneratorInfo {
                     ClaimGeneratorInfoOperatingSystem::Other(name) => name.clone(),
                 })
             },
-            spec_version: None,
+            spec_version: value
+                .other
+                .get("specVersion")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             other: value
                 .other
                 .iter()
+                .filter(|(key, _)| key.as_str() != "specVersion")
                 .map(|(key, value)| {
                     serde_json::to_value(value)
                         .map(|value| (key.clone(), value))

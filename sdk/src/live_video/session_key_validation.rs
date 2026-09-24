@@ -499,6 +499,8 @@ fn extract_iat(sign1: &coset::CoseSign1) -> std::result::Result<Option<i64>, Str
 /// - `Value::Text` — base64-encoded string (serde_json with base64 for bytes)
 pub(super) fn extract_signer_binding_bytes(value: &c2pa_cbor::Value) -> Option<Vec<u8>> {
     match value {
+        // c2pa_cbor 0.78 preserves CBOR tags on decode; unwrap COSE_Sign1_Tagged.
+        c2pa_cbor::Value::Tag(18, inner) => extract_signer_binding_bytes(inner),
         c2pa_cbor::Value::Array(items) if is_cose_sign1_array(items) => {
             // COSE_Sign1 inner array [protected, unprotected, payload, signature].
             // After a JSON roundtrip, bstr elements become integer arrays — coerce

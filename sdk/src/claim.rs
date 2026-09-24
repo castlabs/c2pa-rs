@@ -992,7 +992,11 @@ impl Claim {
         if let Some(md) = self.metadata() {
             claim_map.serialize_field(METADATA_F, md)?;
         }
-        if let Some(spec_version) = self.spec_version() {
+        // Only the legacy claim-level field is serialized here. A 2.4
+        // `specVersion` lives inside `claim_generator_info`; emitting the value
+        // returned by `spec_version()` would duplicate it at claim level and
+        // disagree with the map length counted above.
+        if let Some(spec_version) = &self.spec_version {
             claim_map.serialize_field(SPEC_VERSION_F, spec_version)?;
         }
 
