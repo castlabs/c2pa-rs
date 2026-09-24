@@ -162,6 +162,7 @@ fn check_output(original: &[u8], signed: &[u8]) {
     let maps = hash.merkle().unwrap();
     assert_eq!(maps.len(), 1);
     let map = &maps[0];
+    assert_eq!(map.unique_id, 1);
     let count = roots(original)
         .iter()
         .filter(|b| b.kind == *b"moof")
@@ -291,6 +292,69 @@ fn check_tfra(signed: &[u8]) {
 fn single_file_stream_offsets_and_hashes() {
     for input in [RELATIVE, ABSOLUTE] {
         check_output(input, &sign(input));
+    }
+}
+
+#[test]
+fn single_file_legacy_zero_id_still_verifies() {
+    for input in [RELATIVE, ABSOLUTE] {
+        // Reconstruct the earlier ID-0 output from synthetic FFmpeg fixtures.
+        // Only map IDs change; re-sign the caller-owned binding in two passes
+        // so its hashes reflect the final manifest size and relocated offsets.
+        let mut source = sign(input);
+        let mut hash = binding(&source);
+        hash.merkle.as_mut().unwrap()[0].unique_id = 0;
+        let parsed = read_bmff_c2pa_boxes(&mut Cursor::new(&source)).unwrap();
+        for (mut map, info) in parsed
+            .bmff_merkle
+            .into_iter()
+            .zip(parsed.bmff_merkle_box_infos)
+        {
+            assert_eq!(map.unique_id, 1);
+            map.unique_id = 0;
+            let cbor = c2pa_cbor::to_vec(&map).unwrap();
+            let mut uuid = Vec::new();
+            crate::asset_handlers::bmff_io::write_c2pa_box(
+                &mut uuid,
+                &[],
+                crate::asset_handlers::bmff_io::MERKLE,
+                &cbor,
+                0,
+            )
+            .unwrap();
+            assert_eq!(uuid.len(), info.size() as usize);
+            source[info.start() as usize..info.end() as usize].copy_from_slice(&uuid);
+        }
+        let settings = Settings::new()
+            .with_value("verify.verify_after_sign", false)
+            .unwrap();
+        let mut signed = Cursor::new(Vec::new());
+        for _ in 0..2 {
+            let mut b =
+                Builder::from_context(Context::new().with_settings(settings.clone()).unwrap())
+                    .with_definition(DEFINITION)
+                    .unwrap();
+            b.add_assertion("c2pa.hash.bmff.v3", &hash).unwrap();
+            signed = Cursor::new(Vec::new());
+            b.sign(
+                test_signer(SigningAlg::Es256).as_ref(),
+                "video/mp4",
+                &mut Cursor::new(&source),
+                &mut signed,
+            )
+            .unwrap();
+            hash.finalize_single_file_merkle(&mut signed, &mut |_, _| Ok(()))
+                .unwrap();
+        }
+        let verified = binding(signed.get_ref());
+        assert_eq!(verified.merkle().unwrap()[0].unique_id, 0);
+        let parsed = read_bmff_c2pa_boxes(&mut signed).unwrap();
+        assert_eq!(
+            parsed.bmff_merkle.len(),
+            verified.merkle().unwrap()[0].count
+        );
+        assert!(parsed.bmff_merkle.iter().all(|map| map.unique_id == 0));
+        check_aux_locator(signed.get_ref());
     }
 }
 
