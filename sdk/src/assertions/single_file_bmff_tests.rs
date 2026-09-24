@@ -157,11 +157,16 @@ fn check_aux_locator(signed: &[u8]) {
 }
 
 fn check_output(original: &[u8], signed: &[u8]) {
+    check_output_with_id(original, signed, 1);
+}
+
+fn check_output_with_id(original: &[u8], signed: &[u8], unique_id: usize) {
     let hash = binding(signed);
     assert!(hash.hash().is_none());
     let maps = hash.merkle().unwrap();
     assert_eq!(maps.len(), 1);
     let map = &maps[0];
+    assert_eq!(map.unique_id, unique_id);
     let count = roots(original)
         .iter()
         .filter(|b| b.kind == *b"moof")
@@ -295,9 +300,77 @@ fn single_file_stream_offsets_and_hashes() {
 }
 
 #[test]
+fn single_file_legacy_zero_id_still_verifies() {
+    for input in [RELATIVE, ABSOLUTE] {
+        // Reconstruct the earlier ID-0 output from synthetic FFmpeg fixtures.
+        // Only map IDs change; re-sign the caller-owned binding in two passes
+        // so its hashes reflect the final manifest size and relocated offsets.
+        let mut source = sign(input);
+        let mut hash = binding(&source);
+        hash.merkle.as_mut().unwrap()[0].unique_id = 0;
+        let parsed = read_bmff_c2pa_boxes(&mut Cursor::new(&source)).unwrap();
+        for (mut map, info) in parsed
+            .bmff_merkle
+            .into_iter()
+            .zip(parsed.bmff_merkle_box_infos)
+        {
+            assert_eq!(map.unique_id, 1);
+            map.unique_id = 0;
+            let cbor = c2pa_cbor::to_vec(&map).unwrap();
+            let mut uuid = Vec::new();
+            crate::asset_handlers::bmff_io::write_c2pa_box(
+                &mut uuid,
+                &[],
+                crate::asset_handlers::bmff_io::MERKLE,
+                &cbor,
+                0,
+            )
+            .unwrap();
+            // These three-fragment fixtures need no CBOR padding in their UUIDs.
+            assert_eq!(uuid.len(), info.size() as usize);
+            source[info.start() as usize..info.end() as usize].copy_from_slice(&uuid);
+        }
+        let settings = Settings::new()
+            .with_value("verify.verify_after_sign", false)
+            .unwrap();
+        let mut signed = Cursor::new(Vec::new());
+        for _ in 0..2 {
+            let mut b =
+                Builder::from_context(Context::new().with_settings(settings.clone()).unwrap())
+                    .with_definition(DEFINITION)
+                    .unwrap();
+            b.add_assertion("c2pa.hash.bmff.v3", &hash).unwrap();
+            signed = Cursor::new(Vec::new());
+            b.sign(
+                test_signer(SigningAlg::Es256).as_ref(),
+                "video/mp4",
+                &mut Cursor::new(&source),
+                &mut signed,
+            )
+            .unwrap();
+            hash.finalize_single_file_merkle(&mut signed, &mut |_, _| Ok(()))
+                .unwrap();
+        }
+        check_output_with_id(input, signed.get_ref(), 0);
+
+        let mut corrupted = signed.into_inner();
+        let mdat = named(&roots(&corrupted), b"mdat");
+        corrupted[mdat.end - 1] ^= 1;
+        let reader = Reader::default()
+            .with_stream("video/mp4", Cursor::new(corrupted))
+            .unwrap();
+        assert_eq!(
+            reader.validation_state(),
+            ValidationState::Invalid,
+            "{reader}"
+        );
+    }
+}
+
+#[test]
 #[cfg(feature = "file_io")]
 fn single_file_sign_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::utils::io_utils::tempdirectory().unwrap();
     for (i, input) in [RELATIVE, ABSOLUTE].iter().enumerate() {
         let source = dir.path().join(format!("source{i}.mp4"));
         let dest = dir.path().join(format!("signed{i}.mp4"));
@@ -817,7 +890,7 @@ fn single_file_aux_locator_xmp_replacement_and_in_place_patch() {
         .unwrap()
         .manifest_bytes
         .unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::utils::io_utils::tempdirectory().unwrap();
     let path = dir.path().join("patched.mp4");
     std::fs::write(&path, &signed).unwrap();
     handler
