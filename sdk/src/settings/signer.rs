@@ -939,9 +939,13 @@ pub mod tests {
         let _ = mock;
     }
 
+    // A plain (non-async) test: signing drives the remote signer through the
+    // synchronous HTTP resolver, and with `http_reqwest_blocking` that client
+    // owns a runtime which must not be dropped inside a tokio context. Only the
+    // async identity validation below runs on a runtime.
     #[cfg(not(target_arch = "wasm32"))]
-    #[c2pa_macros::c2pa_test_async]
-    async fn test_cawg_remote_signer_round_trip() {
+    #[test]
+    fn test_cawg_remote_signer_round_trip() {
         use std::io::{Cursor, Seek};
 
         use httpmock::MockServer;
@@ -1045,9 +1049,11 @@ pub mod tests {
         let x509_verifier = X509SignatureVerifier {
             cose_verifier: Verifier::IgnoreProfileAndTrustPolicy,
         };
-        let sig_info = ia
-            .validate(manifest, &mut st, &x509_verifier)
-            .await
+        let sig_info = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ia.validate(manifest, &mut st, &x509_verifier))
             .unwrap();
 
         assert_eq!(sig_info.cert_info.alg.unwrap(), cawg_alg);
