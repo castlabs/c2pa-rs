@@ -44,8 +44,10 @@ use crate::{
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-/// Version of the crJSON specification implemented by this exporter.
-const CRJSON_SPEC_VERSION: &str = "2.3.0";
+/// Specification version against which the reported validation was performed
+/// (crJSON 2.4 `validationResults.specVersion`). This is the C2PA version the
+/// validator implements, not a format constant.
+const CRJSON_SPEC_VERSION: &str = crate::spec_versions::C2PA_VALIDATOR_VERSION;
 
 // ── Output types ────────────────────────────────────────────────────────────
 
@@ -169,11 +171,11 @@ struct CrJsonClaim {
 /// A single entry in the crJSON `manifests` array.
 #[derive(Serialize)]
 struct CrJsonManifest {
+    // The published crJSON 2.4 schema (spec.c2pa.org 2.4) forbids additional
+    // manifest properties, so the post-2.4 `isUpdateManifest` /
+    // `isCompressedManifest` fields (c2pa-rs 2f9ecc9b, targeting the next crJSON
+    // revision) are not emitted by this 2.4 exporter.
     label: String,
-    #[serde(rename = "isUpdateManifest")]
-    is_update_manifest: bool,
-    #[serde(rename = "isCompressedManifest")]
-    is_compressed_manifest: bool,
     /// Assertions map: `label -> assertion value`. Keys may include instance suffixes
     /// such as `c2pa.actions__2`.
     assertions: Map<String, Value>,
@@ -285,8 +287,6 @@ impl<'a> CrJsonExporter<'a> {
 
         Ok(CrJsonManifest {
             label: label.to_string(),
-            is_update_manifest: claim.update_manifest(),
-            is_compressed_manifest: claim.compressed(),
             assertions,
             claim_v1,
             claim_v2,

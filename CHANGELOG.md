@@ -18,6 +18,10 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 * Fix claim serialization of a 2.4 `specVersion` in `claim_generator_info`.
 * Keep the default EKU allow-list when context trust settings are applied.
 * Checked crJSON export through the C FFI.
+* crJSON conforms to the published crJSON 2.4 schema: `validationResults.specVersion`
+  reports the validator version (`2.4.0`) and the post-2.4 `isUpdateManifest` /
+  `isCompressedManifest` manifest fields are not emitted; schema tests validate
+  formats against the vendored 2.4 schema.
 
 ### Experimental
 
