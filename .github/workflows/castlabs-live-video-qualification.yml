@@ -4,9 +4,11 @@ on:
   pull_request:
     branches:
       - feat/live-video-vsi
+      - feat/conformance-validation-v02
   push:
     branches:
       - feat/live-video-vsi
+      - feat/conformance-validation-v02
     tags:
       - "castlabs-live-video-v*"
   workflow_dispatch:
@@ -68,7 +70,7 @@ jobs:
       - name: Install pinned release Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master@2026-06-30
         with:
-          toolchain: 1.88.0
+          toolchain: 1.96.0
           targets: ${{ matrix.target }}
           components: llvm-tools-preview
 
@@ -95,7 +97,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: castlabs-live-video-${{ matrix.target }}-rust-1.88.0
+          key: castlabs-live-video-${{ matrix.target }}-rust-1.96.0
 
       - name: Verify checkout and qualification support
         shell: bash
@@ -105,23 +107,23 @@ jobs:
           python -c "import sys; assert sys.version_info[:2] == (3, 12)"
           python -m unittest discover -s scripts/tests -p 'test_*.py' -v
           python scripts/castlabs_live_video_qualification.py command-manifest --target "${{ matrix.target }}" --output "qualification-work/${{ matrix.target }}/cargo-commands.json"
-          cargo +1.88.0 metadata --locked --manifest-path Cargo.toml --format-version 1 --no-deps > /dev/null
+          cargo +1.96.0 metadata --locked --manifest-path Cargo.toml --format-version 1 --no-deps > /dev/null
 
       - name: Check upstream Rust formatting
         run: cargo +nightly-2026-01-16 fmt --all -- --check
 
       - name: Qualify SDK including live-video tests
-        run: cargo +1.88.0 test --locked --lib --test bmff_timed_media_merkle --manifest-path sdk/Cargo.toml --target ${{ matrix.target }} --no-default-features --features "${{ env.SDK_FEATURES }}"
+        run: cargo +1.96.0 test --locked --lib --test bmff_timed_media_merkle --manifest-path sdk/Cargo.toml --target ${{ matrix.target }} --no-default-features --features "${{ env.SDK_FEATURES }}"
         env:
           RUST_BACKTRACE: "1"
 
       - name: Qualify C FFI including live-video tests
-        run: cargo +1.88.0 test --locked --manifest-path c2pa_c_ffi/Cargo.toml --target ${{ matrix.target }} --no-default-features --features "${{ env.FFI_FEATURES }}"
+        run: cargo +1.96.0 test --locked --manifest-path c2pa_c_ffi/Cargo.toml --target ${{ matrix.target }} --no-default-features --features "${{ env.FFI_FEATURES }}"
         env:
           RUST_BACKTRACE: "1"
 
       - name: Qualify c2patool default vendored-OpenSSL profile
-        run: cargo +1.88.0 test --locked --manifest-path cli/Cargo.toml --target ${{ matrix.target }} --features "${{ env.TOOL_FEATURES }}"
+        run: cargo +1.96.0 test --locked --manifest-path cli/Cargo.toml --target ${{ matrix.target }} --features "${{ env.TOOL_FEATURES }}"
         env:
           RUST_BACKTRACE: "1"
 
@@ -129,9 +131,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.88.0 tree --locked --manifest-path sdk/Cargo.toml --package c2pa --target "${{ matrix.target }}" --edges features --charset ascii --format '{p}_features=[{f}]' --no-default-features --features "$SDK_FEATURES" > "qualification-work/${{ matrix.target }}/sdk-features.txt"
-          cargo +1.88.0 tree --locked --manifest-path c2pa_c_ffi/Cargo.toml --package c2pa-c-ffi --target "${{ matrix.target }}" --edges features --charset ascii --format '{p}_features=[{f}]' --no-default-features --features "$FFI_FEATURES" > "qualification-work/${{ matrix.target }}/ffi-features.txt"
-          cargo +1.88.0 tree --locked --manifest-path cli/Cargo.toml --package c2patool --target "${{ matrix.target }}" --edges features --charset ascii --format '{p}_features=[{f}]' --features "$TOOL_FEATURES" > "qualification-work/${{ matrix.target }}/c2patool-features.txt"
+          cargo +1.96.0 tree --locked --manifest-path sdk/Cargo.toml --package c2pa --target "${{ matrix.target }}" --edges features --charset ascii --format '{p}_features=[{f}]' --no-default-features --features "$SDK_FEATURES" > "qualification-work/${{ matrix.target }}/sdk-features.txt"
+          cargo +1.96.0 tree --locked --manifest-path c2pa_c_ffi/Cargo.toml --package c2pa-c-ffi --target "${{ matrix.target }}" --edges features --charset ascii --format '{p}_features=[{f}]' --no-default-features --features "$FFI_FEATURES" > "qualification-work/${{ matrix.target }}/ffi-features.txt"
+          cargo +1.96.0 tree --locked --manifest-path cli/Cargo.toml --package c2patool --target "${{ matrix.target }}" --edges features --charset ascii --format '{p}_features=[{f}]' --features "$TOOL_FEATURES" > "qualification-work/${{ matrix.target }}/c2patool-features.txt"
 
       - name: Build release native library and c2patool from same SHA
         shell: bash
@@ -143,9 +145,9 @@ jobs:
           fi
           rm -f "target/${{ matrix.target }}/release/c2pa.h"
           touch c2pa_c_ffi/build.rs
-          cargo +1.88.0 build --locked --release --manifest-path c2pa_c_ffi/Cargo.toml --target "${{ matrix.target }}" --no-default-features --features "$FFI_FEATURES"
+          cargo +1.96.0 build --locked --release --manifest-path c2pa_c_ffi/Cargo.toml --target "${{ matrix.target }}" --no-default-features --features "$FFI_FEATURES"
           test -f "target/${{ matrix.target }}/release/c2pa.h"
-          cargo +1.88.0 build --locked --release --manifest-path cli/Cargo.toml --target "${{ matrix.target }}" --features "$TOOL_FEATURES"
+          cargo +1.96.0 build --locked --release --manifest-path cli/Cargo.toml --target "${{ matrix.target }}" --features "$TOOL_FEATURES"
 
       - name: Verify release exports, generated header, and c2patool smoke
         shell: bash

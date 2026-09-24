@@ -9,6 +9,16 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ## [Unreleased]
 
+### Castlabs conformance candidate (Program 0.2 / C2PA 2.4)
+
+* Add `verify.validation_time` (RFC 3339) as the request-scoped evaluation
+  instant for certificate, chain, OCSP and reported validation time.
+* Add purpose-scoped trust (`manifest`/`tsa`/`cawg` anchor lists) and
+  `verify.strict_trust_purposes`.
+* Fix claim serialization of a 2.4 `specVersion` in `claim_generator_info`.
+* Keep the default EKU allow-list when context trust settings are applied.
+* Checked crJSON export through the C FFI.
+
 ### Experimental
 
 * Add purpose-aware Ed25519/ES256 callback signing and validated artifact recovery to the
