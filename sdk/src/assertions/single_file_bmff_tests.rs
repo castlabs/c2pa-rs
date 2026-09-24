@@ -370,7 +370,7 @@ fn single_file_legacy_zero_id_still_verifies() {
 #[test]
 #[cfg(feature = "file_io")]
 fn single_file_sign_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::utils::io_utils::tempdirectory().unwrap();
     for (i, input) in [RELATIVE, ABSOLUTE].iter().enumerate() {
         let source = dir.path().join(format!("source{i}.mp4"));
         let dest = dir.path().join(format!("signed{i}.mp4"));
@@ -890,7 +890,7 @@ fn single_file_aux_locator_xmp_replacement_and_in_place_patch() {
         .unwrap()
         .manifest_bytes
         .unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::utils::io_utils::tempdirectory().unwrap();
     let path = dir.path().join("patched.mp4");
     std::fs::write(&path, &signed).unwrap();
     handler
