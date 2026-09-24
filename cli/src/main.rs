@@ -1736,11 +1736,12 @@ pub mod tests {
         .unwrap();
         let mut settings = Settings::default();
         assert!(apply_trust_sidecars(&mut settings, &settings_path).unwrap());
-        let ta = settings
-            .trust
-            .trust_anchors
-            .as_deref()
-            .expect("trust_anchors");
-        assert!(ta.contains("BEGIN CERTIFICATE"));
+        // Legacy `trust_anchors` settings migrate into `trust.anchors`
+        // (c2pa-rs 36bda4df), so the sidecar must land there as a manifest list.
+        let anchors = settings.trust.anchors.as_deref().expect("trust.anchors");
+        assert!(anchors.iter().any(|a| {
+            a.trust_kind == c2pa::settings::TrustListKind::Manifest
+                && a.trust_anchors.contains("BEGIN CERTIFICATE")
+        }));
     }
 }
