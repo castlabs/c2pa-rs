@@ -157,12 +157,16 @@ fn check_aux_locator(signed: &[u8]) {
 }
 
 fn check_output(original: &[u8], signed: &[u8]) {
+    check_output_with_id(original, signed, 1);
+}
+
+fn check_output_with_id(original: &[u8], signed: &[u8], unique_id: usize) {
     let hash = binding(signed);
     assert!(hash.hash().is_none());
     let maps = hash.merkle().unwrap();
     assert_eq!(maps.len(), 1);
     let map = &maps[0];
-    assert_eq!(map.unique_id, 1);
+    assert_eq!(map.unique_id, unique_id);
     let count = roots(original)
         .iter()
         .filter(|b| b.kind == *b"moof")
@@ -322,6 +326,7 @@ fn single_file_legacy_zero_id_still_verifies() {
                 0,
             )
             .unwrap();
+            // These three-fragment fixtures need no CBOR padding in their UUIDs.
             assert_eq!(uuid.len(), info.size() as usize);
             source[info.start() as usize..info.end() as usize].copy_from_slice(&uuid);
         }
@@ -346,15 +351,19 @@ fn single_file_legacy_zero_id_still_verifies() {
             hash.finalize_single_file_merkle(&mut signed, &mut |_, _| Ok(()))
                 .unwrap();
         }
-        let verified = binding(signed.get_ref());
-        assert_eq!(verified.merkle().unwrap()[0].unique_id, 0);
-        let parsed = read_bmff_c2pa_boxes(&mut signed).unwrap();
+        check_output_with_id(input, signed.get_ref(), 0);
+
+        let mut corrupted = signed.into_inner();
+        let mdat = named(&roots(&corrupted), b"mdat");
+        corrupted[mdat.end - 1] ^= 1;
+        let reader = Reader::default()
+            .with_stream("video/mp4", Cursor::new(corrupted))
+            .unwrap();
         assert_eq!(
-            parsed.bmff_merkle.len(),
-            verified.merkle().unwrap()[0].count
+            reader.validation_state(),
+            ValidationState::Invalid,
+            "{reader}"
         );
-        assert!(parsed.bmff_merkle.iter().all(|map| map.unique_id == 0));
-        check_aux_locator(signed.get_ref());
     }
 }
 
