@@ -317,6 +317,9 @@ impl IdentityAssertion {
 
         if sig_type == "cawg.x509.cose" {
             let mut ctp = CertificateTrustPolicy::default();
+            ctp.set_signer_purpose(crate::crypto::cose::TrustPurpose::Identity);
+            ctp.set_validation_time(settings.verify.validation_time_epoch().ok().flatten());
+            ctp.set_strict_trust_purposes(settings.verify.strict_trust_purposes);
 
             // Load the trust handler settings. Don't worry about status as these
             // are checked during setting generation.

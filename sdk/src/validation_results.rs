@@ -338,7 +338,14 @@ impl ValidationResults {
                 results.add_status(status);
             }
         }
-        results.validation_time = Some(Utc::now().to_rfc3339());
+        // Report the caller-controlled validation instant when one was used.
+        results.validation_time = Some(
+            store
+                .validation_time_epoch()
+                .and_then(|t| chrono::DateTime::<Utc>::from_timestamp(t, 0))
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        );
         results
     }
 

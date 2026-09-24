@@ -27,7 +27,7 @@ use sha2::{Sha256, Sha384, Sha512};
 use crate::{
     crypto::{
         asn1::rfc3161::{Accuracy, TstInfo},
-        cose::{check_end_entity_certificate_profile, CertificateTrustPolicy},
+        cose::{check_end_entity_certificate_profile, CertificateTrustPolicy, TrustPurpose},
         time_stamp::{
             response::{signed_data_from_time_stamp_response, tst_info_from_signed_data},
             TimeStampError,
@@ -520,7 +520,8 @@ pub fn verify_time_stamp(
                 continue;
             }
 
-            match ctp.check_certificate_trust(
+            match ctp.check_certificate_trust_for_purpose(
+                TrustPurpose::TimeStamping,
                 &ordered_cert_ders[0..],
                 &ordered_cert_ders[0],
                 Some(signing_time),

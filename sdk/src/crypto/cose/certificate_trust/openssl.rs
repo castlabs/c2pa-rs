@@ -17,21 +17,28 @@ use openssl::{
     x509::{verify::X509VerifyFlags, X509StoreContext, X509},
 };
 
-use crate::crypto::cose::{CertificateTrustError, CertificateTrustPolicy, TrustAnchorType};
+use crate::crypto::cose::{
+    CertificateTrustError, CertificateTrustPolicy, TrustAnchorType, TrustPurpose,
+};
 
 pub(crate) fn check_certificate_trust(
     ctp: &CertificateTrustPolicy,
+    purpose: TrustPurpose,
     chain_der: &[Vec<u8>],
     cert_der: &[u8],
     signing_time_epoch: Option<i64>,
 ) -> Result<(TrustAnchorType, String), CertificateTrustError> {
     let _openssl = OpenSslMutex::acquire()?;
 
-    if ctp.anchor_sets().count() == 0 {
+    let anchor_sets: Vec<_> = ctp
+        .anchor_sets()
+        .filter(|a| ctp.anchor_type_allowed(purpose, a.trust_anchor_type))
+        .collect();
+    if anchor_sets.is_empty() {
         return Err(CertificateTrustError::CertificateNotTrusted);
     }
 
-    for anchor_set in ctp.anchor_sets() {
+    for anchor_set in anchor_sets {
         // Process each anchor set
 
         let mut cert_chain = Stack::new()?;

@@ -14,7 +14,6 @@
 use asn1_rs::{Any, Class, FromDer, Header, Tag};
 use chrono::{DateTime, Utc};
 use thiserror::Error;
-use web_time::SystemTime;
 use x509_parser::{
     certificate::{BasicExtension, X509Certificate},
     der_parser::{ber::parse_ber_sequence, oid},
@@ -154,14 +153,15 @@ pub fn check_certificate_profile(
     } else {
         // No valid time stamp was associated with this signature: Ensure that the
         // timestamp is valid now.
-        let Ok(now) = SystemTime::now().duration_since(web_time::UNIX_EPOCH) else {
+        // "Now" is the caller-controlled validation instant when configured.
+        let Ok(now) = ctp.evaluation_time() else {
             return Err(CertificateProfileError::InternalError(
                 "system time invalid".to_string(),
             ));
         };
 
         if !signcert.validity().is_valid_at(
-            x509_parser::time::ASN1Time::from_timestamp(now.as_secs() as i64)
+            x509_parser::time::ASN1Time::from_timestamp(now)
                 .map_err(|_| CertificateProfileError::InvalidCertificate)?,
         ) {
             log_item!("", "certificate expired", "check_certificate_profile")

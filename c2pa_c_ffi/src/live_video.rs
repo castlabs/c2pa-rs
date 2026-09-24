@@ -457,12 +457,10 @@ mod tests {
     use p256::ecdsa::signature::Signer as _;
 
     use super::*;
-    use crate::{
-        c_api::{
-            c2pa_context_builder_build, c2pa_context_builder_new,
-            c2pa_context_builder_set_settings, c2pa_context_builder_set_signer, c2pa_free,
-            c2pa_settings_new, c2pa_settings_set_value, c2pa_signer_from_info, C2paSignerInfo,
-        },
+    use crate::c_api::{
+        c2pa_context_builder_build, c2pa_context_builder_new, c2pa_context_builder_set_settings,
+        c2pa_context_builder_set_signer, c2pa_free, c2pa_settings_new, c2pa_settings_set_value,
+        c2pa_signer_from_info, C2paSignerInfo,
     };
 
     macro_rules! fixture_path {

@@ -644,6 +644,58 @@ pub struct Verify {
     ///
     /// The default value is false.
     pub strict_v1_validation: bool,
+    /// Caller-controlled validation instant as an RFC 3339 date-time.
+    ///
+    /// When set, every decision that means "the current time" during
+    /// validation (certificate validity without a trusted timestamp, the
+    /// certificate chain check time, OCSP freshness/revocation without a
+    /// signing time, and the reported `validationTime`) uses this instant
+    /// instead of the wall clock. Authenticated signing and time-stamp times
+    /// are unaffected. Offsets are normalized to UTC; sub-second precision is
+    /// accepted and truncated to whole seconds for certificate decisions.
+    ///
+    /// The default value is `None` (use the wall clock).
+    pub validation_time: Option<String>,
+    /// Whether trust anchors are applied strictly by purpose.
+    ///
+    /// When `true`, claim signing credentials are evaluated only against
+    /// [`TrustListKind::Manifest`] anchors and time-stamp credentials only
+    /// against [`TrustListKind::TSA`] anchors; an empty list for a purpose
+    /// stays empty. When `false` (the default), claim credentials still never
+    /// chain to TSA- or CAWG-only lists, but time stamps fall back to every
+    /// configured C2PA anchor list when no TSA list is configured, preserving
+    /// legacy configurations that mixed TSA roots into `trust_anchors`.
+    pub strict_trust_purposes: bool,
+}
+
+impl Verify {
+    /// Parse [`Verify::validation_time`] into Unix seconds.
+    pub(crate) fn validation_time_epoch(&self) -> Result<Option<i64>> {
+        self.validation_time
+            .as_deref()
+            .map(parse_validation_time)
+            .transpose()
+            .map(|t| t.map(|t| t.timestamp()))
+    }
+}
+
+/// Strictly parse an RFC 3339 validation instant and normalize it to UTC.
+pub(crate) fn parse_validation_time(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    // chrono accepts a space or lowercase `t`/`z`; RFC 3339 §5.6 permits those,
+    // but conformance inputs must be unambiguous, so require `T` and `Z`/offset.
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes[10] != b'T' {
+        return Err(Error::BadParam(format!(
+            "verify.validation_time must be an RFC 3339 date-time: {value}"
+        )));
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            Error::BadParam(format!(
+                "verify.validation_time must be an RFC 3339 date-time: {value}: {e}"
+            ))
+        })
 }
 
 impl Default for Verify {
@@ -658,11 +710,17 @@ impl Default for Verify {
             remote_manifest_fetch: true,
             skip_ingredient_conflict_resolution: false,
             strict_v1_validation: false,
+            validation_time: None,
+            strict_trust_purposes: false,
         }
     }
 }
 
-impl SettingsValidate for Verify {}
+impl SettingsValidate for Verify {
+    fn validate(&self) -> Result<()> {
+        self.validation_time_epoch().map(|_| ())
+    }
+}
 
 #[cfg_attr(
     feature = "json_schema",
@@ -1339,6 +1397,7 @@ impl SettingsValidate for Settings {
             cawg_x509_signer.validate()?;
         }
         self.trust.validate()?;
+        self.verify.validate()?;
         self.core.validate()?;
         self.builder.validate()
     }
@@ -2095,5 +2154,39 @@ pub mod tests {
         );
 
         reset_default_settings().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod validation_time_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn rfc3339_offsets_and_fractions_normalize() {
+        let a = parse_validation_time("2027-01-15T08:00:00Z").unwrap();
+        let b = parse_validation_time("2027-01-15T10:00:00+02:00").unwrap();
+        let c = parse_validation_time("2027-01-15T08:00:00.750Z").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.timestamp(), c.timestamp());
+    }
+
+    #[test]
+    fn invalid_validation_times_fail_explicitly() {
+        for bad in [
+            "",
+            "2027-01-15",
+            "2027-01-15 08:00:00Z",
+            "2027-01-15T08:00:00",
+            "2027-13-15T08:00:00Z",
+            "yesterday",
+        ] {
+            assert!(parse_validation_time(bad).is_err(), "{bad}");
+        }
+        let mut s = Settings::default();
+        s.verify.validation_time = Some("2027-01-15".into());
+        assert!(s.validate().is_err());
+        s.verify.validation_time = Some("2027-01-15T08:00:00Z".into());
+        assert!(s.validate().is_ok());
     }
 }

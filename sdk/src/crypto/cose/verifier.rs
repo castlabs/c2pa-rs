@@ -311,10 +311,20 @@ impl Verifier<'_> {
         });
 
         let verify_result = if _sync {
-            ctp.check_certificate_trust(chain_der, end_entity_cert_der, signing_time_epoch)
+            ctp.check_certificate_trust_for_purpose(
+                ctp.signer_purpose(),
+                chain_der,
+                end_entity_cert_der,
+                signing_time_epoch,
+            )
         } else {
-            ctp.check_certificate_trust_async(chain_der, end_entity_cert_der, signing_time_epoch)
-                .await
+            ctp.check_certificate_trust_for_purpose_async(
+                ctp.signer_purpose(),
+                chain_der,
+                end_entity_cert_der,
+                signing_time_epoch,
+            )
+            .await
         };
 
         match verify_result {

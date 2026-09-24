@@ -21,7 +21,9 @@ use x509_parser::{
     x509::AlgorithmIdentifier,
 };
 
-use crate::crypto::cose::{CertificateTrustError, CertificateTrustPolicy, TrustAnchorType};
+use crate::crypto::cose::{
+    CertificateTrustError, CertificateTrustPolicy, TrustAnchorType, TrustPurpose,
+};
 
 /// Convert a [`c2pa_raw_crypto::Oid`] into a `bcder::Oid` by reusing the OID's
 /// DER content octets directly.
@@ -31,11 +33,16 @@ fn raw_crypto_oid_to_bcder_oid(oid: &c2pa_raw_crypto::Oid) -> bcder::Oid {
 
 pub(crate) fn check_certificate_trust(
     ctp: &CertificateTrustPolicy,
+    purpose: TrustPurpose,
     chain_der: &[Vec<u8>],
     cert_der: &[u8],
     signing_time_epoch: Option<i64>,
 ) -> Result<(TrustAnchorType, String), CertificateTrustError> {
-    if ctp.anchor_sets().count() == 0 {
+    let anchor_sets: Vec<_> = ctp
+        .anchor_sets()
+        .filter(|a| ctp.anchor_type_allowed(purpose, a.trust_anchor_type))
+        .collect();
+    if anchor_sets.is_empty() {
         return Err(CertificateTrustError::CertificateNotTrusted);
     }
 
@@ -89,7 +96,7 @@ pub(crate) fn check_certificate_trust(
         }
     }
 
-    for anchor_set in ctp.anchor_sets() {
+    for anchor_set in anchor_sets {
         // Process each anchor set
 
         // Build anchors and check against trust anchors.

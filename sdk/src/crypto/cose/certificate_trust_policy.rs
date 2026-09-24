@@ -87,6 +87,29 @@ pub struct CertificateTrustPolicy {
 
     /// passthrough mode
     passthrough: bool,
+
+    /// Caller-supplied evaluation instant (Unix seconds) used instead of the
+    /// wall clock when no authenticated signing time applies.
+    validation_time: Option<i64>,
+
+    /// Apply trust anchor lists strictly by purpose (no legacy TSA fallback).
+    strict_trust_purposes: bool,
+
+    /// Purpose used when this policy evaluates a COSE signer credential.
+    signer_purpose: TrustPurpose,
+}
+
+/// The purpose for which a certificate chain is being evaluated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrustPurpose {
+    /// A C2PA claim signing credential (or its OCSP responder).
+    ClaimSigning,
+    /// An RFC 3161 time-stamping authority credential.
+    TimeStamping,
+    /// A CAWG X.509 identity credential.
+    Identity,
+    /// Any configured anchor list (legacy behaviour).
+    Any,
 }
 
 impl Default for CertificateTrustPolicy {
@@ -97,6 +120,9 @@ impl Default for CertificateTrustPolicy {
             additional_ekus: HashSet::default(),
             mandatory_ekus: HashSet::default(),
             passthrough: false,
+            validation_time: None,
+            strict_trust_purposes: false,
+            signer_purpose: TrustPurpose::ClaimSigning,
         };
 
         this.add_valid_ekus(include_bytes!("./valid_eku_oids.cfg"));
@@ -132,6 +158,9 @@ impl CertificateTrustPolicy {
             additional_ekus: HashSet::default(),
             mandatory_ekus: HashSet::default(),
             passthrough: false,
+            validation_time: None,
+            strict_trust_purposes: false,
+            signer_purpose: TrustPurpose::ClaimSigning,
         }
     }
 
@@ -143,6 +172,9 @@ impl CertificateTrustPolicy {
             additional_ekus: HashSet::default(),
             mandatory_ekus: HashSet::default(),
             passthrough: true,
+            validation_time: None,
+            strict_trust_purposes: false,
+            signer_purpose: TrustPurpose::ClaimSigning,
         }
     }
 
@@ -189,6 +221,113 @@ impl CertificateTrustPolicy {
         end_entity_cert_der: &[u8],
         signing_time_epoch: Option<i64>,
     ) -> Result<(TrustAnchorType, String), CertificateTrustError> {
+        if _sync {
+            self.check_certificate_trust_for_purpose(
+                TrustPurpose::Any,
+                chain_der,
+                end_entity_cert_der,
+                signing_time_epoch,
+            )
+        } else {
+            self.check_certificate_trust_for_purpose_async(
+                TrustPurpose::Any,
+                chain_der,
+                end_entity_cert_der,
+                signing_time_epoch,
+            )
+            .await
+        }
+    }
+
+    /// Set the caller-controlled evaluation instant (Unix seconds).
+    pub fn set_validation_time(&mut self, validation_time: Option<i64>) {
+        self.validation_time = validation_time;
+    }
+
+    /// Returns the caller-controlled evaluation instant, if any.
+    pub fn validation_time(&self) -> Option<i64> {
+        self.validation_time
+    }
+
+    /// Returns the instant (Unix seconds) that represents "now" for
+    /// evaluations that have no authenticated signing time.
+    pub fn evaluation_time(&self) -> Result<i64, CertificateTrustError> {
+        match self.validation_time {
+            Some(t) => Ok(t),
+            None => web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .map_err(|_| {
+                    CertificateTrustError::InternalError("system time invalid".to_string())
+                }),
+        }
+    }
+
+    /// Enable or disable strict per-purpose trust anchor selection.
+    pub fn set_strict_trust_purposes(&mut self, strict: bool) {
+        self.strict_trust_purposes = strict;
+    }
+
+    /// Set the purpose used when this policy evaluates COSE signer credentials.
+    pub fn set_signer_purpose(&mut self, purpose: TrustPurpose) {
+        self.signer_purpose = purpose;
+    }
+
+    /// Returns the purpose used when this policy evaluates COSE signer credentials.
+    pub fn signer_purpose(&self) -> TrustPurpose {
+        self.signer_purpose
+    }
+
+    /// Returns whether trust anchors are applied strictly by purpose.
+    pub fn strict_trust_purposes(&self) -> bool {
+        self.strict_trust_purposes
+    }
+
+    /// Returns whether an anchor set of `kind` may authorize `purpose`.
+    pub(crate) fn anchor_type_allowed(&self, purpose: TrustPurpose, kind: TrustAnchorType) -> bool {
+        match purpose {
+            TrustPurpose::Any => true,
+            TrustPurpose::ClaimSigning => kind == TrustAnchorType::Manifest,
+            // Identity policies are built from the CAWG trust namespace only;
+            // outside strict mode also accept default (test) C2PA anchors that
+            // `CertificateTrustPolicy::default()` may contribute.
+            TrustPurpose::Identity => {
+                kind == TrustAnchorType::CAWG
+                    || (!self.strict_trust_purposes && kind == TrustAnchorType::Manifest)
+            }
+            TrustPurpose::TimeStamping => {
+                if kind == TrustAnchorType::TSA {
+                    return true;
+                }
+                // Legacy configurations placed TSA roots in the C2PA list. Only
+                // honour that when no dedicated TSA list exists and strict
+                // purpose separation was not requested.
+                !self.strict_trust_purposes
+                    && kind == TrustAnchorType::Manifest
+                    && !self
+                        .trust_anchors
+                        .iter()
+                        .any(|a| a.trust_anchor_type == TrustAnchorType::TSA)
+            }
+        }
+    }
+
+    /// Like [`Self::check_certificate_trust`], but only anchor sets that may
+    /// authorize `purpose` are considered. When no signing time is supplied,
+    /// the configured validation time (or the wall clock) is used.
+    #[allow(unused)] // parameters may be unused in some cases
+    #[async_generic]
+    pub fn check_certificate_trust_for_purpose(
+        &self,
+        purpose: TrustPurpose,
+        chain_der: &[Vec<u8>],
+        end_entity_cert_der: &[u8],
+        signing_time_epoch: Option<i64>,
+    ) -> Result<(TrustAnchorType, String), CertificateTrustError> {
+        let signing_time_epoch = match signing_time_epoch {
+            Some(t) => Some(t),
+            None => self.validation_time,
+        };
         if self.passthrough {
             return Ok((TrustAnchorType::NoCheck, String::new()));
         }
@@ -205,6 +344,7 @@ impl CertificateTrustPolicy {
         {
             return super::certificate_trust::rust_native::check_certificate_trust(
                 self,
+                purpose,
                 chain_der,
                 end_entity_cert_der,
                 signing_time_epoch,
@@ -218,6 +358,7 @@ impl CertificateTrustPolicy {
         {
             return super::certificate_trust::openssl::check_certificate_trust(
                 self,
+                purpose,
                 chain_der,
                 end_entity_cert_der,
                 signing_time_epoch,
@@ -613,7 +754,8 @@ mod tests {
 
     use crate::{
         crypto::cose::{
-            CertificateTrustError, CertificateTrustPolicy, InvalidCertificateError, TrustAnchorType,
+            CertificateTrustError, CertificateTrustPolicy, InvalidCertificateError,
+            TrustAnchorType, TrustPurpose,
         },
         Settings,
     };
@@ -1682,5 +1824,114 @@ zGxQnM2hCA==
             other: vec![DOCUMENT_SIGNING_OID.clone()],
         };
         assert!(ctp.verify_mandatory_ekus(&eku));
+    }
+
+    const ROOT_BUNDLE: &[u8] =
+        include_bytes!("../../../tests/fixtures/crypto/raw_signature/test_cert_root_bundle.pem");
+
+    fn policy_with(kind: TrustAnchorType) -> CertificateTrustPolicy {
+        let mut ctp = CertificateTrustPolicy::new();
+        ctp.add_trust_anchors(ROOT_BUNDLE, "test", kind, None)
+            .unwrap();
+        ctp
+    }
+
+    fn check(ctp: &CertificateTrustPolicy, purpose: TrustPurpose, at: Option<i64>) -> bool {
+        let es256 = test_cert_chain(SigningAlg::Es256);
+        ctp.check_certificate_trust_for_purpose(purpose, &es256[1..], &es256[0], at)
+            .is_ok()
+    }
+
+    // es256 leaf: 2022-06-10T18:46:40Z .. 2030-08-26T18:46:40Z
+    const BEFORE: i64 = 1_600_000_000; // 2020-09-13
+    const INSIDE: i64 = 1_800_000_000; // 2027-01-15
+    const AFTER: i64 = 1_950_000_000; // 2031-10-17
+
+    #[test]
+    fn claim_purpose_never_uses_tsa_or_cawg_lists() {
+        for kind in [TrustAnchorType::TSA, TrustAnchorType::CAWG] {
+            let ctp = policy_with(kind);
+            assert!(!check(&ctp, TrustPurpose::ClaimSigning, None));
+            assert!(check(&ctp, TrustPurpose::Any, None));
+        }
+        assert!(check(
+            &policy_with(TrustAnchorType::Manifest),
+            TrustPurpose::ClaimSigning,
+            None
+        ));
+    }
+
+    #[test]
+    fn tsa_purpose_strict_and_legacy_selection() {
+        // Legacy: only a C2PA list configured -> timestamps may use it.
+        let mut ctp = policy_with(TrustAnchorType::Manifest);
+        assert!(check(&ctp, TrustPurpose::TimeStamping, None));
+        // Strict: the C2PA list cannot authorize timestamps.
+        ctp.set_strict_trust_purposes(true);
+        assert!(!check(&ctp, TrustPurpose::TimeStamping, None));
+
+        // Once a dedicated (unrelated) TSA list exists, the C2PA list is not borrowed.
+        let mut ctp = policy_with(TrustAnchorType::Manifest);
+        ctp.add_trust_anchors(
+            include_bytes!("../../../tests/fixtures/crypto/raw_signature/ed25519.pub"),
+            "tsa",
+            TrustAnchorType::TSA,
+            None,
+        )
+        .unwrap();
+        assert!(!check(&ctp, TrustPurpose::TimeStamping, None));
+        assert!(check(&ctp, TrustPurpose::ClaimSigning, None));
+
+        // Swapped purposes: a TSA-only list authorizes timestamps, not claims.
+        let mut ctp = policy_with(TrustAnchorType::TSA);
+        ctp.set_strict_trust_purposes(true);
+        assert!(check(&ctp, TrustPurpose::TimeStamping, None));
+        assert!(!check(&ctp, TrustPurpose::ClaimSigning, None));
+    }
+
+    #[test]
+    fn empty_lists_stay_empty() {
+        let mut ctp = CertificateTrustPolicy::new();
+        ctp.set_strict_trust_purposes(true);
+        for purpose in [
+            TrustPurpose::ClaimSigning,
+            TrustPurpose::TimeStamping,
+            TrustPurpose::Identity,
+            TrustPurpose::Any,
+        ] {
+            assert!(!check(&ctp, purpose, None));
+        }
+    }
+
+    #[test]
+    fn validation_time_controls_chain_validity() {
+        let mut ctp = policy_with(TrustAnchorType::Manifest);
+        ctp.set_validation_time(Some(BEFORE));
+        assert!(!check(&ctp, TrustPurpose::ClaimSigning, None));
+        ctp.set_validation_time(Some(INSIDE));
+        assert!(check(&ctp, TrustPurpose::ClaimSigning, None));
+        assert_eq!(ctp.evaluation_time().unwrap(), INSIDE);
+        ctp.set_validation_time(Some(AFTER));
+        assert!(!check(&ctp, TrustPurpose::ClaimSigning, None));
+        // An authenticated signing time takes precedence over the evaluation instant.
+        assert!(check(&ctp, TrustPurpose::ClaimSigning, Some(INSIDE)));
+    }
+
+    #[test]
+    fn validation_time_controls_end_entity_profile_without_timestamp() {
+        use crate::{
+            crypto::cose::check_end_entity_certificate_profile, status_tracker::StatusTracker,
+        };
+        let es256 = test_cert_chain(SigningAlg::Es256);
+        let mut ctp = CertificateTrustPolicy::default();
+        for (at, ok) in [(BEFORE, false), (INSIDE, true), (AFTER, false)] {
+            ctp.set_validation_time(Some(at));
+            let mut log = StatusTracker::default();
+            assert_eq!(
+                check_end_entity_certificate_profile(&es256[0], &ctp, &mut log, None).is_ok(),
+                ok,
+                "at {at}"
+            );
+        }
     }
 }

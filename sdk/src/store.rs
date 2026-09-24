@@ -157,6 +157,11 @@ impl Store {
         }
     }
 
+    /// Caller-controlled validation instant (Unix seconds), if configured.
+    pub(crate) fn validation_time_epoch(&self) -> Option<i64> {
+        self.ctp.validation_time()
+    }
+
     /// Create a new, empty claims store with the specified settings.
     pub fn from_context(context: &Context) -> Self {
         let mut store = Store::new();
@@ -194,8 +199,14 @@ impl Store {
                     anchor.trust_config.clone(),
                 );
 
+                // In strict purpose mode a CAWG allow-list must not authorize
+                // claim signers.
+                let identity_only = settings.verify.strict_trust_purposes
+                    && anchor.trust_kind == TrustListKind::CAWG;
                 if let Some(al) = &anchor.allowed_list {
-                    let _v = store.add_trust_allowed_list(al.as_bytes());
+                    if !identity_only {
+                        let _v = store.add_trust_allowed_list(al.as_bytes());
+                    }
                 }
             }
         }
@@ -203,6 +214,15 @@ impl Store {
         if let Some(tc) = &settings.trust.trust_config {
             let _v = store.add_trust_config(tc.as_bytes());
         }
+
+        // Settings are validated on load, so a malformed instant cannot reach here;
+        // fall back to the wall clock defensively rather than panicking.
+        store
+            .ctp
+            .set_validation_time(settings.verify.validation_time_epoch().ok().flatten());
+        store
+            .ctp
+            .set_strict_trust_purposes(settings.verify.strict_trust_purposes);
 
         store
     }
@@ -2065,6 +2085,9 @@ impl Store {
         context: &Context,
     ) -> Result<()> {
         context.check_progress(ProgressPhase::VerifyingManifest, 1, 1)?;
+        // A malformed caller-supplied validation instant must never silently
+        // degrade to the wall clock.
+        context.settings().verify.validation_time_epoch()?;
         let claim = match store.provenance_claim() {
             Some(c) => c,
             None => {

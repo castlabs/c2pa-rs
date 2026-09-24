@@ -24,6 +24,7 @@ use crate::{
         cose::{
             cert_chain_from_sign1, check_end_entity_certificate_profile, validate_cose_tst_info,
             validate_cose_tst_info_async, CertificateTrustError, CertificateTrustPolicy, CoseError,
+            TrustPurpose,
         },
         ocsp::OcspResponse,
     },
@@ -367,10 +368,11 @@ fn check_stapled_ocsp_response(
     let signing_cert_chain = ocsp_signing_chain(&signing_cert_chain, ctp);
 
     let mut current_validation_log = StatusTracker::default();
-    let Ok(ocsp_data) = OcspResponse::from_der_checked(
+    let Ok(ocsp_data) = OcspResponse::from_der_checked_at(
         ocsp_response_der,
         &signing_cert_chain,
         signing_time,
+        ctp.validation_time(),
         &mut current_validation_log,
     ) else {
         return Ok(OcspResponse::default());
@@ -384,6 +386,7 @@ fn check_stapled_ocsp_response(
 
         // make sure this is an OCSP signing EKU
         let mut new_ctp = CertificateTrustPolicy::default();
+        new_ctp.set_validation_time(ctp.validation_time());
         new_ctp.clear_ekus();
         new_ctp.add_mandatory_ekus(OCSP_OID_STR.as_bytes()); // ocsp signing EKU
         if check_end_entity_certificate_profile(
@@ -401,7 +404,8 @@ fn check_stapled_ocsp_response(
         // x5chain if the response does not embed the responder's issuing CA
         let ocsp_cert_chain = extend_ocsp_cert_chain(ocsp_certs, &signing_cert_chain);
         if ctp
-            .check_certificate_trust(
+            .check_certificate_trust_for_purpose(
+                TrustPurpose::ClaimSigning,
                 &ocsp_cert_chain,
                 first_cert,
                 signing_time.map(|t| t.timestamp()),
@@ -604,10 +608,11 @@ fn validate_fetched_ocsp(
     // response while leaving that success code behind.
     let mut current_validation_log = StatusTracker::default();
 
-    let ocsp_data = match OcspResponse::from_der_checked(
+    let ocsp_data = match OcspResponse::from_der_checked_at(
         ocsp_response_der,
         subject_chain,
         signing_time,
+        ctp.validation_time(),
         &mut current_validation_log,
     ) {
         Ok(data) => data,
@@ -622,6 +627,7 @@ fn validate_fetched_ocsp(
 
         // make sure this is an OCSP signing EKU
         let mut new_ctp = CertificateTrustPolicy::default();
+        new_ctp.set_validation_time(ctp.validation_time());
         new_ctp.clear_ekus();
         new_ctp.add_mandatory_ekus(OCSP_OID_STR.as_bytes()); // ocsp signing EKU
         if check_end_entity_certificate_profile(
@@ -646,7 +652,8 @@ fn validate_fetched_ocsp(
         let ocsp_cert_chain = extend_ocsp_cert_chain(ocsp_certs, subject_chain);
 
         if ctp
-            .check_certificate_trust(
+            .check_certificate_trust_for_purpose(
+                TrustPurpose::ClaimSigning,
                 &ocsp_cert_chain,
                 first_cert,
                 signing_time.map(|t| t.timestamp()),

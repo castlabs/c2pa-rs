@@ -4943,7 +4943,8 @@ mod tests {
         let reader =
             unsafe { c2pa_reader_with_stream(reader, format.as_ptr(), dest_stream.as_ptr()) };
         assert!(!reader.is_null());
-        let manifest = unsafe { &*reader }.active_manifest().unwrap();
+        let reader_guard = crate::cimpl::utils::checkout_shared::<C2paReader>(reader).unwrap();
+        let manifest = reader_guard.active_manifest().unwrap();
         let assertions: Vec<_> = manifest
             .assertions()
             .iter()
@@ -5079,7 +5080,9 @@ mod tests {
             0
         );
 
-        let dynamic_assertions = unsafe { &*signer }.dynamic_assertions();
+        let dynamic_assertions = crate::cimpl::utils::checkout_shared::<C2paSigner>(signer)
+            .unwrap()
+            .dynamic_assertions();
         let error = dynamic_assertions[0]
             .content("com.example.error", Some(8), &PartialClaim::default())
             .err()
@@ -5193,7 +5196,10 @@ mod tests {
             )
         };
         assert!(!signer.is_null());
-        let error = unsafe { &*signer }.sign(b"test").unwrap_err();
+        let error = crate::cimpl::utils::checkout_shared::<C2paSigner>(signer)
+            .unwrap()
+            .sign(b"test")
+            .unwrap_err();
         assert!(error.to_string().contains("exceeding output capacity 8"));
         unsafe { c2pa_free(signer as *mut c_void) };
     }
@@ -5964,8 +5970,14 @@ verify_after_sign = true
             "context reader failed: {:?}",
             CimplError::last_message()
         );
-        assert_eq!(unsafe { &*reader }.validation_status(), None);
-        assert!(unsafe { &*reader }
+        assert_eq!(
+            crate::cimpl::utils::checkout_shared::<C2paReader>(reader)
+                .unwrap()
+                .validation_status(),
+            None
+        );
+        assert!(crate::cimpl::utils::checkout_shared::<C2paReader>(reader)
+            .unwrap()
             .active_manifest()
             .unwrap()
             .assertions()
@@ -5989,7 +6001,12 @@ verify_after_sign = true
             "legacy reader failed: {:?}",
             CimplError::last_message()
         );
-        assert_eq!(unsafe { &*legacy_reader }.validation_status(), None);
+        assert_eq!(
+            crate::cimpl::utils::checkout_shared::<C2paReader>(legacy_reader)
+                .unwrap()
+                .validation_status(),
+            None
+        );
 
         unsafe {
             assert_eq!(c2pa_free(legacy_reader as *const c_void), 0);
