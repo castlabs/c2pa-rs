@@ -383,6 +383,13 @@ pub struct BmffHash {
     bmff_version: usize,
 }
 
+/// Rendition id used when a single-file fragmented asset is signed on its own.
+///
+/// Renditions of one ABR ladder are numbered `0..N-1`, so a one-rung ladder
+/// produces exactly what signing that asset alone produces, and everything
+/// signed before ladders existed keeps validating against its own boxes.
+pub(crate) const SINGLE_RENDITION_ID: usize = 0;
+
 /// Pick the `MerkleMap` that describes *this* single-file fragmented asset.
 ///
 /// A single-file fragmented asset is one track, so every `merkle` uuid box it
@@ -1184,6 +1191,7 @@ impl BmffHash {
         &mut self,
         reader: &mut dyn CAIRead,
         max_leaves: usize,
+        unique_id: usize,
     ) -> crate::Result<Option<Vec<Vec<u8>>>> {
         let boxes = read_bmff_c2pa_boxes(reader)?;
         if !boxes.box_infos.iter().any(|b| b.path == "moov")
@@ -1223,7 +1231,7 @@ impl BmffHash {
         // still identifies each fragment's leaf, as required by A.5.4.1.2.
         let mut uuids = Vec::with_capacity(fragments.len());
         let largest_map = BmffMerkleMap {
-            unique_id: 0,
+            unique_id,
             local_id,
             location: fragments.len() - 1,
             hashes: None,
@@ -1233,7 +1241,7 @@ impl BmffHash {
             .len();
         for location in 0..fragments.len() {
             let map = BmffMerkleMap {
-                unique_id: 0,
+                unique_id,
                 local_id,
                 location,
                 hashes: None,
@@ -1257,7 +1265,7 @@ impl BmffHash {
         self.hash = None;
         self.bmff_version = 3;
         self.merkle = Some(vec![MerkleMap {
-            unique_id: 0,
+            unique_id,
             local_id,
             count: fragments.len(),
             alg: Some(alg.to_owned()),
