@@ -3002,6 +3002,44 @@ impl Store {
 
         let mut output_map = HashMap::new();
 
+        // Every rendition is written to `<output>/<name of the init's parent
+        // dir>`, so two init segments whose parents share a name -- say
+        // `a/video/init.mp4` and `b/video/init.mp4` -- would land in one
+        // directory, the second silently replacing the first's init segment
+        // (and any fragments with the same names) while the claim still
+        // carries a map for each. Refuse that before anything is signed. The
+        // parents are compared canonically so an alias of one directory
+        // counts as that directory, not as a distinct rendition, and names are
+        // compared case-insensitively because the output filesystem may be.
+        let mut rendition_dirs: HashMap<String, PathBuf> = HashMap::new();
+        for init_path in init_paths {
+            let init_dir = init_path.parent().ok_or(Error::BadParam(
+                "failed to get parent directory for init segment".to_string(),
+            ))?;
+            let name = init_dir
+                .file_name()
+                .ok_or(Error::BadParam("init segment bad file name".to_string()))?
+                .to_owned();
+            let canonical =
+                std::fs::canonicalize(init_dir).unwrap_or_else(|_| init_dir.to_path_buf());
+            let key = name.to_string_lossy().to_lowercase();
+            if let Some(previous) = rendition_dirs.insert(key, canonical.clone()) {
+                return Err(Error::BadParam(if previous == canonical {
+                    format!(
+                        "init segment directory {} was given more than once",
+                        canonical.display()
+                    )
+                } else {
+                    format!(
+                        "init segments in {} and {} would both be written to {}; rendition directories must have distinct names",
+                        previous.display(),
+                        canonical.display(),
+                        output_path.as_ref().join(&name).display()
+                    )
+                }));
+            }
+        }
+
         // make sure output path is not a file
         if output_path.as_ref().is_file() {
             return Err(crate::Error::BadParam(

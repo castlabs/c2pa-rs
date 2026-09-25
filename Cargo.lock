@@ -604,6 +604,7 @@ dependencies = [
  "base64",
  "c2pa",
  "cbindgen",
+ "glob",
  "libc",
  "scopeguard",
  "serde",
