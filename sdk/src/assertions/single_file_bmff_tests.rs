@@ -268,7 +268,7 @@ fn check_output_with_id(original: &[u8], signed: &[u8], unique_id: usize) {
     check_tfra(signed);
 }
 
-fn check_tfra(signed: &[u8]) {
+pub(super) fn check_tfra(signed: &[u8]) {
     let root = roots(signed);
     let moofs: Vec<_> = root.iter().filter(|b| b.kind == *b"moof").collect();
     let count = moofs.len();
@@ -348,7 +348,7 @@ fn single_file_legacy_zero_id_still_verifies() {
                 &mut signed,
             )
             .unwrap();
-            hash.finalize_single_file_merkle(&mut signed, &mut |_, _| Ok(()))
+            hash.finalize_single_file_merkle(&mut signed, 0, &mut |_, _| Ok(()))
                 .unwrap();
         }
         check_output_with_id(input, signed.get_ref(), 0);
@@ -675,7 +675,7 @@ fn single_file_dynamic_assertion_and_update() {
     check_aux_locator(output.get_ref());
 }
 
-fn historical_flat(input: &[u8]) -> Vec<u8> {
+pub(super) fn historical_flat(input: &[u8]) -> Vec<u8> {
     // Reproduce the historical file-level binding using the caller-owned hash
     // API. The first pass fixes the layout; the second fills the same-size hash.
     let settings = Settings::new()

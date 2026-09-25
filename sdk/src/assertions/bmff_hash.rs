@@ -65,10 +65,16 @@ use crate::{
 };
 
 const ASSERTION_CREATION_VERSION: usize = 3;
+// New writers use 1-based IDs; the verifier also accepts legacy ID 0.
+pub(crate) const SINGLE_RENDITION_ID: usize = 1;
 
 #[cfg(test)]
 #[path = "single_file_bmff_tests.rs"]
 mod single_file_bmff_tests;
+
+#[cfg(all(test, feature = "file_io"))]
+#[path = "single_file_ladder_tests.rs"]
+mod single_file_ladder_tests;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct UserHashInfo {
@@ -1259,10 +1265,48 @@ impl BmffHash {
         reader: &mut dyn ReadSeek,
         max_leaves: usize,
     ) -> crate::Result<Option<Vec<Vec<u8>>>> {
-        // Align with the multi-file writer and C2PA 2.4 section 18.6.3's
-        // non-normative 1-based guidance; this does not invalidate legacy ID 0.
-        const SINGLE_RENDITION_ID: usize = 1;
+        let Some((map, uuids)) =
+            self.single_file_merkle_layout(reader, max_leaves, SINGLE_RENDITION_ID)?
+        else {
+            return Ok(None);
+        };
+        self.hash = None;
+        self.bmff_version = 3;
+        self.merkle = Some(vec![map]);
+        Ok(Some(uuids))
+    }
 
+    /// Append one rendition to the shared assertion, in 1-based rendition order.
+    #[cfg(feature = "file_io")]
+    pub(crate) fn add_single_file_rendition(
+        &mut self,
+        reader: &mut dyn ReadSeek,
+        max_leaves: usize,
+        unique_id: usize,
+    ) -> crate::Result<Vec<Vec<u8>>> {
+        if unique_id != self.merkle.as_ref().map_or(0, Vec::len) + 1 {
+            return Err(Error::BadParam(
+                "ladder rendition IDs must be consecutive".into(),
+            ));
+        }
+        let Some((map, uuids)) = self.single_file_merkle_layout(reader, max_leaves, unique_id)?
+        else {
+            return Err(Error::BadParam(format!(
+                "rendition {unique_id} is not a single-file fragmented BMFF"
+            )));
+        };
+        self.hash = None;
+        self.bmff_version = 3;
+        self.merkle.get_or_insert_with(Vec::new).push(map);
+        Ok(uuids)
+    }
+
+    fn single_file_merkle_layout(
+        &self,
+        reader: &mut dyn ReadSeek,
+        max_leaves: usize,
+        unique_id: usize,
+    ) -> crate::Result<Option<(MerkleMap, Vec<Vec<u8>>)>> {
         let boxes = read_bmff_c2pa_boxes(reader)?;
         if !boxes.box_infos.iter().any(|b| b.path == "moov")
             || !boxes.box_infos.iter().any(|b| b.path == "moof")
@@ -1292,7 +1336,15 @@ impl BmffHash {
         let local_id = crate::asset_handlers::bmff_io::single_file_fragment_track_id(reader)?;
         let alg = self.alg.as_deref().ok_or(Error::UnsupportedType)?;
         let hash_size = hash_size_by_alg(alg)?;
-        if (fragments.len() as u64).saturating_mul(hash_size as u64) > MAX_MERKLE_LEAVES_SIZE {
+        let existing_size = self.merkle.iter().flatten().fold(0u64, |size, map| {
+            map.hashes
+                .0
+                .iter()
+                .fold(size, |size, hash| size.saturating_add(hash.len() as u64))
+        });
+        if existing_size.saturating_add((fragments.len() as u64).saturating_mul(hash_size as u64))
+            > MAX_MERKLE_LEAVES_SIZE
+        {
             return Err(Error::BadParam(
                 "single-file fragment Merkle map exceeds memory limit".into(),
             ));
@@ -1301,7 +1353,7 @@ impl BmffHash {
         // still identifies each fragment's leaf, as required by A.5.4.1.2.
         let mut uuids = Vec::with_capacity(fragments.len());
         let largest_map = BmffMerkleMap {
-            unique_id: SINGLE_RENDITION_ID,
+            unique_id,
             local_id,
             location: fragments.len() - 1,
             hashes: None,
@@ -1311,7 +1363,7 @@ impl BmffHash {
             .len();
         for location in 0..fragments.len() {
             let map = BmffMerkleMap {
-                unique_id: SINGLE_RENDITION_ID,
+                unique_id,
                 local_id,
                 location,
                 hashes: None,
@@ -1332,10 +1384,8 @@ impl BmffHash {
             uuids.push(uuid);
         }
         let placeholder = ByteBuf::from(vec![0; hash_size]);
-        self.hash = None;
-        self.bmff_version = 3;
-        self.merkle = Some(vec![MerkleMap {
-            unique_id: SINGLE_RENDITION_ID,
+        let map = MerkleMap {
+            unique_id,
             local_id,
             count: fragments.len(),
             alg: Some(alg.to_owned()),
@@ -1343,13 +1393,14 @@ impl BmffHash {
             hashes: VecByteBuf(vec![placeholder; fragments.len()]),
             fixed_block_size: None,
             variable_block_sizes: None,
-        }]);
-        Ok(Some(uuids))
+        };
+        Ok(Some((map, uuids)))
     }
 
     pub(crate) fn finalize_single_file_merkle<F>(
         &mut self,
         reader: &mut dyn ReadSeek,
+        unique_id: usize,
         progress: &mut F,
     ) -> crate::Result<()>
     where
@@ -1362,7 +1413,7 @@ impl BmffHash {
         let map = self
             .merkle
             .as_mut()
-            .and_then(|maps| maps.first_mut())
+            .and_then(|maps| maps.iter_mut().find(|m| m.unique_id == unique_id))
             .ok_or_else(|| Error::BadParam("missing fragment Merkle map".into()))?;
         if fragments.len() != map.count || boxes.bmff_merkle.len() != map.count {
             return Err(Error::BadParam(

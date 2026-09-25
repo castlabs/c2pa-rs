@@ -3366,6 +3366,64 @@ impl Builder {
         Ok(())
     }
 
+    /// Sign an ABR ladder of single-file fragmented BMFF assets into one manifest.
+    ///
+    /// Each source must contain its own initialization and media fragments, with
+    /// a single track and no existing C2PA manifest. For separate initialization
+    /// and media files, use [`Self::sign_fragmented_files`] instead.
+    /// The shared assertion contains one Merkle map per source, with `uniqueId`
+    /// numbered from 1 in source order, with at most 256 renditions. Every output
+    /// embeds identical manifest bytes, which are also returned by this method.
+    ///
+    /// No parent ingredient or thumbnail is generated automatically: supply
+    /// these in the definition when needed. Sidecars and remote URLs, including
+    /// embedding with a remote URL, are not supported. Destination parent
+    /// directories must exist, and destinations
+    /// must not exist or alias another destination (including via hardlinks,
+    /// symlinks, case folding, or Unicode normalization).
+    ///
+    /// # Errors
+    /// Returns an error for empty or unequal path lists, unsupported sources,
+    /// existing destinations, or signing or I/O failures. On error, newly
+    /// created outputs may be empty, incomplete, or unsigned; discard them.
+    /// Existing files, including every source, are never overwritten.
+    #[cfg(feature = "file_io")]
+    pub fn sign_ladder_files<S: AsRef<Path>, D: AsRef<Path>>(
+        &mut self,
+        signer: &dyn Signer,
+        sources: &[S],
+        dests: &[D],
+    ) -> Result<Vec<u8>> {
+        if sources.is_empty() || sources.len() != dests.len() {
+            return Err(Error::BadParam(
+                "a ladder requires nonempty, equal source and destination lists".into(),
+            ));
+        }
+        // Bound path/handle allocations as well as the serialized Merkle maps.
+        if sources.len() > crate::store::MAX_LADDER_RENDITIONS {
+            return Err(Error::BadParam("too many ladder renditions".into()));
+        }
+        let sources: Vec<PathBuf> = sources.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        let dests: Vec<PathBuf> = dests.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        self.definition.format = self
+            .context
+            .io()
+            .format_from_path(&sources[0])
+            .ok_or(Error::UnsupportedType)?;
+        self.definition.instance_id = format!("xmp:iid:{}", Uuid::new_v4());
+        self.apply_resource_base_path();
+        let mut claim = self.to_claim()?;
+        if let Some(tsa_url) = signer.time_authority_url() {
+            self.maybe_add_timestamp(&tsa_url, &mut claim)?;
+        }
+        self.to_store_with_claim(claim)?.save_to_bmff_ladder(
+            &sources,
+            &dests,
+            signer,
+            &self.context,
+        )
+    }
+
     /// Sign rendition(s) containing fragmented BMFF files.
     ///
     /// Note: Currently this does not support files with existing C2PA manifest.
