@@ -3374,6 +3374,8 @@ impl Builder {
     /// The shared assertion contains one Merkle map per source, with `uniqueId`
     /// numbered from 1 in source order, with at most 256 renditions. Every output
     /// embeds identical manifest bytes, which are also returned by this method.
+    /// The manifest definition's format comes from the first source path. Mixed video
+    /// and audio BMFF renditions are supported; source order chooses that format.
     ///
     /// No parent ingredient or thumbnail is generated automatically: supply
     /// these in the definition when needed. Sidecars and remote URLs, including
@@ -3410,7 +3412,7 @@ impl Builder {
             .io()
             .format_from_path(&sources[0])
             .ok_or(Error::UnsupportedType)?;
-        self.definition.instance_id = format!("xmp:iid:{}", Uuid::new_v4());
+        self.definition.instance_id = format!("xmp.iid:{}", Uuid::new_v4());
         self.apply_resource_base_path();
         let mut claim = self.to_claim()?;
         if let Some(tsa_url) = signer.time_authority_url() {

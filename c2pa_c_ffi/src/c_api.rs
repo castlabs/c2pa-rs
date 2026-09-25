@@ -2077,22 +2077,27 @@ pub unsafe extern "C" fn c2pa_builder_sign_ladder(
     }
     ptr_or_return_int!(sources);
     ptr_or_return_int!(dests);
-    let unpack = |array: *const *const c_char| -> Result<Vec<std::path::PathBuf>, CimplError> {
-        let mut paths = Vec::with_capacity(count);
-        for index in 0..count {
-            let entry = *array.add(index);
-            if entry.is_null() {
-                return Err(CimplError::other("a ladder path is NULL"));
+    let unpack =
+        |array: *const *const c_char, name: &str| -> Result<Vec<std::path::PathBuf>, CimplError> {
+            let mut paths = Vec::with_capacity(count);
+            for index in 0..count {
+                let entry = *array.add(index);
+                if entry.is_null() {
+                    return Err(CimplError::other("a ladder path is NULL"));
+                }
+                let cstr = std::ffi::CStr::from_ptr(entry);
+                if cstr.to_bytes().len() > crate::macros::MAX_CSTRING_LEN {
+                    return Err(CimplError::string_too_long(format!("{name}[{index}]")));
+                }
+                let path = cstr
+                    .to_str()
+                    .map_err(|_| CimplError::other("a ladder path is not valid UTF-8"))?;
+                paths.push(std::path::PathBuf::from(path));
             }
-            let path = std::ffi::CStr::from_ptr(entry)
-                .to_str()
-                .map_err(|_| CimplError::other("a ladder path is not valid UTF-8"))?;
-            paths.push(std::path::PathBuf::from(path));
-        }
-        Ok(paths)
-    };
-    let sources = ok_or_return_int!(unpack(sources));
-    let dests = ok_or_return_int!(unpack(dests));
+            Ok(paths)
+        };
+    let sources = ok_or_return_int!(unpack(sources, "sources"));
+    let dests = ok_or_return_int!(unpack(dests, "dests"));
     let mut builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
     let signer = deref_or_return_int!(signer_ptr, C2paSigner);
     let bytes =
@@ -3253,6 +3258,29 @@ mod tests {
         let invalid_utf8 = [0xffu8, 0];
         let invalid_paths = [invalid_utf8.as_ptr().cast(), sources[1]];
         let null_paths = [std::ptr::null(), sources[1]];
+        let oversized = CString::new(vec![b'x'; crate::macros::MAX_CSTRING_LEN + 1]).unwrap();
+        let oversized_paths = [sources[0], oversized.as_ptr()];
+        for (input, output, name) in [
+            (oversized_paths.as_ptr(), dests.as_ptr(), "sources[1]"),
+            (sources.as_ptr(), oversized_paths.as_ptr(), "dests[1]"),
+        ] {
+            let mut bytes = std::ptr::dangling();
+            assert_eq!(
+                unsafe { c2pa_builder_sign_ladder(builder, signer, input, output, 2, &mut bytes) },
+                -1
+            );
+            assert!(bytes.is_null());
+            let error = unsafe { c2pa_error() };
+            let message = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { c2pa_free(error.cast()) };
+            assert!(message.contains("StringTooLong"), "{message}");
+            assert!(message.contains(name), "{message}");
+            assert!(!dir.path().join("output0.mp4").exists());
+            assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
+            assert!(checkout_exclusive::<C2paSigner>(signer).is_ok());
+        }
         for (input, output, count) in [
             (sources.as_ptr(), dests.as_ptr(), 0),
             (sources.as_ptr(), dests.as_ptr(), usize::MAX),

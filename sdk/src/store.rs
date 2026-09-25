@@ -3052,7 +3052,7 @@ impl Store {
         let format = io
             .supported_extension(&inputs[0])
             .ok_or(Error::UnsupportedType)?;
-        let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+        let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
         if !matches!(pc.remote_manifest(), RemoteManifest::NoRemote) {
             return Err(Error::BadParam(
                 "ladder signing requires embedded manifests; remote and sidecar manifests are not supported".into(),
@@ -3063,6 +3063,9 @@ impl Store {
                 "a ladder requires a new claim without an existing hard binding".into(),
             ));
         }
+        // As in ordinary BMFF signing, compression would destabilize the
+        // placeholder size and invalidate the absolute offsets being hashed.
+        pc.set_compressed_manifest(false);
 
         let dynamic_assertions = signer.dynamic_assertions();
         self.add_dynamic_assertion_placeholders(&dynamic_assertions)?;
@@ -3170,19 +3173,23 @@ impl Store {
             dest.seek(SeekFrom::Start(offset))?;
             dest.write_all(&replacement)?;
             dest.flush()?;
-            if settings.verify.verify_after_sign {
-                dest.rewind()?;
-                let mut log = StatusTracker::with_error_behavior(ErrorBehavior::StopOnFirstError);
-                Store::verify_store(
-                    self,
-                    Some(&mut ClaimAssetData::Stream(dest, &format)),
-                    &mut log,
-                    context,
-                )?;
-            }
         }
         self.embedded = true;
         context.check_progress(ProgressPhase::Embedding, 1, 1)?;
+        if settings.verify.verify_after_sign {
+            if settings.verify.verify_after_sign_hash {
+                for dest in &mut destinations {
+                    dest.rewind()?;
+                    self.verify_store_strict(
+                        Some(&mut ClaimAssetData::Stream(dest, &format)),
+                        context,
+                    )?;
+                }
+            } else {
+                // The claim is shared; without asset hashing, verify it only once.
+                self.verify_store_strict(None, context)?;
+            }
+        }
         Ok(final_jumbf)
     }
 

@@ -192,6 +192,139 @@ fn ladder_one_rung_matches_single_file_signing() {
 }
 
 #[test]
+fn ladder_instance_id_and_compression_preference() {
+    for compress in [false, true] {
+        let dir = tempdirectory().unwrap();
+        let (sources, outputs) = paths(dir.path(), &[RELATIVE.to_vec(), shortened()]);
+        let settings = Settings::new()
+            .with_value("core.prefer_compress_manifests", compress)
+            .unwrap();
+        let manifest = Builder::from_context(Context::new().with_settings(settings).unwrap())
+            .with_definition(DEFINITION)
+            .unwrap()
+            .sign_ladder_files(test_signer(SigningAlg::Es256).as_ref(), &sources, &outputs)
+            .unwrap();
+        let store = crate::store::Store::from_jumbf(
+            &manifest,
+            &mut crate::status_tracker::StatusTracker::default(),
+        )
+        .unwrap();
+        let claim = store.provenance_claim().unwrap();
+        assert!(!claim.compressed());
+        let id = claim.instance_id().strip_prefix("xmp.iid:").unwrap();
+        assert_eq!(uuid::Uuid::parse_str(id).unwrap().get_version_num(), 4);
+        for output in outputs {
+            let bytes = std::fs::read(output).unwrap();
+            assert_eq!(
+                read_bmff_c2pa_boxes(&mut Cursor::new(&bytes))
+                    .unwrap()
+                    .manifest_bytes
+                    .as_deref(),
+                Some(manifest.as_slice())
+            );
+            binding(&bytes);
+        }
+    }
+}
+
+#[test]
+fn ladder_post_sign_verification_respects_settings() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::context::ProgressPhase;
+
+    for (verify, hashes) in [(false, false), (false, true), (true, false), (true, true)] {
+        for tamper in [false, true] {
+            let dir = tempdirectory().unwrap();
+            let originals = [RELATIVE.to_vec(), ABSOLUTE.to_vec()];
+            let (sources, outputs) = paths(dir.path(), &originals);
+            let second = outputs[1].clone();
+            let phases = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&phases);
+            let mut settings = Settings::new()
+                .with_value("verify.verify_after_sign", verify)
+                .unwrap()
+                .with_value("verify.verify_after_sign_hash", hashes)
+                .unwrap();
+            // An untrusted credential is a tolerated status, not an invalid
+            // manifest. Use the same strict policy as ordinary stream signing.
+            settings.trust.anchors = None;
+            let context = Context::new()
+                .with_settings(settings.clone())
+                .unwrap()
+                .with_progress_callback(move |phase, _, _| {
+                    if tamper && phase == ProgressPhase::Embedding {
+                        // Change only the second rendition after all final-layout
+                        // hashes are fixed; optional verification must catch it.
+                        let mut bytes = std::fs::read(&second).unwrap();
+                        let boxes = read_bmff_c2pa_boxes(&mut Cursor::new(&bytes)).unwrap();
+                        let mdat = boxes.box_infos.iter().find(|b| b.path == "mdat").unwrap();
+                        bytes[(mdat.offset + mdat.size - 1) as usize] ^= 1;
+                        std::fs::write(&second, bytes).unwrap();
+                    }
+                    captured.lock().unwrap().push(phase);
+                    true
+                });
+            let result = Builder::from_context(context)
+                .with_definition(DEFINITION)
+                .unwrap()
+                .sign_ladder_files(test_signer(SigningAlg::Es256).as_ref(), &sources, &outputs);
+            if verify && hashes && tamper {
+                assert!(
+                    matches!(result, Err(crate::Error::InvalidManifest(_))),
+                    "{result:?}"
+                );
+            } else {
+                result.unwrap();
+            }
+            let phases = phases.lock().unwrap();
+            let expected = if !verify {
+                0
+            } else if hashes {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                phases
+                    .iter()
+                    .filter(|p| **p == ProgressPhase::VerifyingManifest)
+                    .count(),
+                expected
+            );
+            assert_eq!(
+                phases
+                    .iter()
+                    .filter(|p| **p == ProgressPhase::VerifyingSignature)
+                    .count(),
+                expected
+            );
+            assert_eq!(
+                phases.contains(&ProgressPhase::VerifyingAssetHash),
+                verify && hashes
+            );
+            for (source, original) in sources.iter().zip(&originals) {
+                assert_eq!(&std::fs::read(source).unwrap(), original);
+            }
+            let reader = Reader::from_context(Context::new().with_settings(settings).unwrap())
+                .with_stream(
+                    "video/mp4",
+                    Cursor::new(std::fs::read(&outputs[1]).unwrap()),
+                )
+                .unwrap();
+            assert_eq!(
+                reader.validation_state(),
+                if tamper {
+                    ValidationState::Invalid
+                } else {
+                    ValidationState::Valid
+                }
+            );
+        }
+    }
+}
+
+#[test]
 fn ladder_rendition_ids_cross_cbor_width_boundary() {
     let dir = tempdirectory().unwrap();
     let (sources, outputs) = paths(dir.path(), &vec![shortened(); 25]);
@@ -518,7 +651,7 @@ fn ladder_video_audio_decode_equivalence() {
         &[RELATIVE.to_vec(), ABSOLUTE.to_vec(), shortened()],
     );
     for (i, duration) in ["1", "2"].iter().enumerate() {
-        let source = dir.path().join(format!("audio{i}.mp4"));
+        let source = dir.path().join(format!("audio{i}.m4a"));
         let result = Command::new("ffmpeg")
             .args([
                 "-v",
@@ -547,12 +680,13 @@ fn ladder_video_audio_decode_equivalence() {
             String::from_utf8_lossy(&result.stderr)
         );
         sources.push(source);
-        outputs.push(dir.path().join(format!("signed_audio{i}.mp4")));
+        outputs.push(dir.path().join(format!("signed_audio{i}.m4a")));
     }
     let originals: Vec<_> = sources.iter().map(|p| std::fs::read(p).unwrap()).collect();
-    builder()
-        .sign_ladder_files(test_signer(SigningAlg::Es256).as_ref(), &sources, &outputs)
+    let mut b = builder();
+    b.sign_ladder_files(test_signer(SigningAlg::Es256).as_ref(), &sources, &outputs)
         .unwrap();
+    assert_eq!(b.definition.format, "video/mp4");
     let decode = |path: &std::path::Path| {
         let result = Command::new("ffmpeg")
             .args(["-v", "error", "-i"])
@@ -577,6 +711,25 @@ fn ladder_video_audio_decode_equivalence() {
     };
     for ((source, output), original) in sources.iter().zip(&outputs).zip(&originals) {
         assert_eq!(std::fs::read(source).unwrap(), *original);
+        assert_eq!(decode(source), decode(output));
+        binding(&std::fs::read(output).unwrap());
+    }
+    sources.rotate_left(3);
+    let outputs: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            dir.path().join(format!(
+                "audio_first{index}.{}",
+                source.extension().unwrap().to_str().unwrap()
+            ))
+        })
+        .collect();
+    let mut b = builder();
+    b.sign_ladder_files(test_signer(SigningAlg::Es256).as_ref(), &sources, &outputs)
+        .unwrap();
+    assert_eq!(b.definition.format, "audio/mp4");
+    for (source, output) in sources.iter().zip(&outputs) {
         assert_eq!(decode(source), decode(output));
         binding(&std::fs::read(output).unwrap());
     }
