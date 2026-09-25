@@ -2039,6 +2039,72 @@ pub unsafe extern "C" fn c2pa_builder_sign(
     out_bytes_or_return_int!(manifest_bytes, manifest_bytes_ptr)
 }
 
+/// Sign an ABR ladder of single-file fragmented BMFF assets into one manifest.
+///
+/// `sources` and `dests` are parallel arrays of `count` UTF-8 paths. Each source
+/// must contain one track and its own initialization and media fragments, with
+/// no existing C2PA manifest. Destinations must not exist and their parent
+/// directories must exist. All outputs embed the returned manifest bytes.
+/// Sidecars and remote URLs, including embedding with a remote URL, are unsupported.
+/// The builder and signer are borrowed, not consumed.
+///
+/// # Returns
+/// Manifest byte length on success, or -1 on error (see [`c2pa_error`]).
+/// `count` must be in 1..=256. Errors may leave partial newly created outputs;
+/// discard these files. Existing files are never overwritten.
+///
+/// # Safety
+/// Both arrays must contain `count` readable pointers to null-terminated strings.
+/// Builder and signer must be valid handles. `manifest_bytes_ptr` may be NULL;
+/// otherwise it must point to writable pointer storage and is set to NULL on
+/// error. Release returned bytes with [`c2pa_free`].
+#[cfg(feature = "file_io")]
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_builder_sign_ladder(
+    builder_ptr: *mut C2paBuilder,
+    signer_ptr: *mut C2paSigner,
+    sources: *const *const c_char,
+    dests: *const *const c_char,
+    count: usize,
+    manifest_bytes_ptr: *mut *const c_uchar,
+) -> i64 {
+    if !manifest_bytes_ptr.is_null() {
+        *manifest_bytes_ptr = std::ptr::null();
+    }
+    if !(1..=256).contains(&count) {
+        CimplError::other("a ladder requires 1..=256 renditions").set_last();
+        return -1;
+    }
+    ptr_or_return_int!(sources);
+    ptr_or_return_int!(dests);
+    let unpack =
+        |array: *const *const c_char, name: &str| -> Result<Vec<std::path::PathBuf>, CimplError> {
+            let mut paths = Vec::with_capacity(count);
+            for index in 0..count {
+                let entry = *array.add(index);
+                if entry.is_null() {
+                    return Err(CimplError::other("a ladder path is NULL"));
+                }
+                let cstr = std::ffi::CStr::from_ptr(entry);
+                if cstr.to_bytes().len() > crate::macros::MAX_CSTRING_LEN {
+                    return Err(CimplError::string_too_long(format!("{name}[{index}]")));
+                }
+                let path = cstr
+                    .to_str()
+                    .map_err(|_| CimplError::other("a ladder path is not valid UTF-8"))?;
+                paths.push(std::path::PathBuf::from(path));
+            }
+            Ok(paths)
+        };
+    let sources = ok_or_return_int!(unpack(sources, "sources"));
+    let dests = ok_or_return_int!(unpack(dests, "dests"));
+    let mut builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
+    let signer = deref_or_return_int!(signer_ptr, C2paSigner);
+    let bytes =
+        ok_or_return_int!(builder.sign_ladder_files(signer.signer.as_ref(), &sources, &dests));
+    out_bytes_or_return_int!(bytes, manifest_bytes_ptr)
+}
+
 /// Sign using the Signer from the Context.
 ///
 /// Equivalent to `c2pa_builder_sign` but the signer comes from the Builder's
@@ -3159,6 +3225,126 @@ mod tests {
         assert!(!builder.is_null());
 
         (signer, builder)
+    }
+
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_sign_ladder_arguments_ownership_and_bytes() {
+        let (signer, builder) = setup_signer_and_builder_for_signing_tests();
+        let definition = CString::new(r#"{"assertions":[{"label":"c2pa.actions","data":{"actions":[{"action":"c2pa.created","digitalSourceType":"http://cv.iptc.org/newscodes/digitalsourcetype/digitalCreation"}]}}]}"#).unwrap();
+        let builder = unsafe { c2pa_builder_with_definition(builder, definition.as_ptr()) };
+        assert!(!builder.is_null());
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures: [&[u8]; 2] = [
+            include_bytes!(fixture_path!("single_file_fragments.mp4")),
+            include_bytes!(fixture_path!("single_file_fragments_absolute.mp4")),
+        ];
+        let sources: Vec<_> = fixtures
+            .iter()
+            .enumerate()
+            .map(|(i, data)| {
+                let path = dir.path().join(format!("source{i}.mp4"));
+                std::fs::write(&path, data).unwrap();
+                CString::new(path.to_str().unwrap()).unwrap()
+            })
+            .collect();
+        let dests: Vec<_> = (0..2)
+            .map(|i| {
+                CString::new(dir.path().join(format!("output{i}.mp4")).to_str().unwrap()).unwrap()
+            })
+            .collect();
+        let sources: Vec<_> = sources.iter().map(|s| s.as_ptr()).collect();
+        let dests: Vec<_> = dests.iter().map(|s| s.as_ptr()).collect();
+        let invalid_utf8 = [0xffu8, 0];
+        let invalid_paths = [invalid_utf8.as_ptr().cast(), sources[1]];
+        let null_paths = [std::ptr::null(), sources[1]];
+        let oversized = CString::new(vec![b'x'; crate::macros::MAX_CSTRING_LEN + 1]).unwrap();
+        let oversized_paths = [sources[0], oversized.as_ptr()];
+        for (input, output, name) in [
+            (oversized_paths.as_ptr(), dests.as_ptr(), "sources[1]"),
+            (sources.as_ptr(), oversized_paths.as_ptr(), "dests[1]"),
+        ] {
+            let mut bytes = std::ptr::dangling();
+            assert_eq!(
+                unsafe { c2pa_builder_sign_ladder(builder, signer, input, output, 2, &mut bytes) },
+                -1
+            );
+            assert!(bytes.is_null());
+            let error = unsafe { c2pa_error() };
+            let message = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { c2pa_free(error.cast()) };
+            assert!(message.contains("StringTooLong"), "{message}");
+            assert!(message.contains(name), "{message}");
+            assert!(!dir.path().join("output0.mp4").exists());
+            assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
+            assert!(checkout_exclusive::<C2paSigner>(signer).is_ok());
+        }
+        for (input, output, count) in [
+            (sources.as_ptr(), dests.as_ptr(), 0),
+            (sources.as_ptr(), dests.as_ptr(), usize::MAX),
+            (std::ptr::null(), dests.as_ptr(), 2),
+            (sources.as_ptr(), std::ptr::null(), 2),
+            (null_paths.as_ptr(), dests.as_ptr(), 2),
+            (invalid_paths.as_ptr(), dests.as_ptr(), 2),
+        ] {
+            let mut bytes = std::ptr::dangling();
+            assert_eq!(
+                unsafe {
+                    c2pa_builder_sign_ladder(builder, signer, input, output, count, &mut bytes)
+                },
+                -1
+            );
+            assert!(bytes.is_null());
+            assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
+            assert!(checkout_exclusive::<C2paSigner>(signer).is_ok());
+        }
+        let mut bytes = std::ptr::null();
+        let len = unsafe {
+            c2pa_builder_sign_ladder(
+                builder,
+                signer,
+                sources.as_ptr(),
+                dests.as_ptr(),
+                2,
+                &mut bytes,
+            )
+        };
+        if len < 0 {
+            let error = unsafe { c2pa_error() };
+            let message = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { c2pa_free(error.cast()) };
+            panic!("ladder signing failed: {message}");
+        }
+        assert!(len > 0);
+        assert!(!bytes.is_null());
+        let manifest = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
+        for (i, original) in fixtures.iter().enumerate() {
+            let output = std::fs::read(dir.path().join(format!("output{i}.mp4"))).unwrap();
+            assert!(output
+                .windows(manifest.len())
+                .any(|window| window == manifest));
+            let reader = c2pa::Reader::default()
+                .with_stream("video/mp4", std::io::Cursor::new(output))
+                .unwrap();
+            assert_ne!(
+                reader.validation_state(),
+                c2pa::ValidationState::Invalid,
+                "{reader}"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join(format!("source{i}.mp4"))).unwrap(),
+                *original
+            );
+        }
+        assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
+        assert!(checkout_exclusive::<C2paSigner>(signer).is_ok());
+        assert_eq!(unsafe { c2pa_free(bytes.cast()) }, 0);
+        assert_eq!(unsafe { c2pa_free(builder.cast()) }, 0);
+        assert_eq!(unsafe { c2pa_free(signer.cast()) }, 0);
     }
 
     #[test]
