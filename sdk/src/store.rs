@@ -30,7 +30,7 @@ use crate::{
     assertions::{
         labels::{self, CLAIM},
         BmffHash, BoxHash, CertificateStatus, DataBox, DataHash, Ingredient, Relationship,
-        TimeStamp, User, UserCbor,
+        TimeStamp, User, UserCbor, SINGLE_RENDITION_ID,
     },
     asset_io::{
         CAIRead, CAIReadWrite, HashBlockObjectType, HashObjectPositions, RemoteRefEmbedType,
@@ -3172,6 +3172,320 @@ impl Store {
         Ok(())
     }
 
+    /// Patch an already-written manifest box in place, without the
+    /// whole-file-rewrite fallback that `save_jumbf_to_file` performs.
+    ///
+    /// Only valid when the replacement is the same length as what is already
+    /// in the file, which the caller guarantees. Errors rather than falling
+    /// back, because for fragmented assets a rewrite relocates boxes and
+    /// invalidates hashes that were computed against the current layout.
+    #[cfg(feature = "file_io")]
+    fn patch_manifest_in_place(path: &Path, jumbf: &[u8]) -> Result<()> {
+        let ext = get_file_extension(path).ok_or(Error::UnsupportedType)?;
+        let handler = get_assetio_handler(&ext).ok_or(Error::UnsupportedType)?;
+        let patcher = handler.asset_patch_ref().ok_or_else(|| {
+            Error::BadParam(format!(
+                "{} cannot be patched in place; refusing the whole-file rewrite that would invalidate the fragment hashes",
+                path.display()
+            ))
+        })?;
+        patcher.patch_cai_store(path, jumbf)
+    }
+
+    /// Sign the renditions of one ABR ladder into a single claim.
+    ///
+    /// Every input must be a *single-file* fragmented BMFF asset: one file that
+    /// holds `ftyp`, `moov` and every `moof`/`mdat` pair, rather than an init
+    /// segment plus a directory of segment files (that layout is
+    /// [`Self::save_to_bmff_fragmented`]). The renditions of a ladder are
+    /// different encodes of the same content, so one claim covers the set: the
+    /// single `c2pa.hash.bmff.v3` assertion carries one `MerkleMap` per
+    /// rendition -- `uniqueId` `1..=N` in the order given here, each with its
+    /// own `initHash` and its own leaf row -- and the identical signed manifest
+    /// is embedded in every output. Each output's `merkle` UUID boxes carry
+    /// that rendition's `uniqueId`, which is how a reader picks the one map
+    /// that describes the file in front of it; `localId` cannot do that,
+    /// because splitting a multiplexed source renumbers every track to 1.
+    ///
+    /// A one-rung ladder is exactly a single-asset signing: `uniqueId` 1 is
+    /// [`SINGLE_RENDITION_ID`].
+    ///
+    /// `outputs` must be the same length as `inputs`, and none may exist yet:
+    /// every output is created with `create_new`, so a path that is a source,
+    /// another output under any spelling or link, or any other pre-existing
+    /// file is refused and nothing is ever overwritten. On any error, every
+    /// output this call created is removed again, so a failed call leaves no
+    /// partial ladder behind. No input may already carry a C2PA manifest: a
+    /// ladder signing adds no parent ingredient, so re-signing is refused
+    /// rather than silently replacing provenance. The manifest is always
+    /// embedded, so
+    /// remote and sidecar manifests are refused. Returns the JUMBF manifest
+    /// that was written to every rendition.
+    #[cfg(feature = "file_io")]
+    pub fn save_to_bmff_ladder(
+        &mut self,
+        inputs: &[PathBuf],
+        outputs: &[PathBuf],
+        signer: &dyn Signer,
+        context: &Context,
+    ) -> Result<Vec<u8>> {
+        if inputs.is_empty() {
+            return Err(Error::BadParam(
+                "at least one rendition path must be provided".to_string(),
+            ));
+        }
+        if inputs.len() != outputs.len() {
+            return Err(Error::BadParam(
+                "every rendition needs exactly one output path".to_string(),
+            ));
+        }
+
+        // One claim covers the set, so one handler has to be able to write all
+        // of it. Whether each file really is single-file fragmented is settled
+        // below, when its Merkle map is laid out.
+        for path in inputs.iter().chain(outputs.iter()) {
+            match get_supported_file_extension(path) {
+                Some(ext) if is_bmff_format(&ext) => (),
+                _ => return Err(Error::UnsupportedType),
+            }
+        }
+        let format = get_supported_file_extension(&inputs[0]).ok_or(Error::UnsupportedType)?;
+
+        // Claim-level refusals come first: they need no output created.
+        {
+            let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+            // The manifest box is excluded from initHash and the leaf hashes; what
+            //    matters is that its presence and size fix the absolute offsets those
+            //    hashes are computed over, and
+            // the whole point of a ladder is that they all ship the same one.
+            if !matches!(pc.remote_manifest(), RemoteManifest::NoRemote) {
+                return Err(Error::BadParam(
+                    "ladder signing embeds the manifest in every rendition; remote and sidecar manifests are not supported".to_string(),
+                ));
+            }
+            if pc.update_manifest() {
+                return Err(Error::BadParam(
+                    "an update manifest cannot bind a ladder".to_string(),
+                ));
+            }
+            if !pc.bmff_hash_assertions().is_empty() {
+                return Err(Error::BadParam(
+                    "claim already carries a BMFF hash assertion".to_string(),
+                ));
+            }
+        }
+
+        // Every output is created here, up front and with `create_new`, so the
+        // filesystem decides overlap rather than string comparison: an output
+        // that already exists -- a source, a hard link or symlink to a source
+        // or to another output, a dangling symlink (`create_new` does not
+        // follow one on Unix), a case-folded twin of an output created a
+        // moment ago on a case-insensitive filesystem, or any other
+        // pre-existing file -- is refused, and nothing that existed
+        // before this call is ever truncated. From here on any failure removes
+        // every output this call created, so a failed call leaves no partial
+        // ladder behind.
+        let reserved = Store::reserve_ladder_outputs(outputs)?;
+        let result = self.write_bmff_ladder(inputs, reserved, outputs, &format, signer, context);
+        if result.is_err() {
+            for output in outputs {
+                let _ = std::fs::remove_file(output);
+            }
+        }
+        result
+    }
+
+    /// Create every ladder output with `create_new`, in order. If one is
+    /// refused, the ones already created are removed again.
+    #[cfg(feature = "file_io")]
+    fn reserve_ladder_outputs(outputs: &[PathBuf]) -> Result<Vec<std::fs::File>> {
+        let mut reserved = Vec::with_capacity(outputs.len());
+        for (index, output) in outputs.iter().enumerate() {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(output)
+            {
+                Ok(file) => reserved.push(file),
+                Err(e) => {
+                    drop(reserved);
+                    for created in &outputs[..index] {
+                        let _ = std::fs::remove_file(created);
+                    }
+                    return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        Error::BadParam(format!(
+                            "output {} already exists; ladder signing never overwrites, and an output may not be a source, another output, or a link to either",
+                            output.display()
+                        ))
+                    } else {
+                        Error::IoError(e)
+                    });
+                }
+            }
+        }
+        Ok(reserved)
+    }
+
+    /// The body of [`Self::save_to_bmff_ladder`], once every output has been
+    /// reserved: `reserved[i]` is the open, empty file at `outputs[i]`.
+    #[cfg(feature = "file_io")]
+    fn write_bmff_ladder(
+        &mut self,
+        inputs: &[PathBuf],
+        mut reserved: Vec<std::fs::File>,
+        outputs: &[PathBuf],
+        format: &str,
+        signer: &dyn Signer,
+        context: &Context,
+    ) -> Result<Vec<u8>> {
+        let settings = context.settings();
+        let threshold = settings.core.backing_store_memory_threshold_in_mb;
+
+        // Dynamic assertions need their placeholders in the claim before the
+        // manifest length is fixed.
+        let dynamic_assertions = signer.dynamic_assertions();
+        if !dynamic_assertions.is_empty() {
+            self.add_dynamic_assertion_placeholders(&dynamic_assertions)?;
+        }
+
+        // 1) Lay out one Merkle map per rendition, and keep each rendition's
+        //    UUID boxes: they are a few dozen bytes per fragment, and pass 2
+        //    needs them again.
+        let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+        let mut bmff_hash = Store::generate_bmff_data_hash_for_stream(pc.alg())?;
+        if pc.version() < 2 {
+            bmff_hash.set_bmff_version(2); // backcompat support
+        }
+        let mut merkle_boxes = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let unique_id = index + 1;
+            let mut source = std::fs::File::open(input)?;
+            merkle_boxes.push(bmff_hash.add_single_file_rendition(
+                &mut source,
+                settings.core.merkle_tree_max_leaves,
+                unique_id,
+            )?);
+        }
+        let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
+        pc.add_assertion(&bmff_hash)?;
+
+        // 2) Reserve the manifest, then write that placeholder into every
+        //    rendition before hashing any of them: a rendition's initHash and
+        //    leaf hashes cover absolute offsets, so they are only correct once
+        //    the UUID boxes and the manifest are at their final positions.
+        let unsigned_jumbf = self.to_jumbf_internal(signer.reserve_size())?;
+        for (index, (input, boxes)) in inputs.iter().zip(merkle_boxes.iter()).enumerate() {
+            // Rendition ids are 1-based, matching what pass 1 recorded.
+            let unique_id = index + 1;
+            context.check_progress(
+                ProgressPhase::Writing,
+                unique_id as u32,
+                inputs.len() as u32,
+            )?;
+
+            let mut source = std::fs::File::open(input)?;
+            let mut with_boxes = io_utils::stream_with_fs_fallback(threshold);
+            crate::asset_handlers::bmff_io::insert_fragment_merkle_boxes(
+                &mut source,
+                &mut with_boxes,
+                boxes,
+            )?;
+            with_boxes.rewind()?;
+
+            let dest = &mut reserved[index];
+            save_jumbf_to_stream(format, &mut with_boxes, dest, &unsigned_jumbf)?;
+            drop(with_boxes); // one rendition-sized temporary at a time
+
+            dest.rewind()?;
+            let mut cb = |step, total| context.check_progress(ProgressPhase::Hashing, step, total);
+            bmff_hash.finalize_single_file_merkle(dest, unique_id, &mut cb)?;
+        }
+        // The patch below and the verification reopen by path. Before each
+        // reopen, check that the path still names the file that was reserved
+        // and written -- a swap in the output directory would otherwise
+        // receive the patch. The handles are dropped only afterwards.
+
+        // 3) Fold every rendition's hashes back into the one assertion.
+        let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
+        pc.update_bmff_hash(bmff_hash)?;
+
+        // Write dynamic assertions only if placeholders were added during placeholder generation.
+        if !dynamic_assertions.is_empty() {
+            let has_placeholders = {
+                let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+                dynamic_assertions
+                    .iter()
+                    .all(|da| pc.assertion_hashed_uri_from_label(&da.label()).is_some())
+            };
+
+            if has_placeholders {
+                let mut preliminary_claim = PartialClaim::default();
+                {
+                    let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+                    for assertion in pc.assertions() {
+                        preliminary_claim.add_assertion(assertion);
+                    }
+                }
+
+                self.write_dynamic_assertions(&dynamic_assertions, &mut preliminary_claim)?;
+            }
+        }
+
+        context.check_progress(ProgressPhase::Signing, 1, 1)?;
+
+        let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+        let sig = self.sign_claim(pc, signer, signer.reserve_size(), settings)?;
+
+        let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
+        pc.set_signature_val(sig);
+
+        let final_jumbf = self.to_jumbf_internal(signer.reserve_size())?;
+        if final_jumbf.len() != unsigned_jumbf.len() {
+            return Err(Error::JumbfCreationError);
+        }
+
+        // 4) The signed manifest is the same length as the placeholder and the
+        //    same bytes for every rendition, so it drops into the box already
+        //    written without moving anything the hashes cover.
+        //
+        //    Deliberately NOT save_jumbf_to_file: that falls back to
+        //    save_cai_store -- a full rewrite that relocates boxes -- when
+        //    patching fails, and returns Ok either way. Here a relocation
+        //    would silently invalidate every initHash and leaf hash just
+        //    computed against the patched layout, so the fallback must be
+        //    unreachable and a patch failure must surface.
+        for (output, reserved) in outputs.iter().zip(reserved.iter()) {
+            let expected = same_file::Handle::from_file(reserved.try_clone()?)?;
+            if same_file::Handle::from_path(output)? != expected {
+                return Err(Error::BadParam(format!(
+                    "output {} was replaced while the ladder was being signed",
+                    output.display()
+                )));
+            }
+            Store::patch_manifest_in_place(output, &final_jumbf)?;
+        }
+        drop(reserved);
+
+        context.check_progress(ProgressPhase::Embedding, 1, 1)?;
+
+        if settings.verify.verify_after_sign {
+            for output in outputs {
+                let mut dest = std::fs::File::open(output)?;
+                let mut validation_log =
+                    StatusTracker::with_error_behavior(ErrorBehavior::StopOnFirstError);
+                Store::verify_store(
+                    self,
+                    &mut ClaimAssetData::Stream(&mut dest, format),
+                    &mut validation_log,
+                    context,
+                )?;
+            }
+        }
+
+        Ok(final_jumbf)
+    }
+
     /// Embed the claims store as JUMBF into a stream. Updates XMP with provenance
     /// record.
     ///
@@ -3439,9 +3753,15 @@ impl Store {
                 }
 
                 // Fragment binding takes precedence over ordinary mdat chunk hashing.
+                //
+                // `uniqueId` is 1-based, matching the multi-file writer (the
+                // spec's CDDL comment, which is non-normative, calls it so). A ladder numbers its renditions 1..N, so
+                // a one-rung ladder is identical to signing that rendition on
+                // its own.
                 if let Some(fragment_boxes) = bmff_hash.prepare_single_file_merkle(
                     &mut intermediate_stream,
                     settings.core.merkle_tree_max_leaves,
+                    SINGLE_RENDITION_ID,
                 )? {
                     let mut temp_stream = io_utils::stream_with_fs_fallback(threshold);
                     crate::asset_handlers::bmff_io::insert_fragment_merkle_boxes(
@@ -3511,7 +3831,11 @@ impl Store {
                     let mut cb =
                         |step, total| context.check_progress(ProgressPhase::Hashing, step, total);
                     if single_file_fragments {
-                        bmff_hash.finalize_single_file_merkle(output_stream, &mut cb)?;
+                        bmff_hash.finalize_single_file_merkle(
+                            output_stream,
+                            SINGLE_RENDITION_ID,
+                            &mut cb,
+                        )?;
                     } else {
                         bmff_hash.gen_hash_from_stream_with_progress(output_stream, &mut cb)?;
                     }

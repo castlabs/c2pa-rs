@@ -3099,6 +3099,78 @@ impl Builder {
         Ok(())
     }
 
+    /// Sign the renditions of one ABR ladder into a single manifest.
+    ///
+    /// Every source must be a *single-file* fragmented BMFF asset -- one file
+    /// holding `ftyp`, `moov` and all of its `moof`/`mdat` pairs. Use
+    /// [`Self::sign_fragmented_files`] instead for the init-segment-plus-
+    /// segment-files layout.
+    ///
+    /// The renditions of a ladder are different encodes of the same content, so
+    /// they share one claim. The resulting `c2pa.hash.bmff.v3` assertion holds
+    /// one Merkle map per rendition, numbered in the order of `sources`, and
+    /// the identical signed manifest is embedded in every destination, which is
+    /// what lets a player switch rungs without leaving the manifest behind.
+    ///
+    /// A source that already carries a C2PA manifest is refused: a ladder adds
+    /// no parent ingredient (nor a thumbnail) of its own, having no single
+    /// source file to derive either from, so re-signing would silently replace
+    /// provenance. Add ingredients and thumbnails to the definition if you
+    /// want them.
+    ///
+    /// # Arguments
+    /// * `signer` - The signer to use.
+    /// * `sources` - One path per rendition. The order fixes each rendition's
+    ///   `uniqueId`, so a set signed twice must be given in the same order.
+    /// * `dests` - One output path per rendition, in the same order. None may
+    ///   exist yet: unlike [`Self::sign_file`], nothing is overwritten -- every
+    ///   output is created with `create_new`, so a path that is a source,
+    ///   another output under any spelling or link, or any pre-existing file
+    ///   is an error. On any error, every output this call created is removed
+    ///   again, so a failed call leaves no partial ladder behind.
+    ///
+    /// # Returns
+    /// * The bytes of the c2pa_manifest that was embedded in every rendition.
+    ///
+    /// # Errors
+    /// * Returns an [`Error`] if any source is not a single-file fragmented
+    ///   BMFF asset, or if the manifest cannot be signed.
+    #[cfg(feature = "file_io")]
+    pub fn sign_ladder_files<S, D>(
+        &mut self,
+        signer: &dyn Signer,
+        sources: &[S],
+        dests: &[D],
+    ) -> Result<Vec<u8>>
+    where
+        S: AsRef<Path>,
+        D: AsRef<Path>,
+    {
+        let sources: Vec<PathBuf> = sources.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        let dests: Vec<PathBuf> = dests.iter().map(|p| p.as_ref().to_path_buf()).collect();
+
+        let first = sources.first().ok_or(Error::BadParam(
+            "at least one rendition path must be provided".to_string(),
+        ))?;
+        let format = crate::format_from_path(first).ok_or(crate::Error::UnsupportedType)?;
+        self.definition.format.clone_from(&format);
+        self.definition.instance_id = format!("xmp:iid:{}", Uuid::new_v4());
+
+        #[allow(deprecated)]
+        if let Some(base_path) = &self.base_path {
+            self.resources.set_base_path(base_path);
+        }
+
+        let mut claim = self.to_claim()?;
+        if let Some(tsa_url) = signer.time_authority_url() {
+            self.maybe_add_timestamp(&tsa_url, &mut claim)?;
+        }
+
+        let mut store = self.to_store_with_claim(claim)?;
+
+        store.save_to_bmff_ladder(&sources, &dests, signer, &self.context)
+    }
+
     #[cfg(feature = "file_io")]
     /// Sign a file using a supplied signer.
     ///

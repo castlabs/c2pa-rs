@@ -566,6 +566,7 @@ dependencies = [
  "reqwest",
  "riff",
  "rsa",
+ "same-file",
  "schemars 1.2.1",
  "serde",
  "serde-transcode",

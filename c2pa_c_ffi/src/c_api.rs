@@ -2305,6 +2305,114 @@ pub unsafe extern "C" fn c2pa_manifest_bytes_free(manifest_bytes_ptr: *const c_u
     cimpl_free!(manifest_bytes_ptr);
 }
 
+/// More renditions than any real ladder has; bounds the array walk in
+/// [`c2pa_builder_sign_ladder`] before anything is allocated for it.
+#[cfg(feature = "file_io")]
+const MAX_LADDER_RENDITIONS: usize = 1024;
+
+/// Sign an ABR ladder of single-file fragmented BMFF assets into ONE manifest.
+///
+/// Every rendition of a ladder shares one claim: the assertion carries one
+/// Merkle tree per rendition and the identical manifest is embedded into each
+/// output file, so the set validates together and a watermark that resolves to
+/// the session resolves to a single manifest rather than one per rendition.
+///
+/// # Arguments
+///
+/// * `builder_ptr` - the builder to sign with. Borrowed: the caller still
+///   owns it and must free it with [`c2pa_builder_free`].
+/// * `signer_ptr` - the signer to use.
+/// * `sources` - array of `count` null-terminated UTF-8 paths, one per
+///   rendition. Each must be a single-file fragmented BMFF (its own `moov`
+///   and `moof`); a multiplexed or non-fragmented asset is rejected.
+/// * `dests` - array of `count` null-terminated UTF-8 output paths, positionally
+///   matched to `sources`. None may exist yet: each is created with
+///   `create_new`, so a source, another output under any spelling or link, or
+///   any pre-existing file is refused and nothing is overwritten. On error,
+///   every output this call created is removed again. A source that already
+///   carries a C2PA manifest is refused.
+/// * `count` - number of renditions; 1 to 1024.
+/// * `manifest_bytes_ptr` - out-pointer receiving the manifest embedded in
+///   every rendition. Released with [`c2pa_free`].
+///
+/// # Safety
+///
+/// Reads `count` entries from each array and each entry as a NULL-terminated C
+/// string. `builder_ptr` and `signer_ptr` must point to valid, non-freed
+/// instances.
+///
+/// # Returns
+///
+/// The length of the manifest bytes on success, or `-1` on error.
+#[cfg(feature = "file_io")]
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_builder_sign_ladder(
+    builder_ptr: *mut C2paBuilder,
+    signer_ptr: *mut C2paSigner,
+    sources: *const *const c_char,
+    dests: *const *const c_char,
+    count: usize,
+    manifest_bytes_ptr: *mut *const c_uchar,
+) -> i64 {
+    let builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
+    let c2pa_signer = deref_mut_or_return_int!(signer_ptr, C2paSigner);
+    ptr_or_return_int!(manifest_bytes_ptr);
+
+    if count == 0 {
+        CimplError::other("a ladder needs at least one rendition").set_last();
+        return -1;
+    }
+    if count > MAX_LADDER_RENDITIONS {
+        CimplError::other(format!(
+            "count {count} exceeds the {MAX_LADDER_RENDITIONS} renditions a ladder may hold"
+        ))
+        .set_last();
+        return -1;
+    }
+    if sources.is_null() || dests.is_null() {
+        CimplError::other("sources or dests pointer is null").set_last();
+        return -1;
+    }
+
+    // Unpack both arrays before touching the builder, so a malformed argument
+    // cannot consume it.
+    let unpack = |array: *const *const c_char, name: &str| -> Option<Vec<std::path::PathBuf>> {
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let entry_ptr = *array.add(i);
+            if entry_ptr.is_null() {
+                CimplError::other(format!("{name}[{i}] is a null pointer")).set_last();
+                return None;
+            }
+            match std::ffi::CStr::from_ptr(entry_ptr).to_str() {
+                Ok(s) => out.push(std::path::PathBuf::from(s)),
+                Err(_) => {
+                    CimplError::other(format!("{name}[{i}] is not valid UTF-8")).set_last();
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    };
+
+    let Some(source_paths) = unpack(sources, "sources") else {
+        return -1;
+    };
+    let Some(dest_paths) = unpack(dests, "dests") else {
+        return -1;
+    };
+
+    // Unlike the segmented entry point there is no read-back step: the ladder
+    // writer returns the manifest it embedded in every rendition.
+    let sign_result =
+        builder.sign_ladder_files(c2pa_signer.signer.as_ref(), &source_paths, &dest_paths);
+    let manifest_bytes = ok_or_return_int!(sign_result);
+
+    let len = manifest_bytes.len() as i64;
+    *manifest_bytes_ptr = to_c_bytes(manifest_bytes);
+    len
+}
+
 /// Sign a fragmented BMFF asset set (init segment + media fragments).
 ///
 /// Wraps [`c2pa::Builder::sign_fragmented_files`]. The output directory
@@ -3340,6 +3448,133 @@ mod tests {
         ($path:expr) => {
             concat!("../../sdk/tests/fixtures/", $path)
         };
+    }
+
+    #[cfg(feature = "file_io")]
+    fn ladder_last_error() -> String {
+        let ptr = unsafe { c2pa_error() };
+        if ptr.is_null() {
+            return String::new();
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { c2pa_string_free(ptr) };
+        s
+    }
+
+    /// Call `c2pa_builder_sign_ladder` with the given paths and return
+    /// `(result, manifest bytes)`; the native buffer is released here.
+    #[cfg(feature = "file_io")]
+    unsafe fn call_sign_ladder(
+        builder: *mut C2paBuilder,
+        signer: *mut C2paSigner,
+        sources: &[std::path::PathBuf],
+        dests: &[std::path::PathBuf],
+        count: usize,
+    ) -> (i64, Vec<u8>) {
+        let sources: Vec<CString> = sources
+            .iter()
+            .map(|p| CString::new(p.to_str().unwrap()).unwrap())
+            .collect();
+        let dests: Vec<CString> = dests
+            .iter()
+            .map(|p| CString::new(p.to_str().unwrap()).unwrap())
+            .collect();
+        let source_ptrs: Vec<*const c_char> = sources.iter().map(|s| s.as_ptr()).collect();
+        let dest_ptrs: Vec<*const c_char> = dests.iter().map(|s| s.as_ptr()).collect();
+        let mut manifest: *const c_uchar = std::ptr::null();
+        let result = c2pa_builder_sign_ladder(
+            builder,
+            signer,
+            source_ptrs.as_ptr(),
+            dest_ptrs.as_ptr(),
+            count,
+            &mut manifest,
+        );
+        let bytes = if result > 0 {
+            let bytes = std::slice::from_raw_parts(manifest, result as usize).to_vec();
+            c2pa_free(manifest as *const c_void);
+            bytes
+        } else {
+            assert!(manifest.is_null());
+            Vec::new()
+        };
+        (result, bytes)
+    }
+
+    /// The ladder writer through the C entry point: the bytes handed back are
+    /// the bytes embedded in every output, the builder is borrowed and signs
+    /// again afterwards, and every refusal returns -1 with nothing written.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn sign_ladder_through_the_c_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = include_bytes!(fixture_path!("single_file_fragments.mp4"));
+        let a = dir.path().join("a.mp4");
+        std::fs::write(&a, fixture).unwrap();
+        let b = dir.path().join("b.mp4");
+        std::fs::write(&b, fixture).unwrap();
+        let sources = [a.clone(), b.clone()];
+        let outputs = [dir.path().join("out_a.mp4"), dir.path().join("out_b.mp4")];
+
+        let (signer, builder) = setup_signer_and_builder_for_signing_tests();
+        let (len, returned) = unsafe { call_sign_ladder(builder, signer, &sources, &outputs, 2) };
+        assert!(len > 0, "sign_ladder failed: {}", ladder_last_error());
+        for output in &outputs {
+            let embedded = c2pa::jumbf_io::load_jumbf_from_file(output).unwrap();
+            assert_eq!(embedded, returned, "{}", output.display());
+        }
+
+        // Borrowed, not consumed: the same builder signs a second ladder.
+        let again = [
+            dir.path().join("again_a.mp4"),
+            dir.path().join("again_b.mp4"),
+        ];
+        let (len, _) = unsafe { call_sign_ladder(builder, signer, &sources, &again, 2) };
+        assert!(len > 0, "second sign failed: {}", ladder_last_error());
+
+        // Refusals: an existing output, a zero count, an absurd count, and a
+        // source that is not fragmented -- each -1, each leaving no output.
+        let fresh = [dir.path().join("x.mp4"), dir.path().join("y.mp4")];
+        let (len, _) = unsafe {
+            call_sign_ladder(
+                builder,
+                signer,
+                &sources,
+                &[outputs[0].clone(), fresh[1].clone()],
+                2,
+            )
+        };
+        assert_eq!(len, -1);
+        assert!(ladder_last_error().contains("already exists"));
+        assert!(!fresh[1].exists());
+        let (len, _) = unsafe { call_sign_ladder(builder, signer, &sources, &fresh, 0) };
+        assert_eq!(len, -1);
+        assert!(
+            ladder_last_error().contains("greater than zero") || !ladder_last_error().is_empty()
+        );
+        let (len, _) = unsafe { call_sign_ladder(builder, signer, &sources, &fresh, 1025) };
+        assert_eq!(len, -1);
+        assert!(ladder_last_error().contains("exceeds the 1024"));
+        let flat = dir.path().join("flat.mp4");
+        std::fs::write(
+            &flat,
+            include_bytes!(fixture_path!("video1_no_manifest.mp4")),
+        )
+        .unwrap();
+        let (len, _) = unsafe { call_sign_ladder(builder, signer, &[a.clone(), flat], &fresh, 2) };
+        assert_eq!(len, -1);
+        assert!(ladder_last_error().contains("not a single-file fragmented BMFF"));
+        assert!(!fresh[0].exists() && !fresh[1].exists());
+
+        // Still usable after every refusal.
+        let last = [dir.path().join("last_a.mp4"), dir.path().join("last_b.mp4")];
+        let (len, _) = unsafe { call_sign_ladder(builder, signer, &sources, &last, 2) };
+        assert!(len > 0, "{}", ladder_last_error());
+
+        unsafe { c2pa_builder_free(builder) };
+        unsafe { c2pa_signer_free(signer) };
     }
 
     /// Helper to create a signer and builder for testing
