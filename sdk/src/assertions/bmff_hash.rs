@@ -1218,6 +1218,10 @@ impl BmffHash {
         reader: &mut dyn ReadSeek,
         max_leaves: usize,
     ) -> crate::Result<Option<Vec<Vec<u8>>>> {
+        // Align with the multi-file writer and C2PA 2.4 section 18.6.3's
+        // non-normative 1-based guidance; this does not invalidate legacy ID 0.
+        const SINGLE_RENDITION_ID: usize = 1;
+
         let boxes = read_bmff_c2pa_boxes(reader)?;
         if !boxes.box_infos.iter().any(|b| b.path == "moov")
             || !boxes.box_infos.iter().any(|b| b.path == "moof")
@@ -1256,7 +1260,7 @@ impl BmffHash {
         // still identifies each fragment's leaf, as required by A.5.4.1.2.
         let mut uuids = Vec::with_capacity(fragments.len());
         let largest_map = BmffMerkleMap {
-            unique_id: 0,
+            unique_id: SINGLE_RENDITION_ID,
             local_id,
             location: fragments.len() - 1,
             hashes: None,
@@ -1266,7 +1270,7 @@ impl BmffHash {
             .len();
         for location in 0..fragments.len() {
             let map = BmffMerkleMap {
-                unique_id: 0,
+                unique_id: SINGLE_RENDITION_ID,
                 local_id,
                 location,
                 hashes: None,
@@ -1290,7 +1294,7 @@ impl BmffHash {
         self.hash = None;
         self.bmff_version = 3;
         self.merkle = Some(vec![MerkleMap {
-            unique_id: 0,
+            unique_id: SINGLE_RENDITION_ID,
             local_id,
             count: fragments.len(),
             alg: Some(alg.to_owned()),
