@@ -7,7 +7,10 @@ use std::{io::Cursor, path::PathBuf};
 
 use serde_bytes::ByteBuf;
 
-use super::BmffHash;
+use super::{
+    single_file_bmff_tests::{children, named, roots},
+    BmffHash,
+};
 use crate::{
     asset_handlers::bmff_io::read_bmff_c2pa_boxes,
     dynamic_assertion::{DynamicAssertion, DynamicAssertionContent, PartialClaim},
@@ -88,8 +91,105 @@ fn shortened() -> Vec<u8> {
 #[test]
 fn ladder_unequal_fragments_shared_manifest_and_tampering() {
     let data = vec![RELATIVE.to_vec(), ABSOLUTE.to_vec(), shortened()];
+    validate_ladder(&data, &[(1, 1, 3), (2, 1, 3), (3, 1, 1)]);
+}
+
+// Only the checked layout of RELATIVE is supported, not arbitrary BMFF input.
+fn with_track_id(id: u32) -> Vec<u8> {
+    let mut data = RELATIVE.to_vec();
+    let root = roots(&data);
+    let moov = named(&root, b"moov");
+    let moov_children = children(&data, moov);
+    assert_eq!(
+        moov_children.iter().filter(|b| b.kind == *b"trak").count(),
+        1
+    );
+    let trak = named(&moov_children, b"trak");
+    let tkhd = named(&children(&data, trak), b"tkhd");
+    assert_eq!(data[tkhd.payload], 0);
+    let trex = named(&children(&data, named(&moov_children, b"mvex")), b"trex");
+    let sidx = named(&root, b"sidx");
+    let tfra = named(&children(&data, named(&root, b"mfra")), b"tfra");
+    let mut offsets = vec![
+        tkhd.payload + 12,
+        trex.payload + 4,
+        sidx.payload + 4,
+        tfra.payload + 4,
+    ];
+    for moof in root.iter().filter(|b| b.kind == *b"moof") {
+        let traf = named(&children(&data, *moof), b"traf");
+        let tfhd = named(&children(&data, traf), b"tfhd");
+        offsets.push(tfhd.payload + 4);
+    }
+    assert_eq!(offsets.len(), 7);
+    for at in offsets {
+        assert_eq!(&data[at..at + 4], &1u32.to_be_bytes());
+        data[at..at + 4].copy_from_slice(&id.to_be_bytes());
+    }
+    let mvhd = named(&moov_children, b"mvhd");
+    assert_eq!(data[mvhd.payload], 0);
+    assert_eq!(mvhd.end - mvhd.payload, 100);
+    let next_track_id = mvhd.payload + 96;
+    assert_eq!(&data[next_track_id..mvhd.end], &2u32.to_be_bytes());
+    data[next_track_id..mvhd.end].copy_from_slice(&id.checked_add(1).unwrap().to_be_bytes());
+    data
+}
+
+// A structural hash/selector fixture, not a playback fixture. Repeat the first
+// moof-relative fragment without indexes, advancing its sequence and decode time.
+fn five_fragments() -> Vec<u8> {
+    let root = roots(RELATIVE);
+    let moofs: Vec<_> = root.iter().filter(|b| b.kind == *b"moof").collect();
+    assert_eq!(moofs.len(), 3);
+    let first = *moofs[0];
+    let mdat = named(&root, b"mdat");
+    assert_eq!(first.end, mdat.start);
+    let mfhd = named(&children(RELATIVE, first), b"mfhd");
+    let traf = named(&children(RELATIVE, first), b"traf");
+    let tfhd = named(&children(RELATIVE, traf), b"tfhd");
+    let flags = u32::from_be_bytes(RELATIVE[tfhd.payload..tfhd.payload + 4].try_into().unwrap());
+    assert_eq!(flags & 0x020001, 0x020000);
+    let tfdt = named(&children(RELATIVE, traf), b"tfdt");
+    let next_traf = named(&children(RELATIVE, *moofs[1]), b"traf");
+    let next_tfdt = named(&children(RELATIVE, next_traf), b"tfdt");
+    assert_eq!(RELATIVE[tfdt.payload], 1);
+    assert_eq!(RELATIVE[next_tfdt.payload], 1);
+    assert_eq!(
+        &RELATIVE[tfdt.payload + 4..tfdt.payload + 12],
+        &0u64.to_be_bytes()
+    );
+    let duration = u64::from_be_bytes(
+        RELATIVE[next_tfdt.payload + 4..next_tfdt.payload + 12]
+            .try_into()
+            .unwrap(),
+    );
+    assert!(duration > 0);
+    let mut data = RELATIVE[..named(&root, b"moov").end].to_vec();
+    for index in 0..5u32 {
+        let mut fragment = RELATIVE[first.start..mdat.end].to_vec();
+        let at = mfhd.payload + 4 - first.start;
+        fragment[at..at + 4].copy_from_slice(&(index + 1).to_be_bytes());
+        let at = tfdt.payload + 4 - first.start;
+        fragment[at..at + 8].copy_from_slice(&(u64::from(index) * duration).to_be_bytes());
+        data.extend(fragment);
+    }
+    data
+}
+
+#[test]
+fn ladder_mixed_local_ids_and_unequal_fragment_counts() {
+    let data = vec![RELATIVE.to_vec(), five_fragments(), with_track_id(7)];
+    validate_ladder(&data, &[(1, 1, 3), (2, 1, 5), (3, 7, 3)]);
+}
+
+fn validate_ladder(data: &[Vec<u8>], expected: &[(usize, usize, usize)]) {
+    assert_eq!(data.len(), expected.len());
+    assert!(
+        expected.len() >= 2,
+        "sibling tampering requires multiple renditions"
+    );
     let dir = tempdirectory().unwrap();
-    let (sources, outputs) = paths(dir.path(), &data);
+    let (sources, outputs) = paths(dir.path(), data);
     let manifest = builder()
         .sign_ladder_files(test_signer(SigningAlg::Es256).as_ref(), &sources, &outputs)
         .unwrap();
@@ -101,7 +201,7 @@ fn ladder_unequal_fragments_shared_manifest_and_tampering() {
             boxes.first_aux_uuid_offset,
             boxes.bmff_merkle_box_infos[0].offset
         );
-        assert_eq!(boxes.bmff_merkle.len(), [3, 3, 1][i]);
+        assert_eq!(boxes.bmff_merkle.len(), expected[i].2);
         super::single_file_bmff_tests::check_tfra(&bytes);
         // The sidx reference ranges include each inserted Merkle UUID and end
         // at the corresponding mdat, independently of the writer's arithmetic.
@@ -133,15 +233,14 @@ fn ladder_unequal_fragments_shared_manifest_and_tampering() {
         for (location, map) in boxes.bmff_merkle.iter().enumerate() {
             assert_eq!(
                 (map.unique_id, map.local_id, map.location),
-                (i + 1, 1, location)
+                (expected[i].0, expected[i].1, location)
             );
         }
         let hash = binding(&bytes);
         let maps = hash.merkle.as_ref().unwrap();
-        assert_eq!(maps.len(), 3);
+        assert_eq!(maps.len(), expected.len());
         for (index, map) in maps.iter().enumerate() {
-            assert_eq!(map.unique_id, index + 1);
-            assert_eq!(map.count, [3, 3, 1][index]);
+            assert_eq!((map.unique_id, map.local_id, map.count), expected[index]);
             assert_eq!(map.hashes.0.len(), map.count);
         }
         let mut own = binding(&bytes);
@@ -150,7 +249,7 @@ fn ladder_unequal_fragments_shared_manifest_and_tampering() {
             .verify_stream_hash(&mut Cursor::new(&bytes), None)
             .is_err());
         let mut sibling = binding(&bytes);
-        let map = &mut sibling.merkle.as_mut().unwrap()[(i + 1) % 3];
+        let map = &mut sibling.merkle.as_mut().unwrap()[(i + 1) % expected.len()];
         map.hashes.0[0] = ByteBuf::from(vec![0; 32]);
         map.init_hash = Some(ByteBuf::from(vec![0; 32]));
         sibling
@@ -543,6 +642,76 @@ fn ladder_rejects_existing_whole_file_provenance_before_writing() {
             assert_eq!(&std::fs::read(source).unwrap(), original);
         }
         assert!(outputs.iter().all(|output| !output.exists()));
+    }
+}
+
+#[test]
+fn ladder_late_signer_error_preserves_sources() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingSigner {
+        inner: Box<dyn Signer>,
+        outputs: Vec<PathBuf>,
+        calls: AtomicUsize,
+    }
+    impl Signer for FailingSigner {
+        fn sign(&self, _: &[u8]) -> Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // Prove this failure is late: all renditions already contain the
+            // placeholder manifest and fragment UUIDs when signing is reached.
+            for output in &self.outputs {
+                let data = std::fs::read(output).unwrap();
+                let boxes = read_bmff_c2pa_boxes(&mut Cursor::new(data)).unwrap();
+                assert!(boxes.manifest_bytes.is_some());
+                assert_eq!(boxes.bmff_merkle.len(), 3);
+            }
+            Err(crate::Error::OtherError("test HSM signing failure".into()))
+        }
+
+        fn alg(&self) -> SigningAlg {
+            self.inner.alg()
+        }
+
+        fn certs(&self) -> Result<Vec<Vec<u8>>> {
+            self.inner.certs()
+        }
+
+        fn reserve_size(&self) -> usize {
+            self.inner.reserve_size()
+        }
+    }
+
+    let dir = tempdirectory().unwrap();
+    let data = [RELATIVE.to_vec(), ABSOLUTE.to_vec()];
+    let (sources, outputs) = paths(dir.path(), &data);
+    let signer = FailingSigner {
+        inner: test_signer(SigningAlg::Es256),
+        outputs: outputs.clone(),
+        calls: AtomicUsize::new(0),
+    };
+    let error = builder()
+        .sign_ladder_files(&signer, &sources, &outputs)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("test HSM signing failure"),
+        "{error}"
+    );
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+    for (source, original) in sources.iter().zip(&data) {
+        assert_eq!(&std::fs::read(source).unwrap(), original);
+    }
+    // The SDK permits partial new outputs on failure; it promises no rollback.
+    // Any readable manifest left behind must not appear successfully signed.
+    for output in outputs.iter().filter(|p| p.exists()) {
+        if let Ok(reader) =
+            Reader::default().with_stream("video/mp4", Cursor::new(std::fs::read(output).unwrap()))
+        {
+            assert_eq!(
+                reader.validation_state(),
+                ValidationState::Invalid,
+                "{reader}"
+            );
+        }
     }
 }
 

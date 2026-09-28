@@ -3281,8 +3281,13 @@ mod tests {
             assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
             assert!(checkout_exclusive::<C2paSigner>(signer).is_ok());
         }
+        let boundary_sources = [sources[0]; 257];
+        let boundary_dests = [dests[0]; 257];
         for (input, output, count) in [
             (sources.as_ptr(), dests.as_ptr(), 0),
+            (boundary_sources.as_ptr(), boundary_dests.as_ptr(), 257),
+            // This pre-existing guard-precondition test requires rejecting the
+            // impossible count before accessing either pointer array.
             (sources.as_ptr(), dests.as_ptr(), usize::MAX),
             (std::ptr::null(), dests.as_ptr(), 2),
             (sources.as_ptr(), std::ptr::null(), 2),
@@ -3297,52 +3302,135 @@ mod tests {
                 -1
             );
             assert!(bytes.is_null());
-            assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
-            assert!(checkout_exclusive::<C2paSigner>(signer).is_ok());
-        }
-        let mut bytes = std::ptr::null();
-        let len = unsafe {
-            c2pa_builder_sign_ladder(
-                builder,
-                signer,
-                sources.as_ptr(),
-                dests.as_ptr(),
-                2,
-                &mut bytes,
-            )
-        };
-        if len < 0 {
             let error = unsafe { c2pa_error() };
+            assert!(!error.is_null());
             let message = unsafe { CStr::from_ptr(error) }
                 .to_string_lossy()
                 .into_owned();
-            unsafe { c2pa_free(error.cast()) };
-            panic!("ladder signing failed: {message}");
+            assert_eq!(unsafe { c2pa_free(error.cast()) }, 0);
+            if count == 0 || count > 256 {
+                assert!(message.contains("1..=256 renditions"), "{message}");
+            }
+            assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
+            assert!(checkout_exclusive::<C2paSigner>(signer).is_ok());
         }
-        assert!(len > 0);
-        assert!(!bytes.is_null());
-        let manifest = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
-        for (i, original) in fixtures.iter().enumerate() {
-            let output = std::fs::read(dir.path().join(format!("output{i}.mp4"))).unwrap();
-            assert!(output
-                .windows(manifest.len())
-                .any(|window| window == manifest));
-            let reader = c2pa::Reader::default()
-                .with_stream("video/mp4", std::io::Cursor::new(output))
-                .unwrap();
-            assert_ne!(
-                reader.validation_state(),
-                c2pa::ValidationState::Invalid,
-                "{reader}"
-            );
-            assert_eq!(
-                std::fs::read(dir.path().join(format!("source{i}.mp4"))).unwrap(),
-                *original
-            );
+        let flat = dir.path().join("flat.mp4");
+        let flat_bytes = include_bytes!(fixture_path!("video1_no_manifest.mp4"));
+        std::fs::write(&flat, flat_bytes).unwrap();
+        let flat_c = CString::new(flat.to_str().unwrap()).unwrap();
+        let existing = dir.path().join("existing.mp4");
+        std::fs::write(&existing, b"preserve existing destination").unwrap();
+        let existing_c = CString::new(existing.to_str().unwrap()).unwrap();
+
+        // Actually sign again with the same borrowed builder AND signer after
+        // success, then after each error returned from inside the SDK.
+        for round in 0..4 {
+            let output_paths: Vec<_> = (0..2)
+                .map(|i| dir.path().join(format!("round{round}_output{i}.mp4")))
+                .collect();
+            let output_strings: Vec<_> = output_paths
+                .iter()
+                .map(|p| CString::new(p.to_str().unwrap()).unwrap())
+                .collect();
+            let dests: Vec<_> = output_strings.iter().map(|s| s.as_ptr()).collect();
+            if round >= 2 {
+                let (input, output, expected_error) = if round == 2 {
+                    // The existing destination is first, so reservation fails
+                    // before creating any outputs even under the partial-output contract.
+                    (
+                        [sources[0], sources[1]],
+                        [existing_c.as_ptr(), dests[1]],
+                        "Io:",
+                    )
+                } else {
+                    (
+                        [sources[0], flat_c.as_ptr()],
+                        [dests[0], dests[1]],
+                        "not a single-file fragmented BMFF",
+                    )
+                };
+                let mut bytes = std::ptr::dangling();
+                assert_eq!(
+                    unsafe {
+                        c2pa_builder_sign_ladder(
+                            builder,
+                            signer,
+                            input.as_ptr(),
+                            output.as_ptr(),
+                            2,
+                            &mut bytes,
+                        )
+                    },
+                    -1
+                );
+                assert!(bytes.is_null());
+                let error = unsafe { c2pa_error() };
+                assert!(!error.is_null());
+                let message = unsafe { CStr::from_ptr(error) }
+                    .to_string_lossy()
+                    .into_owned();
+                assert_eq!(unsafe { c2pa_free(error.cast()) }, 0);
+                assert!(message.contains(expected_error), "{message}");
+                assert!(output_paths.iter().all(|p| !p.exists()));
+                assert_eq!(
+                    std::fs::read(&existing).unwrap(),
+                    b"preserve existing destination"
+                );
+                assert_eq!(std::fs::read(&flat).unwrap(), flat_bytes);
+                for (i, original) in fixtures.iter().enumerate() {
+                    assert_eq!(
+                        std::fs::read(dir.path().join(format!("source{i}.mp4"))).unwrap(),
+                        *original
+                    );
+                }
+            }
+            let mut bytes = std::ptr::dangling();
+            let len = unsafe {
+                c2pa_builder_sign_ladder(
+                    builder,
+                    signer,
+                    sources.as_ptr(),
+                    dests.as_ptr(),
+                    2,
+                    &mut bytes,
+                )
+            };
+            if len < 0 {
+                let error = unsafe { c2pa_error() };
+                let message = unsafe { CStr::from_ptr(error) }
+                    .to_string_lossy()
+                    .into_owned();
+                assert_eq!(unsafe { c2pa_free(error.cast()) }, 0);
+                panic!("ladder signing round {round} failed: {message}");
+            }
+            assert!(len > 0);
+            assert!(!bytes.is_null());
+            let manifest = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
+            for (i, output) in output_paths.iter().enumerate() {
+                assert_eq!(
+                    c2pa::jumbf_io::load_jumbf_from_file(output).unwrap(),
+                    manifest
+                );
+                let reader = c2pa::Reader::default()
+                    .with_stream(
+                        "video/mp4",
+                        std::io::Cursor::new(std::fs::read(output).unwrap()),
+                    )
+                    .unwrap();
+                assert_ne!(
+                    reader.validation_state(),
+                    c2pa::ValidationState::Invalid,
+                    "{reader}"
+                );
+                assert_eq!(
+                    std::fs::read(dir.path().join(format!("source{i}.mp4"))).unwrap(),
+                    fixtures[i]
+                );
+            }
+            assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
+            assert!(checkout_exclusive::<C2paSigner>(signer).is_ok());
+            assert_eq!(unsafe { c2pa_free(bytes.cast()) }, 0);
         }
-        assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
-        assert!(checkout_exclusive::<C2paSigner>(signer).is_ok());
-        assert_eq!(unsafe { c2pa_free(bytes.cast()) }, 0);
         assert_eq!(unsafe { c2pa_free(builder.cast()) }, 0);
         assert_eq!(unsafe { c2pa_free(signer.cast()) }, 0);
     }
