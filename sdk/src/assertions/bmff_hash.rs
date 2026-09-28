@@ -3146,11 +3146,14 @@ mod bmff_hash_tests {
                 };
                 let mut assertion = tm_assertion(Vec::new(), 1);
                 assertion.set_merkle(vec![sibling, selected]);
-                let result = assertion.verify_stream_hash(&mut Cursor::new(&asset), None);
-                assert!(
-                    result.is_ok(),
-                    "unrelated {fault} map {sibling_ids:?}: {result:?}"
-                );
+                for _ in 0..2 {
+                    let result = assertion.verify_stream_hash(&mut Cursor::new(&asset), None);
+                    assert!(
+                        result.is_ok(),
+                        "unrelated {fault} map {sibling_ids:?}: {result:?}"
+                    );
+                    assertion.merkle.as_mut().unwrap().reverse();
+                }
 
                 // Swap the keys: the same invalid sibling is now the named
                 // map and must fail despite a valid unrelated map remaining.
@@ -3159,13 +3162,16 @@ mod bmff_hash_tests {
                 maps[0].local_id = 1;
                 maps[1].unique_id = sibling_ids.0;
                 maps[1].local_id = sibling_ids.1;
-                let err = assertion
-                    .verify_stream_hash(&mut Cursor::new(&asset), None)
-                    .unwrap_err();
-                assert!(
-                    matches!(err, Error::HashMismatch(ref m) if m == expected_error),
-                    "named {fault} map {sibling_ids:?}: {err}"
-                );
+                for _ in 0..2 {
+                    let err = assertion
+                        .verify_stream_hash(&mut Cursor::new(&asset), None)
+                        .unwrap_err();
+                    assert!(
+                        matches!(err, Error::HashMismatch(ref m) if m == expected_error),
+                        "named {fault} map {sibling_ids:?}: {err}"
+                    );
+                    assertion.merkle.as_mut().unwrap().reverse();
+                }
             }
         }
     }
@@ -3178,8 +3184,18 @@ mod bmff_hash_tests {
             let mut assertion = tm_assertion(Vec::new(), 1);
             assertion.set_merkle(vec![map]);
             assertion
-                .verify_stream_hash(&mut Cursor::new(asset), None)
+                .verify_stream_hash(&mut Cursor::new(&asset), None)
                 .unwrap();
+            if ids.0 == 0 {
+                assertion.merkle.as_mut().unwrap()[0].unique_id = 1;
+                let err = assertion
+                    .verify_stream_hash(&mut Cursor::new(&asset), None)
+                    .unwrap_err();
+                assert!(
+                    matches!(err, Error::HashMismatch(ref m) if m.contains("no MerkleMap for this asset")),
+                    "{err}"
+                );
+            }
         }
     }
 
