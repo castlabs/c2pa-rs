@@ -82,6 +82,8 @@ use crate::{
 };
 
 const MANIFEST_STORE_EXT: &str = "c2pa"; // file extension for external manifests
+#[cfg(feature = "file_io")]
+pub(crate) const MAX_LADDER_RENDITIONS: usize = 256;
 #[cfg(feature = "fetch_remote_manifests")]
 const DEFAULT_MANIFEST_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
@@ -3014,6 +3016,183 @@ impl Store {
         Ok(())
     }
 
+    /// Embed one shared manifest into a ladder of single-track fragmented files.
+    /// Destinations must not exist. Errors may leave partial new outputs, but
+    /// never overwrite existing files. Returns the bytes embedded in every file.
+    #[cfg(feature = "file_io")]
+    pub fn save_to_bmff_ladder(
+        &mut self,
+        inputs: &[PathBuf],
+        outputs: &[PathBuf],
+        signer: &dyn Signer,
+        context: &Context,
+    ) -> Result<Vec<u8>> {
+        use std::io::{SeekFrom, Write};
+
+        use crate::asset_handlers::bmff_io::{
+            insert_fragment_merkle_boxes, read_bmff_c2pa_boxes, write_c2pa_box, MANIFEST,
+        };
+
+        if inputs.is_empty()
+            || inputs.len() != outputs.len()
+            || inputs.len() > MAX_LADDER_RENDITIONS
+        {
+            return Err(Error::BadParam(
+                "a ladder requires 1..=256 sources and exactly one destination per source".into(),
+            ));
+        }
+        let settings = context.settings();
+        let io = context.io();
+        for path in inputs.iter().chain(outputs) {
+            let ext = io.supported_extension(path).ok_or(Error::UnsupportedType)?;
+            if !io.is_bmff_format(&ext) {
+                return Err(Error::UnsupportedType);
+            }
+        }
+        let format = io
+            .supported_extension(&inputs[0])
+            .ok_or(Error::UnsupportedType)?;
+        let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
+        if !matches!(pc.remote_manifest(), RemoteManifest::NoRemote) {
+            return Err(Error::BadParam(
+                "ladder signing requires embedded manifests; remote and sidecar manifests are not supported".into(),
+            ));
+        }
+        if pc.update_manifest() || !pc.hash_assertions().is_empty() {
+            return Err(Error::BadParam(
+                "a ladder requires a new claim without an existing hard binding".into(),
+            ));
+        }
+        // As in ordinary BMFF signing, compression would destabilize the
+        // placeholder size and invalidate the absolute offsets being hashed.
+        pc.set_compressed_manifest(false);
+
+        let dynamic_assertions = signer.dynamic_assertions();
+        self.add_dynamic_assertion_placeholders(&dynamic_assertions)?;
+        let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+        let mut bmff_hash = Store::generate_bmff_data_hash_for_stream(pc.alg(), settings)?;
+        let mut sources = Vec::with_capacity(inputs.len());
+        let mut merkle_boxes = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let mut source = std::fs::File::open(input)?;
+            if read_bmff_c2pa_boxes(&mut source)?.c2pa_box_present {
+                return Err(Error::BadParam(
+                    "ladder sources must not contain C2PA boxes".into(),
+                ));
+            }
+            merkle_boxes.push(bmff_hash.add_single_file_rendition(
+                &mut source,
+                settings.core.merkle_tree_max_leaves,
+                index + 1,
+            )?);
+            sources.push(source);
+        }
+        self.provenance_claim_mut()
+            .ok_or(Error::ClaimEncoding)?
+            .add_assertion(&bmff_hash)?;
+        let reserve_size = signer.reserve_size();
+        let unsigned_jumbf = self.to_jumbf_internal(reserve_size)?;
+
+        // Reserve every name atomically before writing anything. The filesystem
+        // resolves aliases, including nonexistent case/Unicode-equivalent names.
+        // Keep the handles for hashing and patching: never reopen by pathname.
+        let mut destinations = outputs
+            .iter()
+            .map(|path| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+
+        for (index, ((source, dest), boxes)) in sources
+            .iter_mut()
+            .zip(&mut destinations)
+            .zip(&merkle_boxes)
+            .enumerate()
+        {
+            context.check_progress(
+                ProgressPhase::Writing,
+                (index + 1) as u32,
+                inputs.len() as u32,
+            )?;
+            let input_len = stream_len(source)?;
+            let mut with_boxes = io_utils::stream_with_fs_fallback(
+                settings.core.backing_store_memory_threshold_in_mb,
+                input_len,
+            )?;
+            insert_fragment_merkle_boxes(source, &mut with_boxes, boxes)?;
+            with_boxes.rewind()?;
+            io.write_c2pa(&format, &mut with_boxes, dest, &unsigned_jumbf)?;
+            dest.rewind()?;
+            let mut cb = |step, total| context.check_progress(ProgressPhase::Hashing, step, total);
+            bmff_hash.finalize_single_file_merkle(dest, index + 1, &mut cb)?;
+        }
+        self.provenance_claim_mut()
+            .ok_or(Error::ClaimEncoding)?
+            .update_bmff_hash(bmff_hash)?;
+        let mut preliminary_claim = PartialClaim::default();
+        for assertion in self
+            .provenance_claim()
+            .ok_or(Error::ClaimEncoding)?
+            .assertions()
+        {
+            preliminary_claim.add_assertion(assertion);
+        }
+        self.write_dynamic_assertions(&dynamic_assertions, &mut preliminary_claim)?;
+        context.check_progress(ProgressPhase::Signing, 1, 1)?;
+        let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+        let sig = self.sign_claim(pc, signer, reserve_size, settings)?;
+        self.provenance_claim_mut()
+            .ok_or(Error::ClaimEncoding)?
+            .set_signature_val(sig);
+        let final_jumbf = self.to_jumbf_internal(reserve_size)?;
+        if final_jumbf.len() != unsigned_jumbf.len() {
+            return Err(Error::JumbfCreationError);
+        }
+
+        for dest in &mut destinations {
+            let boxes = read_bmff_c2pa_boxes(dest)?;
+            let offset = boxes.manifest_box_offset.ok_or(Error::JumbfCreationError)?;
+            let first_merkle = boxes
+                .bmff_merkle_box_infos
+                .first()
+                .ok_or(Error::JumbfCreationError)?
+                .offset;
+            let mut replacement = Vec::new();
+            write_c2pa_box(&mut replacement, &final_jumbf, MANIFEST, &[], first_merkle)?;
+            if boxes.manifest_bytes.as_deref() != Some(unsigned_jumbf.as_slice())
+                || boxes.manifest_box_bytes.as_ref().map(Vec::len) != Some(replacement.len())
+            {
+                return Err(Error::JumbfCreationError);
+            }
+            // Only an equal-sized in-place patch is allowed after hashing.
+            // A whole-file write fallback would invalidate absolute offsets.
+            dest.seek(SeekFrom::Start(offset))?;
+            dest.write_all(&replacement)?;
+            dest.flush()?;
+        }
+        self.embedded = true;
+        context.check_progress(ProgressPhase::Embedding, 1, 1)?;
+        if settings.verify.verify_after_sign {
+            if settings.verify.verify_after_sign_hash {
+                for dest in &mut destinations {
+                    dest.rewind()?;
+                    self.verify_store_strict(
+                        Some(&mut ClaimAssetData::Stream(dest, &format)),
+                        context,
+                    )?;
+                }
+            } else {
+                // The claim is shared; without asset hashing, verify it only once.
+                self.verify_store_strict(None, context)?;
+            }
+        }
+        Ok(final_jumbf)
+    }
+
     /// Embed the claims store as JUMBF into a stream. Updates XMP with provenance
     /// record.
     ///
@@ -3419,7 +3598,11 @@ impl Store {
                     let mut cb =
                         |step, total| context.check_progress(ProgressPhase::Hashing, step, total);
                     if single_file_fragments {
-                        bmff_hash.finalize_single_file_merkle(output_stream, &mut cb)?;
+                        bmff_hash.finalize_single_file_merkle(
+                            output_stream,
+                            crate::assertions::SINGLE_RENDITION_ID,
+                            &mut cb,
+                        )?;
                     } else {
                         bmff_hash.gen_hash_from_stream_with_progress(output_stream, &mut cb)?;
                     }

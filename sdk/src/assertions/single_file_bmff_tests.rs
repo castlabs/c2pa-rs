@@ -48,11 +48,11 @@ fn u64_at(data: &[u8], at: usize) -> u64 {
 
 // Deliberately independent of the SDK's BMFF tree and offset/hash helpers.
 #[derive(Clone, Copy, Debug)]
-struct B {
-    start: usize,
-    payload: usize,
-    end: usize,
-    kind: [u8; 4],
+pub(super) struct B {
+    pub(super) start: usize,
+    pub(super) payload: usize,
+    pub(super) end: usize,
+    pub(super) kind: [u8; 4],
 }
 
 fn boxes(data: &[u8], start: usize, end: usize) -> Vec<B> {
@@ -78,13 +78,13 @@ fn boxes(data: &[u8], start: usize, end: usize) -> Vec<B> {
     result
 }
 
-fn roots(data: &[u8]) -> Vec<B> {
+pub(super) fn roots(data: &[u8]) -> Vec<B> {
     boxes(data, 0, data.len())
 }
-fn children(data: &[u8], b: B) -> Vec<B> {
+pub(super) fn children(data: &[u8], b: B) -> Vec<B> {
     boxes(data, b.payload, b.end)
 }
-fn named(list: &[B], kind: &[u8; 4]) -> B {
+pub(super) fn named(list: &[B], kind: &[u8; 4]) -> B {
     *list.iter().find(|b| &b.kind == kind).unwrap()
 }
 
@@ -268,7 +268,7 @@ fn check_output_with_id(original: &[u8], signed: &[u8], unique_id: usize) {
     check_tfra(signed);
 }
 
-fn check_tfra(signed: &[u8]) {
+pub(super) fn check_tfra(signed: &[u8]) {
     let root = roots(signed);
     let moofs: Vec<_> = root.iter().filter(|b| b.kind == *b"moof").collect();
     let count = moofs.len();
@@ -300,12 +300,65 @@ fn single_file_stream_offsets_and_hashes() {
 }
 
 #[test]
+fn single_file_verifier_selects_own_map_in_either_order() {
+    use serde_bytes::ByteBuf;
+
+    for input in [RELATIVE, ABSOLUTE] {
+        let signed = sign(input);
+        let hash = binding(&signed);
+        let own = &hash.merkle.as_ref().unwrap()[0];
+        assert_eq!((own.unique_id, own.local_id), (1, 1));
+        for same_unique_id in [false, true] {
+            let sibling = || super::MerkleMap {
+                unique_id: own.unique_id + usize::from(!same_unique_id),
+                local_id: own.local_id + usize::from(same_unique_id),
+                count: own.count + 2,
+                alg: own.alg.clone(),
+                init_hash: Some(ByteBuf::from(vec![0xaa; 32])),
+                hashes: super::VecByteBuf(vec![ByteBuf::from(vec![0xbb; 32]); own.count + 2]),
+                fixed_block_size: None,
+                variable_block_sizes: None,
+            };
+            for own_first in [false, true] {
+                let mut selected = binding(&signed);
+                selected
+                    .merkle
+                    .as_mut()
+                    .unwrap()
+                    .insert(usize::from(own_first), sibling());
+                selected
+                    .verify_stream_hash(&mut Cursor::new(&signed), None)
+                    .unwrap();
+
+                let own_index = usize::from(!own_first);
+                selected.merkle.as_mut().unwrap()[own_index].hashes.0[0] =
+                    ByteBuf::from(vec![0; 32]);
+                assert!(selected
+                    .verify_stream_hash(&mut Cursor::new(&signed), None)
+                    .is_err());
+            }
+            let mut missing = binding(&signed);
+            missing.merkle = Some(vec![sibling()]);
+            let error = missing
+                .verify_stream_hash(&mut Cursor::new(&signed), None)
+                .unwrap_err();
+            assert!(
+                matches!(error, crate::Error::HashMismatch(ref message)
+                if message.contains("no MerkleMap for this asset")),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn single_file_legacy_zero_id_still_verifies() {
     for input in [RELATIVE, ABSOLUTE] {
         // Reconstruct the earlier ID-0 output from synthetic FFmpeg fixtures.
         // Only map IDs change; re-sign the caller-owned binding in two passes
         // so its hashes reflect the final manifest size and relocated offsets.
         let mut source = sign(input);
+        let wrong_id = binding(&source);
         let mut hash = binding(&source);
         hash.merkle.as_mut().unwrap()[0].unique_id = 0;
         let parsed = read_bmff_c2pa_boxes(&mut Cursor::new(&source)).unwrap();
@@ -330,6 +383,15 @@ fn single_file_legacy_zero_id_still_verifies() {
             assert_eq!(uuid.len(), info.size() as usize);
             source[info.start() as usize..info.end() as usize].copy_from_slice(&uuid);
         }
+        // UUID 0 must not silently select the original assertion's map 1.
+        let error = wrong_id
+            .verify_stream_hash(&mut Cursor::new(&source), None)
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::HashMismatch(ref message)
+            if message == "no MerkleMap for this asset (uniqueId 0, localId 1)"),
+            "{error}"
+        );
         let settings = Settings::new()
             .with_value("verify.verify_after_sign", false)
             .unwrap();
@@ -348,7 +410,7 @@ fn single_file_legacy_zero_id_still_verifies() {
                 &mut signed,
             )
             .unwrap();
-            hash.finalize_single_file_merkle(&mut signed, &mut |_, _| Ok(()))
+            hash.finalize_single_file_merkle(&mut signed, 0, &mut |_, _| Ok(()))
                 .unwrap();
         }
         check_output_with_id(input, signed.get_ref(), 0);
@@ -675,7 +737,7 @@ fn single_file_dynamic_assertion_and_update() {
     check_aux_locator(output.get_ref());
 }
 
-fn historical_flat(input: &[u8]) -> Vec<u8> {
+pub(super) fn historical_flat(input: &[u8]) -> Vec<u8> {
     // Reproduce the historical file-level binding using the caller-owned hash
     // API. The first pass fixes the layout; the second fills the same-size hash.
     let settings = Settings::new()
