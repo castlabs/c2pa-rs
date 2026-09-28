@@ -5,10 +5,12 @@ on:
     branches:
       - feat/live-video-vsi
       - feat/trusted-vsi-api-surface
+      - feat/trusted-vsi-functional
   push:
     branches:
       - feat/live-video-vsi
       - feat/trusted-vsi-api-surface
+      - feat/trusted-vsi-functional
     tags:
       - "castlabs-live-video-v*"
   workflow_dispatch:
@@ -154,6 +156,7 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/castlabs_live_video_qualification.py verify-symbols --target "${{ matrix.target }}" --library "target/${{ matrix.target }}/release/${{ matrix.native }}"
+          python scripts/castlabs_live_video_qualification.py verify-trusted-capabilities --library "target/${{ matrix.target }}/release/${{ matrix.native }}"
           python scripts/castlabs_live_video_qualification.py verify-header --header "target/${{ matrix.target }}/release/c2pa.h"
           python scripts/castlabs_live_video_qualification.py verify-c2patool-help --executable "target/${{ matrix.target }}/release/${{ matrix.c2patool }}"
 

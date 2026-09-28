@@ -10,7 +10,7 @@ import tomllib
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -508,7 +508,8 @@ Symbol {
             (ROOT / relative).read_text(encoding="utf-8")
             for relative in ("c2pa_c_ffi/src/c_api.rs", "c2pa_c_ffi/src/live_video.rs")
         )
-        self.assertEqual(len(qualification.REQUIRED_SYMBOLS), 24)
+        self.assertEqual(len(qualification.REQUIRED_SYMBOLS), 28)
+        self.assertEqual(qualification.TRUSTED_VSI_CAPABILITIES, 63)
         self.assertEqual(
             len(set(qualification.REQUIRED_SYMBOLS)),
             len(qualification.REQUIRED_SYMBOLS),
@@ -538,19 +539,18 @@ Symbol {
                 "struct C2paLiveVideoTrustedVsiSession *",
                 "const struct C2paLiveVideoTrustedVsiSession *",
             ),
-            ("const unsigned char *_sig_structure", "unsigned char *_sig_structure"),
-            ("uintptr_t _sig_structure_len", "uint32_t _sig_structure_len"),
+            ("const unsigned char *data", "unsigned char *data"),
+            ("uintptr_t len", "uint32_t len"),
             ("const unsigned char **output", "unsigned char **output"),
-            ("uint32_t *sequence_number", "uint64_t *sequence_number"),
-            ("uint32_t *sequence_max", "uint64_t *sequence_max"),
-            ("bool *has_sequence_max", "uint32_t *has_sequence_max"),
+            ("uint32_t sequence_number", "uint64_t sequence_number"),
+            ("uint32_t sequence_number", "uint32_t *sequence_number"),
             (
-                "uint32_t *sequence_number,\n    uint32_t *sequence_max",
-                "uint32_t *sequence_max,\n    uint32_t *sequence_number",
+                "uint32_t sequence_number,\n    const unsigned char **output",
+                "const unsigned char **output,\n    uint32_t sequence_number",
             ),
             (
-                "uintptr_t _sig_structure_len,",
-                "uintptr_t _sig_structure_len, const unsigned char *emsg,",
+                "const unsigned char **output);",
+                "const unsigned char **output, uint32_t *sequence_max, bool *has_sequence_max);",
             ),
         ):
             with self.subTest(after=after), self.assertRaisesRegex(
@@ -580,6 +580,17 @@ Symbol {
             ):
                 with self.assertRaisesRegex(RuntimeError, "removed native exports"):
                     qualification.verify_symbols(Path("library"), target)
+
+    def test_trusted_capabilities_must_be_fully_wired(self):
+        for value, ok in ((63, True), (0, False), (31, False)):
+            function = MagicMock(return_value=value)
+            handle = Namespace(c2pa_live_video_trusted_vsi_capabilities=function)
+            with self.subTest(value=value), patch("ctypes.CDLL", return_value=handle):
+                if ok:
+                    qualification.verify_trusted_capabilities(Path("library"))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "expected 63"):
+                        qualification.verify_trusted_capabilities(Path("library"))
 
     def test_verify_header_runs_c11_abi_compilation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -718,11 +729,19 @@ class WorkflowTests(unittest.TestCase):
             triggers = workflow.get("on", workflow.get(True))
             self.assertEqual(
                 triggers["pull_request"]["branches"],
-                ["feat/live-video-vsi", "feat/trusted-vsi-api-surface"],
+                [
+                    "feat/live-video-vsi",
+                    "feat/trusted-vsi-api-surface",
+                    "feat/trusted-vsi-functional",
+                ],
             )
             self.assertEqual(
                 triggers["push"]["branches"],
-                ["feat/live-video-vsi", "feat/trusted-vsi-api-surface"],
+                [
+                    "feat/live-video-vsi",
+                    "feat/trusted-vsi-api-surface",
+                    "feat/trusted-vsi-functional",
+                ],
             )
             self.assertEqual(triggers["push"]["tags"], ["castlabs-live-video-v*"])
             self.assertIn("workflow_dispatch", triggers)

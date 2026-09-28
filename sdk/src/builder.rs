@@ -2216,7 +2216,7 @@ impl Builder {
     ///
     /// This functioin calls [`Builder::to_claim`] internally. Use [`Builder::to_store_with_claim`]
     /// if the [`Claim`] is constructed manually.
-    fn to_store(&self) -> Result<Store> {
+    pub(crate) fn to_store(&self) -> Result<Store> {
         let claim = self.to_claim()?;
         self.to_store_with_claim(claim)
     }

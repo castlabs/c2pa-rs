@@ -119,20 +119,25 @@ REQUIRED_SYMBOLS = (
     "c2pa_live_video_trusted_vsi_session_sign_sig_structure",
     "c2pa_live_video_trusted_vsi_session_reserve_media_emsg",
     "c2pa_live_video_trusted_vsi_session_finalize_media_emsg",
-    "c2pa_live_video_trusted_vsi_session_recover",
+    "c2pa_live_video_trusted_vsi_session_export_state",
+    "c2pa_live_video_trusted_vsi_session_import_state",
     "c2pa_live_video_trusted_vsi_session_status_v1",
+    "c2pa_live_video_trusted_vsi_validate_input",
+    "c2pa_live_video_trusted_vsi_hash_template",
+    "c2pa_live_video_trusted_vsi_session_preflight",
 )
 REMOVED_SYMBOLS = (
     "c2pa_live_video_trusted_vsi_session_sign_emsg_sig_structure",
+    "c2pa_live_video_trusted_vsi_session_recover",
 )
+# Prehashed trusted VSI capability bits that a qualified build must report.
+TRUSTED_VSI_CAPABILITIES = 63
 TRUSTED_SIGN_PROTOTYPE = """int64_t c2pa_live_video_trusted_vsi_session_sign_sig_structure(
-    struct C2paLiveVideoTrustedVsiSession *_session,
-    const unsigned char *_sig_structure,
-    uintptr_t _sig_structure_len,
-    const unsigned char **output,
-    uint32_t *sequence_number,
-    uint32_t *sequence_max,
-    bool *has_sequence_max);"""
+    struct C2paLiveVideoTrustedVsiSession *session,
+    const unsigned char *data,
+    uintptr_t len,
+    uint32_t sequence_number,
+    const unsigned char **output);"""
 
 
 def sha256_file(path: Path) -> str:
@@ -385,6 +390,23 @@ def verify_symbols(library: Path, target: str) -> None:
     if missing:
         raise RuntimeError("missing defined exported symbols: " + ", ".join(missing))
     print(f"verified {len(REQUIRED_SYMBOLS)} required defined native exports")
+
+
+def verify_trusted_capabilities(library: Path) -> None:
+    """Loads a host-native library and checks the trusted VSI capability mask."""
+    import ctypes
+
+    handle = ctypes.CDLL(str(library.resolve()))
+    function = handle.c2pa_live_video_trusted_vsi_capabilities
+    function.argtypes = []
+    function.restype = ctypes.c_uint64
+    capabilities = int(function())
+    if capabilities != TRUSTED_VSI_CAPABILITIES:
+        raise RuntimeError(
+            f"trusted VSI capabilities are {capabilities}, "
+            f"expected {TRUSTED_VSI_CAPABILITIES}"
+        )
+    print(f"verified trusted VSI capabilities {capabilities}")
 
 
 def workspace_version(manifest: Path = Path("Cargo.toml")) -> str:
@@ -1092,6 +1114,9 @@ def parser() -> argparse.ArgumentParser:
     symbols.add_argument("--library", required=True)
     symbols.add_argument("--target", choices=SUPPORTED_TARGETS, required=True)
 
+    capabilities = commands.add_parser("verify-trusted-capabilities")
+    capabilities.add_argument("--library", required=True)
+
     header = commands.add_parser("verify-header")
     header.add_argument("--header", required=True)
     header.add_argument(
@@ -1136,6 +1161,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_command_manifest(args.target, Path(args.output))
     elif args.command == "verify-symbols":
         verify_symbols(Path(args.library), args.target)
+    elif args.command == "verify-trusted-capabilities":
+        verify_trusted_capabilities(Path(args.library))
     elif args.command == "verify-header":
         verify_header(Path(args.header), args.compiler)
     elif args.command == "verify-c2patool-help":
