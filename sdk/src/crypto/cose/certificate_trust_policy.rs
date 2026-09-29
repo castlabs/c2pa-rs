@@ -205,11 +205,16 @@ impl CertificateTrustPolicy {
         }
     }
 
-    /// Evaluate trust only within the verification operation's purpose.
-    /// TSA trust never accepts private end-entity allow-lists (C2PA 14.4.3).
-    #[allow(unused)]
+    /// Evaluate a certificate against this trust policy for one trust purpose.
+    ///
+    /// Behaves like [`check_certificate_trust`](Self::check_certificate_trust),
+    /// but only trust anchors and private credentials registered for `purpose`
+    /// are considered. Use [`TrustListKind::CAWG`] for CAWG X.509 identity
+    /// credentials and [`TrustListKind::TSA`] for time-stamping authorities.
+    /// TSA trust never accepts private end-entity credentials (C2PA 14.4.3).
+    #[allow(unused)] // parameters may be unused in some cases
     #[async_generic]
-    pub(crate) fn check_certificate_trust_for(
+    pub fn check_certificate_trust_for(
         &self,
         chain_der: &[Vec<u8>],
         end_entity_cert_der: &[u8],
@@ -351,6 +356,11 @@ impl CertificateTrustPolicy {
     ///
     /// Lines that match neither format (PEM or hash) are ignored.
     ///
+    /// Credentials added here are accepted only when verifying manifest
+    /// signatures. They are not used for CAWG identity or time-stamp trust;
+    /// use [`add_end_entity_credentials_for`](Self::add_end_entity_credentials_for)
+    /// to allow-list CAWG X.509 identity credentials.
+    ///
     /// [§14.4.3, Private Credential Storage]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_private_credential_storage
     pub fn add_end_entity_credentials(
         &mut self,
@@ -359,7 +369,19 @@ impl CertificateTrustPolicy {
         self.add_end_entity_credentials_for(end_entity_cert_pems, TrustListKind::Manifest)
     }
 
-    pub(crate) fn add_end_entity_credentials_for(
+    /// Add individual end-entity credentials that shall be accepted only for
+    /// the given trust `purpose`.
+    ///
+    /// Accepts the same input formats as
+    /// [`add_end_entity_credentials`](Self::add_end_entity_credentials), which is
+    /// equivalent to calling this function with [`TrustListKind::Manifest`].
+    /// Use [`TrustListKind::CAWG`] to allow-list CAWG X.509 identity
+    /// credentials, for example for an
+    /// [`X509SignatureVerifier`](crate::identity::x509::X509SignatureVerifier).
+    ///
+    /// Credentials added for [`TrustListKind::TSA`] are never trusted: a private
+    /// credential store shall not apply to validating time-stamps (C2PA 14.4.3).
+    pub fn add_end_entity_credentials_for(
         &mut self,
         end_entity_cert_pems: &[u8],
         purpose: TrustListKind,
