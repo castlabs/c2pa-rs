@@ -666,6 +666,7 @@ dependencies = [
  "c2pa_cbor 0.77.4",
  "c2pa_cbor 0.78.0",
  "cbindgen",
+ "glob",
  "libc",
  "p256",
  "serde",
