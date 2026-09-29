@@ -27,8 +27,8 @@ use uuid::Uuid;
 
 use crate::{
     assertion::{
-        get_thumbnail_image_type, get_thumbnail_instance, get_thumbnail_type, Assertion,
-        AssertionBase, AssertionData,
+        cbor_to_crjson, get_thumbnail_image_type, get_thumbnail_instance, get_thumbnail_type,
+        Assertion, AssertionBase, AssertionData,
     },
     assertions::{
         self, c2pa_action,
@@ -76,7 +76,7 @@ use crate::{
     settings::{Settings, MAX_ASSERTIONS},
     status_tracker::{ErrorBehavior, StatusTracker},
     store::StoreValidationInfo,
-    utils::hash_utils::{hash_by_alg, vec_compare},
+    utils::hash_utils::{hash_by_alg, vec_compare, HashRange},
     validation_status, ClaimGeneratorInfo,
 };
 
@@ -397,6 +397,34 @@ impl Serialize for Claim {
         } else {
             self.serialize_v1(serializer)
         }
+    }
+}
+
+/// Whether a `c2pa.hash.data` assertion's exclusions are acceptable for this asset.
+///
+/// Per C2PA 15.12, the exclusion range containing the manifest store must hold only
+/// the manifest store and padding. `manifest_store_range` is the manifest's real
+/// location, found independently by re-parsing the asset; a legitimate exclusion
+/// covers exactly it. A mismatch means the exclusion covers non-manifest bytes -- a
+/// detached manifest applied to an unrelated asset, or content injected into the
+/// space freed by shrinking the manifest.
+fn data_hash_exclusions_match_manifest(
+    exclusions: &[HashRange],
+    manifest_store_range: Option<&HashRange>,
+    is_embedded: bool,
+) -> bool {
+    // Remote/sidecar manifests carry a placeholder exclusion that excludes no
+    // bytes; the whole asset is hashed, so there is nothing to police.
+    if !exclusions.iter().any(|e| e.length() > 0) {
+        return true;
+    }
+
+    match manifest_store_range {
+        // Manifest present in this asset: an exclusion must cover exactly it.
+        Some(range) => exclusions.contains(range),
+        // Manifest not in this asset: allow only if it was read from here
+        // (embedded); a detached manifest on an unrelated asset is rejected (#2643).
+        None => is_embedded,
     }
 }
 
@@ -2961,8 +2989,28 @@ impl Claim {
                     }
 
                     if !dh.is_remote_hash() {
-                        // there are extra exclusion then log the information code about extra exclusion
                         if let Some(exclusions) = &dh.exclusions {
+                            if !data_hash_exclusions_match_manifest(
+                                exclusions,
+                                svi.manifest_store_range.as_ref(),
+                                svi.is_embedded,
+                            ) {
+                                log_item!(
+                                    claim.assertion_uri(&hash_binding_assertion.label()),
+                                    "data hash exclusion does not match the manifest location in the asset",
+                                    "verify_internal"
+                                )
+                                .validation_status(validation_status::ASSERTION_DATAHASH_MISMATCH)
+                                .failure(
+                                    validation_log,
+                                    Error::HashMismatch(
+                                        "data hash exclusion does not match manifest location"
+                                            .to_string(),
+                                    ),
+                                )?;
+                            }
+
+                            // there are extra exclusion then log the information code about extra exclusion
                             if exclusions.len() > 1 {
                                 log_item!(
                                     claim.assertion_uri(&hash_binding_assertion.label()),
@@ -4335,18 +4383,10 @@ impl Claim {
                             }
                             AssertionData::Cbor(x) => {
                                 // some types are not translatable to json so explicitly convert
-                                let buf: Vec<u8> = Vec::new();
-                                let mut from = c2pa_cbor::Deserializer::from_slice(x);
-                                let mut to = serde_json::Serializer::new(buf);
-
-                                serde_transcode::transcode(&mut from, &mut to)
-                                    .map_err(|err| Error::AssertionEncoding(err.to_string()))?;
-                                let buf2 = to.into_inner();
-
-                                let decoded: Value = serde_json::from_slice(&buf2)
+                                let cbor_value: c2pa_cbor::Value = c2pa_cbor::from_slice(x)
                                     .map_err(|err| Error::AssertionEncoding(err.to_string()))?;
 
-                                json_map.insert(label, decoded);
+                                json_map.insert(label, cbor_to_crjson(&cbor_value));
                             }
                             AssertionData::Binary(x) => {
                                 // binary vecs
@@ -4425,16 +4465,9 @@ impl Claim {
                             }
                             AssertionData::Cbor(x) => {
                                 // some types are not translatable to json so explicitly convert
-                                let buf: Vec<u8> = Vec::new();
-                                let mut from = c2pa_cbor::Deserializer::from_slice(x);
-                                let mut to = serde_json::Serializer::new(buf);
-
-                                serde_transcode::transcode(&mut from, &mut to)
+                                let cbor_value: c2pa_cbor::Value = c2pa_cbor::from_slice(x)
                                     .map_err(|err| Error::AssertionEncoding(err.to_string()))?;
-                                let buf2 = to.into_inner();
-
-                                let d: Value = serde_json::from_slice(&buf2)
-                                    .map_err(|err| Error::AssertionEncoding(err.to_string()))?;
+                                let d = cbor_to_crjson(&cbor_value);
 
                                 let j = JsonOrderedAssertionData {
                                     label: claim_assertion.label().to_owned(),

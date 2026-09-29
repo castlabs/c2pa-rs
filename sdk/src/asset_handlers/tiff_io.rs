@@ -22,7 +22,7 @@ use std::{
 };
 
 use atree::{Arena, Token};
-use byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, NativeEndian, ReadBytesExt, WriteBytesExt};
 use byteordered::{with_order, ByteOrdered, Endianness};
 
 use crate::{
@@ -397,6 +397,22 @@ fn check_ifd_data_size(claimed_size: u64, file_size: u64) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The authoritative length of the C2PA manifest store: the JUMBF superbox
+/// LBox/XLBox at `offset` (big-endian, per ISO BMFF, independent of TIFF byte
+/// order). Returns `None` when the data isn't a parseable JUMBF box header
+/// (e.g. the zero placeholder written during signing before the real manifest).
+fn c2pa_manifest_jumbf_len<R: Read + Seek + ?Sized>(stream: &mut R, offset: u64) -> Option<u64> {
+    stream.seek(SeekFrom::Start(offset)).ok()?;
+    let lbox = u64::from(stream.read_u32::<BigEndian>().ok()?);
+    let len = if lbox == 1 {
+        stream.read_u64::<BigEndian>().ok()?
+    } else {
+        lbox
+    };
+    // A valid JUMBF box is at least LBox(4) + TBox(4) bytes.
+    (len >= 8).then_some(len)
 }
 
 #[derive(Debug)]
@@ -1983,6 +1999,9 @@ impl<T: Read + Write + Seek> TiffCloner<T> {
         let file_size = stream_len(asset_reader)?;
         let mut target_ifd: BTreeMap<u16, IfdClonedEntry> = BTreeMap::new();
 
+        // Bound bytes cloned across all entries in this IFD, not just each one alone.
+        let mut cumulative_ifd_bytes: u64 = 0;
+
         for (tag, entry) in entries {
             let target_endianness = self.writer.endianness();
 
@@ -2002,6 +2021,7 @@ impl<T: Read + Write + Seek> TiffCloner<T> {
                         .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?;
 
                     check_ifd_data_size(cnt, file_size)?;
+                    accumulate_copy_len(&mut cumulative_ifd_bytes, cnt, file_size, "IFD entry")?;
 
                     let mut data = safe_vec(cnt, Some(0u8))?;
 
@@ -2030,6 +2050,12 @@ impl<T: Read + Write + Seek> TiffCloner<T> {
                         .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?;
 
                     check_ifd_data_size(num_shorts_x2 as u64, file_size)?;
+                    accumulate_copy_len(
+                        &mut cumulative_ifd_bytes,
+                        num_shorts_x2 as u64,
+                        file_size,
+                        "IFD entry",
+                    )?;
 
                     let mut data = safe_vec(num_shorts_x2 as u64, Some(0u8))?;
 
@@ -2062,6 +2088,12 @@ impl<T: Read + Write + Seek> TiffCloner<T> {
                         .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?;
 
                     check_ifd_data_size(num_longs_x4 as u64, file_size)?;
+                    accumulate_copy_len(
+                        &mut cumulative_ifd_bytes,
+                        num_longs_x4 as u64,
+                        file_size,
+                        "IFD entry",
+                    )?;
 
                     let mut data = safe_vec(num_longs_x4 as u64, Some(0u8))?;
 
@@ -2094,6 +2126,12 @@ impl<T: Read + Write + Seek> TiffCloner<T> {
                         .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?;
 
                     check_ifd_data_size(num_sshorts_x2 as u64, file_size)?;
+                    accumulate_copy_len(
+                        &mut cumulative_ifd_bytes,
+                        num_sshorts_x2 as u64,
+                        file_size,
+                        "IFD entry",
+                    )?;
 
                     let mut data = safe_vec(num_sshorts_x2 as u64, Some(0u8))?;
 
@@ -2126,6 +2164,12 @@ impl<T: Read + Write + Seek> TiffCloner<T> {
                         .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?;
 
                     check_ifd_data_size(num_slongs_x4 as u64, file_size)?;
+                    accumulate_copy_len(
+                        &mut cumulative_ifd_bytes,
+                        num_slongs_x4 as u64,
+                        file_size,
+                        "IFD entry",
+                    )?;
 
                     let mut data = safe_vec(num_slongs_x4 as u64, Some(0u8))?;
 
@@ -2158,6 +2202,12 @@ impl<T: Read + Write + Seek> TiffCloner<T> {
                         .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?;
 
                     check_ifd_data_size(num_floats_x4 as u64, file_size)?;
+                    accumulate_copy_len(
+                        &mut cumulative_ifd_bytes,
+                        num_floats_x4 as u64,
+                        file_size,
+                        "IFD entry",
+                    )?;
 
                     let mut data = safe_vec(num_floats_x4 as u64, Some(0u8))?;
 
@@ -2195,6 +2245,14 @@ impl<T: Read + Write + Seek> TiffCloner<T> {
                     let num_bytes_8 = cnt
                         .checked_mul(8)
                         .ok_or_else(|| Error::InvalidAsset("value out of range".to_string()))?;
+
+                    check_ifd_data_size(num_bytes_8, file_size)?;
+                    accumulate_copy_len(
+                        &mut cumulative_ifd_bytes,
+                        num_bytes_8,
+                        file_size,
+                        "IFD entry",
+                    )?;
 
                     // move to start of data
                     asset_reader.seek(SeekFrom::Start(decode_offset(
@@ -2484,6 +2542,18 @@ impl C2paWriter for TiffIO {
 
         let manifest_offset = decode_offset(cai_ifd_entry.value_offset, e, big_tiff)?;
         let manifest_len = cai_ifd_entry.value_count;
+
+        // The IFD value_count is attacker-controlled; bound the manifest exclusion
+        // to the actual JUMBF superbox length so a forged, over-long count can't
+        // exclude non-manifest bytes (C2PA 15.12.1). Skipped for the signing-time
+        // placeholder, which is not yet a JUMBF box.
+        if let Some(jumbf_len) = c2pa_manifest_jumbf_len(&mut output_stream, manifest_offset) {
+            if manifest_len != jumbf_len {
+                return Err(Error::InvalidAsset(
+                    "C2PA IFD value_count does not match manifest store length".to_string(),
+                ));
+            }
+        }
 
         // figure out count to exclude
         let c2p_entry_pos = last_page_ifd
@@ -3024,7 +3094,10 @@ pub mod tests {
 
     #[test]
     fn test_get_object_location() {
-        let data = "some data";
+        // The C2PA manifest store is always a JUMBF box; get_object_locations
+        // bounds the IFD value_count to that box's length, so use a minimal
+        // valid JUMBF superbox (LBox = 8, TBox = "jumb") as the stored data.
+        let data: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x6a, 0x75, 0x6d, 0x62];
 
         let source = crate::utils::test::fixture_path("TUSCANY.TIF");
 
@@ -3036,12 +3109,12 @@ pub mod tests {
         let tiff_io = TiffIO {};
 
         // save data to tiff
-        tiff_io.save_c2pa_store(&output, data.as_bytes()).unwrap();
+        tiff_io.save_c2pa_store(&output, &data).unwrap();
 
         // read data back
         let loaded = tiff_io.read_cai_store(&output).unwrap();
 
-        assert_eq!(&loaded, data.as_bytes());
+        assert_eq!(loaded.as_slice(), data.as_slice());
 
         let mut success = false;
         let mut output_reader = std::fs::File::open(&output).unwrap();
@@ -3053,7 +3126,7 @@ pub mod tests {
                     let mut manifests_buf: Vec<u8> = vec![0u8; usize::try_from(op.length).unwrap()];
                     of.seek(SeekFrom::Start(op.offset)).unwrap();
                     of.read_exact(manifests_buf.as_mut_slice()).unwrap();
-                    if crate::hash_utils::vec_compare(&manifests_buf, data.as_bytes()) {
+                    if crate::hash_utils::vec_compare(&manifests_buf, &data) {
                         success = true;
                     }
                 }
@@ -3320,6 +3393,118 @@ pub mod tests {
         cloner
             .clone_image_data(&mut ifd, &mut asset_reader)
             .expect("valid strip byte counts should copy successfully");
+    }
+
+    // Regression: entries individually within file size but summing over it must be rejected.
+    #[test]
+    fn clone_ifd_entries_rejects_cumulative_amplification() {
+        let file_size = 1000u64;
+        let mut asset_reader = Cursor::new(vec![0xaau8; file_size as usize]);
+
+        let mut entries: BTreeMap<u16, IfdEntry> = BTreeMap::new();
+        for tag in 0..2u16 {
+            entries.insert(
+                tag,
+                IfdEntry {
+                    entry_tag: tag,
+                    entry_type: IFDEntryType::Byte as u16,
+                    value_count: 600, // fits alone (600 <= 1000) but 2x600 > 1000
+                    value_offset: 0,
+                },
+            );
+        }
+
+        let writer = Cursor::new(Vec::<u8>::new());
+        let mut cloner = TiffCloner::new(Endianness::Little, false, writer).unwrap();
+        let result = cloner.clone_ifd_entries(&entries, &mut asset_reader);
+
+        match result {
+            Err(Error::InvalidAsset(msg)) => {
+                assert!(
+                    msg.contains("IFD entry") && msg.contains("exceed"),
+                    "unexpected error message: {msg}",
+                );
+            }
+            Err(other) => panic!("expected InvalidAsset, got other error: {other}"),
+            Ok(_) => panic!("expected InvalidAsset for cumulative IFD entry amplification"),
+        }
+    }
+
+    // Happy path: entries summing to <= file size must still clone successfully.
+    #[test]
+    fn clone_ifd_entries_accepts_valid_cumulative_size() {
+        let file_size = 1000u64;
+        let mut asset_reader = Cursor::new(vec![0xaau8; file_size as usize]);
+
+        let mut entries: BTreeMap<u16, IfdEntry> = BTreeMap::new();
+        for tag in 0..2u16 {
+            entries.insert(
+                tag,
+                IfdEntry {
+                    entry_tag: tag,
+                    entry_type: IFDEntryType::Byte as u16,
+                    value_count: 400, // 2x400 = 800 <= 1000
+                    value_offset: 0,
+                },
+            );
+        }
+
+        let writer = Cursor::new(Vec::<u8>::new());
+        let mut cloner = TiffCloner::new(Endianness::Little, false, writer).unwrap();
+        cloner
+            .clone_ifd_entries(&entries, &mut asset_reader)
+            .expect("valid cumulative IFD entry sizes should clone successfully");
+    }
+
+    // The cumulative bound must hold for every element-type branch, not just Byte.
+    // For each type, two entries that each fit the file but together exceed it must
+    // be rejected -- exercising accumulate_copy_len (and, for 8-byte types, the
+    // added per-entry check) in the Short/Long/Sshort/Slong/Float/8-byte branches.
+    #[test]
+    fn clone_ifd_entries_cumulative_bound_covers_all_types() {
+        let file_size = 40u64;
+        // (entry_type discriminant, per-entry value_count, label): each entry's byte
+        // size is 24 (<= 40, fits alone), two entries sum to 48 (> 40, rejected).
+        let cases: [(u16, u64, &str); 6] = [
+            (IFDEntryType::Short as u16, 12, "Short"),
+            (IFDEntryType::Long as u16, 6, "Long"),
+            (IFDEntryType::Sshort as u16, 12, "Sshort"),
+            (IFDEntryType::Slong as u16, 6, "Slong"),
+            (IFDEntryType::Float as u16, 6, "Float"),
+            (IFDEntryType::Double as u16, 3, "Double"),
+        ];
+
+        for (entry_type, value_count, label) in cases {
+            let mut asset_reader = Cursor::new(vec![0xaau8; file_size as usize]);
+            let mut entries: BTreeMap<u16, IfdEntry> = BTreeMap::new();
+            for tag in 0..2u16 {
+                entries.insert(
+                    tag,
+                    IfdEntry {
+                        entry_tag: tag,
+                        entry_type,
+                        value_count,
+                        value_offset: 0,
+                    },
+                );
+            }
+
+            let writer = Cursor::new(Vec::<u8>::new());
+            let mut cloner = TiffCloner::new(Endianness::Little, false, writer).unwrap();
+
+            // Map to a message so the assert doesn't require Debug on the Ok map:
+            // Ok -> empty (fails), a different error -> its text (fails), the
+            // expected InvalidAsset -> its message (passes the contains check).
+            let msg = match cloner.clone_ifd_entries(&entries, &mut asset_reader) {
+                Err(Error::InvalidAsset(msg)) => msg,
+                Err(other) => other.to_string(),
+                Ok(_) => String::new(),
+            };
+            assert!(
+                msg.contains("IFD entry") && msg.contains("exceed"),
+                "type {label}: expected cumulative rejection, got message {msg:?}",
+            );
+        }
     }
 
     // Unit test for the shared cap helper used by the strip, tile, and BigTable

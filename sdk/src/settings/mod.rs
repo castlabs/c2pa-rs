@@ -35,6 +35,11 @@ use crate::{
 
 const VERSION: u32 = 1;
 
+/// The newer `trust.anchors` field and the deprecated `trust.trust_anchors` /
+/// `trust.user_anchors` fields, as extracted from an overlay JSON value by
+/// [`Settings::take_trust_anchor_overlay_fields`].
+type LegacyTrustAnchorFields = (Option<Vec<TrustAnchor>>, Option<String>, Option<String>);
+
 /// Maximum recursion depth for JSON merging.
 const MERGE_MAX_DEPTH: usize = 64;
 
@@ -145,7 +150,8 @@ pub struct TrustAnchor {
 
 impl Default for TrustAnchor {
     fn default() -> Self {
-        if cfg!(not(test)) {
+        #[cfg(not(test))]
+        {
             Self {
                 trust_anchors: "".into(),
                 trust_uri: None,
@@ -154,7 +160,9 @@ impl Default for TrustAnchor {
                 allowed_list: None,
                 trusted_ica_issuers: None,
             }
-        } else {
+        }
+        #[cfg(test)]
+        {
             // In unit tests, trust the ICA issuer DIDs used by the bundled CAWG
             // ICA fixtures so the existing ICA validation tests continue to
             // produce `cawg.ica.credential_valid`. In production the allow-list
@@ -432,9 +440,13 @@ pub struct Core {
     ///
     /// The behavior is as follows:
     /// - `None` (default): no host allow-list is applied. Redirect handling is governed
-    ///   independently by [`allow_redirects`] (which rejects redirects to internal addresses).
+    ///   independently by [`allow_redirects`] (which rejects redirects to internal addresses), and
+    ///   the initial request is still rejected if it directly names a link-local/cloud-metadata
+    ///   address (SSRF – <https://github.com/contentauth/c2pa-rs/issues/2430>); see [`allow_redirects`] for the full initial-request policy.
     /// - `Some(vec)` where `vec` is empty, all traffic is blocked.
-    /// - `Some(vec)` with at least one pattern, filtering enabled for only those patterns.
+    /// - `Some(vec)` with at least one pattern, filtering enabled for only those patterns. Setting
+    ///   this takes over the initial-request policy entirely, superseding the default
+    ///   link-local/cloud-metadata guard described above.
     ///
     /// When an allow-list is set it is enforced on every request, including each redirect hop the
     /// SDK follows, so a redirect to a host outside the allow-list is rejected.
@@ -478,14 +490,19 @@ pub struct Core {
     /// - `false`: redirects are not followed at all; a redirect response is surfaced as
     ///   [`HttpResolverError::RedirectDisallowed`].
     ///
-    /// This applies to redirect *targets*, not the initial request: a URL that *directly* names an
-    /// internal host (for example an enterprise OCSP responder on a private address, or a
-    /// `localhost` development server) is still fetched. Use [`allowed_network_hosts`] to restrict
-    /// which hosts may be contacted at all.
+    /// This applies to redirect *targets*, not the initial request. Independently of this setting,
+    /// the initial request is rejected by default when it directly names a link-local or
+    /// cloud-metadata address (e.g. `169.254.169.254`), reported as
+    /// [`HttpResolverError::MetadataOrLinkLocalUriDisallowed`] (SSRF – <https://github.com/contentauth/c2pa-rs/issues/2430>). A URL that
+    /// directly names a loopback or private (RFC 1918) host (for example an enterprise OCSP
+    /// responder on a private address, or a `localhost` development server) is not covered by that
+    /// guard and is still fetched. Use [`allowed_network_hosts`] to restrict which hosts — including
+    /// loopback/private ones — may be contacted at all.
     ///
     /// [`allowed_network_hosts`]: Core::allowed_network_hosts
     /// [`HttpResolverError::RedirectTargetDisallowed`]: crate::http::HttpResolverError::RedirectTargetDisallowed
     /// [`HttpResolverError::RedirectDisallowed`]: crate::http::HttpResolverError::RedirectDisallowed
+    /// [`HttpResolverError::MetadataOrLinkLocalUriDisallowed`]: crate::http::HttpResolverError::MetadataOrLinkLocalUriDisallowed
     pub allow_redirects: bool,
     /// Whether to prefer compressing manifests. This can reduce the size of the manifest. Compressed manifest
     /// are not always possible and will default back to uncompressed if the manifest contains features
@@ -726,15 +743,41 @@ impl Settings {
         note = "Use `Settings::new().with_json(str)` or `Settings::new().with_toml(str)` instead, which do not modify thread-local state. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
     )]
     pub fn from_string(settings_str: &str, format: &str) -> Result<Self> {
-        let overlay = parse_to_value(settings_str, format)?;
+        let mut overlay = parse_to_value(settings_str, format)?;
         let mut merged = SETTINGS.with_borrow(Value::clone);
+
+        // Extract the legacy `trust.trust_anchors` / `trust.user_anchors` fields (and
+        // the newer `trust.anchors`) the same way `with_string()` does, so this
+        // deprecated thread-local path stays consistent with the builder path (#2663).
+        let (new_anchors, legacy_trust_anchors, legacy_user_anchors) =
+            Self::take_trust_anchor_overlay_fields(&mut overlay)?;
+
         merge_json(&mut merged, overlay);
 
-        let settings: Settings =
+        let mut settings: Settings =
             serde_json::from_value(merged.clone()).map_err(|e| Error::BadParam(e.to_string()))?;
         settings.validate()?;
 
+        Self::merge_legacy_trust_anchors(
+            &mut settings,
+            new_anchors,
+            legacy_trust_anchors,
+            legacy_user_anchors,
+        )?;
+
+        // Reflect the migrated `trust` settings back into the raw thread-local value.
+        // The raw value may carry "hidden" fields outside of `trust` that are not
+        // modeled by `Settings`, so only the `trust` subtree is replaced here rather
+        // than overwriting `merged` wholesale.
+        if let Some(obj) = merged.as_object_mut() {
+            obj.insert(
+                "trust".to_string(),
+                serde_json::to_value(&settings.trust)
+                    .map_err(|err| Error::OtherError(Box::new(err)))?,
+            );
+        }
         SETTINGS.set(merged);
+
         Ok(settings)
     }
 
@@ -950,13 +993,37 @@ impl Settings {
     ///
     /// This overlays the parsed configuration on top of the current Settings
     /// instance without touching thread-local state.
-    #[allow(deprecated)]
     fn with_string(&self, settings_str: &str, format: &str) -> Result<Self> {
         let mut overlay = parse_to_value(settings_str, format)?;
         let mut merged =
             serde_json::to_value(self).map_err(|err| Error::OtherError(Box::new(err)))?;
 
-        // remove any trust settings that will be manually merged since merge_json does not handle arrays
+        // Remove any trust anchor settings that will be manually merged since
+        // `merge_json` does not handle arrays.
+        let (new_anchors, legacy_trust_anchors, legacy_user_anchors) =
+            Self::take_trust_anchor_overlay_fields(&mut overlay)?;
+
+        merge_json(&mut merged, overlay);
+
+        let mut settings: Settings =
+            serde_json::from_value(merged).map_err(|err| Error::BadParam(err.to_string()))?;
+        settings.validate()?;
+
+        Self::merge_legacy_trust_anchors(
+            &mut settings,
+            new_anchors,
+            legacy_trust_anchors,
+            legacy_user_anchors,
+        )?;
+
+        Ok(settings)
+    }
+
+    /// Takes the newer `trust.anchors` field and the deprecated
+    /// `trust.trust_anchors` / `trust.user_anchors` fields out of an overlay
+    /// JSON value, removing them from the overlay so that `merge_json` (which
+    /// does not handle arrays) does not clobber the existing values.
+    fn take_trust_anchor_overlay_fields(overlay: &mut Value) -> Result<LegacyTrustAnchorFields> {
         let mut new_anchors = None;
         let mut legacy_trust_anchors = None;
         let mut legacy_user_anchors = None;
@@ -965,29 +1032,23 @@ impl Settings {
             if let Some(trust) = overlay_map.get_mut("trust").and_then(|t| t.as_object_mut()) {
                 if let Some(new_anchors_value) = trust.get_mut("anchors") {
                     let v = new_anchors_value.take();
-                    let na: Option<Vec<TrustAnchor>> = serde_json::from_value(v)
+                    new_anchors = serde_json::from_value(v)
                         .map_err(|err| Error::OtherError(Box::new(err)))?;
-
-                    new_anchors = na;
                 }
 
                 if let Some(trust_anchors_value) = trust.get_mut("trust_anchors") {
                     let v = trust_anchors_value.take();
-                    let ta: Option<String> = serde_json::from_value(v)
+                    legacy_trust_anchors = serde_json::from_value(v)
                         .map_err(|err| Error::OtherError(Box::new(err)))?;
-
-                    legacy_trust_anchors = ta;
                 }
 
                 if let Some(user_anchors_value) = trust.get_mut("user_anchors") {
                     let v = user_anchors_value.take();
-                    let ua: Option<String> = serde_json::from_value(v)
+                    legacy_user_anchors = serde_json::from_value(v)
                         .map_err(|err| Error::OtherError(Box::new(err)))?;
-
-                    legacy_user_anchors = ua;
                 }
 
-                // remove so that these do not override existing values improperly
+                // Remove so that these do not override existing values improperly.
                 if new_anchors.is_some() {
                     trust.remove("anchors");
                 }
@@ -1000,70 +1061,79 @@ impl Settings {
             }
         }
 
-        merge_json(&mut merged, overlay);
+        Ok((new_anchors, legacy_trust_anchors, legacy_user_anchors))
+    }
 
-        let mut settings: Settings =
-            serde_json::from_value(merged).map_err(|err| Error::BadParam(err.to_string()))?;
-        settings.validate()?;
-
-        // merge to legacy anchors and new anchors into current anchors set (deduping)
-        if new_anchors.is_some() || legacy_trust_anchors.is_some() || legacy_user_anchors.is_some()
+    /// Merges the newer `trust.anchors` field and the deprecated
+    /// `trust.trust_anchors` / `trust.user_anchors` fields (as extracted by
+    /// [`Self::take_trust_anchor_overlay_fields`]) into `settings.trust.anchors`,
+    /// deduping and clearing the deprecated fields for backwards compatibility.
+    #[allow(deprecated)]
+    fn merge_legacy_trust_anchors(
+        settings: &mut Settings,
+        new_anchors: Option<Vec<TrustAnchor>>,
+        legacy_trust_anchors: Option<String>,
+        legacy_user_anchors: Option<String>,
+    ) -> Result<()> {
+        if new_anchors.is_none() && legacy_trust_anchors.is_none() && legacy_user_anchors.is_none()
         {
-            let mut unique = HashSet::new();
-
-            // load existing anchors
-            if let Some(existing_anchors) = settings.trust.anchors.take() {
-                unique.extend(existing_anchors);
-            }
-
-            // load new_anchors
-            if let Some(new_anchors) = new_anchors {
-                unique.extend(new_anchors);
-            }
-
-            // load legacy trust_anchors
-            if let Some(ta) = legacy_trust_anchors {
-                test_load_trust(ta.as_bytes())?;
-
-                // add in those anchors to the anchors list for backwards compatibility
-                let a = TrustAnchor {
-                    trust_anchors: ta.clone(),
-                    trust_uri: Some("system_anchors".to_string()),
-                    trust_kind: TrustListKind::Manifest,
-                    trust_config: None,
-                    allowed_list: None,
-                    trusted_ica_issuers: None,
-                };
-                a.validate()?;
-
-                unique.insert(a);
-
-                settings.trust.trust_anchors = None;
-            }
-
-            if let Some(ua) = legacy_user_anchors {
-                test_load_trust(ua.as_bytes())?;
-
-                // add in those anchors to the anchors list for backwards compatibility
-                let a = TrustAnchor {
-                    trust_anchors: ua.clone(),
-                    trust_uri: Some("user_anchors".to_string()),
-                    trust_kind: TrustListKind::Manifest,
-                    trust_config: None,
-                    allowed_list: None,
-                    trusted_ica_issuers: None,
-                };
-                a.validate()?;
-
-                unique.insert(a);
-
-                settings.trust.user_anchors = None;
-            }
-
-            settings.trust.anchors = Some(unique.into_iter().collect());
+            return Ok(());
         }
 
-        Ok(settings)
+        let mut unique = HashSet::new();
+
+        // Load existing anchors.
+        if let Some(existing_anchors) = settings.trust.anchors.take() {
+            unique.extend(existing_anchors);
+        }
+
+        // Load new_anchors.
+        if let Some(new_anchors) = new_anchors {
+            unique.extend(new_anchors);
+        }
+
+        // Load legacy trust_anchors.
+        if let Some(ta) = legacy_trust_anchors {
+            test_load_trust(ta.as_bytes())?;
+
+            // Add in those anchors to the anchors list for backwards compatibility.
+            let a = TrustAnchor {
+                trust_anchors: ta.clone(),
+                trust_uri: Some("system_anchors".to_string()),
+                trust_kind: TrustListKind::Manifest,
+                trust_config: None,
+                allowed_list: None,
+                trusted_ica_issuers: None,
+            };
+            a.validate()?;
+
+            unique.insert(a);
+
+            settings.trust.trust_anchors = None;
+        }
+
+        if let Some(ua) = legacy_user_anchors {
+            test_load_trust(ua.as_bytes())?;
+
+            // Add in those anchors to the anchors list for backwards compatibility.
+            let a = TrustAnchor {
+                trust_anchors: ua.clone(),
+                trust_uri: Some("user_anchors".to_string()),
+                trust_kind: TrustListKind::Manifest,
+                trust_config: None,
+                allowed_list: None,
+                trusted_ica_issuers: None,
+            };
+            a.validate()?;
+
+            unique.insert(a);
+
+            settings.trust.user_anchors = None;
+        }
+
+        settings.trust.anchors = Some(unique.into_iter().collect());
+
+        Ok(())
     }
 
     /// Serializes the thread-local [Settings] into a toml string.
@@ -1965,5 +2035,58 @@ pub mod tests {
             has_system_trust_anchor,
             "Expected system trust anchor to be present"
         );
+    }
+
+    // Regression test for https://github.com/contentauth/c2pa-rs/issues/2663:
+    // the deprecated `Settings::from_string()` thread-local API must migrate
+    // legacy `trust.trust_anchors` / `trust.user_anchors` fields the same way
+    // that `Settings::new().with_json()` does.
+    #[test]
+    #[allow(deprecated)]
+    fn test_from_string_loads_legacy_trust_anchors() {
+        // Some Wasm/WASI test runners execute all tests in a single process without
+        // per-test thread isolation, so the thread-local `SETTINGS` state can carry
+        // over from an earlier test. Start from a clean baseline.
+        reset_default_settings().unwrap();
+
+        let legacy_trust_anchors = r#"{
+                "trust": {
+                    "trust_anchors": "-----BEGIN CERTIFICATE-----\\nMIICEzCCAcWgAwIBAgIUW4fUnS38162x10PCnB8qFsrQuZgwBQYDK2VwMHcxCzAJ\\nBgNVBAYTAlVTMQswCQYDVQQIDAJDQTESMBAGA1UEBwwJU29tZXdoZXJlMRowGAYD\\nVQQKDBFDMlBBIFRlc3QgUm9vdCBDQTEZMBcGA1UECwwQRk9SIFRFU1RJTkdfT05M\\nWTEQMA4GA1UEAwwHUm9vdCBDQTAeFw0yMjA2MTAxODQ2NDFaFw0zMjA2MDcxODQ2\\nNDFaMHcxCzAJBgNVBAYTAlVTMQswCQYDVQQIDAJDQTESMBAGA1UEBwwJU29tZXdo\\nZXJlMRowGAYDVQQKDBFDMlBBIFRlc3QgUm9vdCBDQTEZMBcGA1UECwwQRk9SIFRF\\nU1RJTkdfT05MWTEQMA4GA1UEAwwHUm9vdCBDQTAqMAUGAytlcAMhAGPUgK9q1H3D\\neKMGqLGjTXJSpsrLpe0kpxkaFMe7KUAuo2MwYTAdBgNVHQ4EFgQUXuZWArP1jiRM\\nfgye6ZqRyGupTowwHwYDVR0jBBgwFoAUXuZWArP1jiRMfgye6ZqRyGupTowwDwYD\\nVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAYYwBQYDK2VwA0EA8E79g54u2fUy\\ndfVLPyqKmtjenOUMvVQD7waNbetLY7kvUJZCd5eaDghk30/Q1RaNjiP/2RfA/it8\\nzGxQnM2hCA==\\n-----END CERTIFICATE-----",
+                    "user_anchors": "-----BEGIN CERTIFICATE-----\\n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\\nxPd7wFhjRZHfuWb2cs63xjAGjQ==\\n-----END CERTIFICATE-----"
+                }
+        }"#;
+
+        let settings = Settings::from_string(legacy_trust_anchors, "json").unwrap();
+
+        assert!(
+            settings.trust.anchors.is_some(),
+            "Expected trust anchors to be loaded from legacy fields via from_string()"
+        );
+
+        let anchors = settings.trust.anchors.as_ref().unwrap();
+        assert_eq!(
+            anchors.len(),
+            3,
+            "Expected two trust anchors loaded from legacy fields"
+        );
+
+        let has_user_trust_anchor = anchors
+            .iter()
+            .any(|anchor| anchor.trust_uri.as_deref() == Some("user_anchors"));
+
+        let has_system_trust_anchor = anchors
+            .iter()
+            .any(|anchor| anchor.trust_uri.as_deref() == Some("system_anchors"));
+
+        assert!(
+            has_user_trust_anchor,
+            "Expected user trust anchor to be present"
+        );
+        assert!(
+            has_system_trust_anchor,
+            "Expected system trust anchor to be present"
+        );
+
+        reset_default_settings().unwrap();
     }
 }

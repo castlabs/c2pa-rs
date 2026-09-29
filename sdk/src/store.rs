@@ -14,6 +14,7 @@
 #[cfg(feature = "file_io")]
 use std::path::{Path, PathBuf};
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     io::{Cursor, Read, Seek},
 };
@@ -112,6 +113,7 @@ pub(crate) struct StoreValidationInfo<'a> {
     pub update_manifest_label: Option<String>,    // label of the update manifest if it exists
     pub manifest_store_range: Option<HashRange>, // range of the manifest store in the asset for data hash exclusions
     pub certificate_statuses: HashMap<String, Vec<Vec<u8>>>, // list of certificate status assertions for each serial
+    pub is_embedded: bool, // whether the manifest was read out of the asset being validated, vs. supplied separately (sidecar/remote)
 }
 
 /// A `Store` maintains a list of `Claim` structs.
@@ -1905,7 +1907,10 @@ impl Store {
         context: &Context,
     ) -> Result<StoreValidationInfo<'a>> {
         let io = context.io();
-        let mut svi = StoreValidationInfo::default();
+        let mut svi = StoreValidationInfo {
+            is_embedded: self.embedded,
+            ..Default::default()
+        };
         Store::get_claim_referenced_manifests(claim, self, &mut svi, true, validation_log)?;
 
         // find the manifest with the hash binding
@@ -2030,7 +2035,7 @@ impl Store {
                         let ocsp_ders = svi
                             .certificate_statuses
                             .entry(response.certificate_serial_num)
-                            .or_insert(Vec::new());
+                            .or_default();
                         ocsp_ders.push(response.ocsp_der);
                     }
                 }
@@ -2076,6 +2081,31 @@ impl Store {
             validation_log,
             context,
         )?;
+
+        // Per spec §15.11.3.3.1, any box present at a redacted URI must contain only 0x00
+        // bytes, regardless of its JUMBF type — reject with `assertion.notRedacted` otherwise.
+        // This is driven by the redaction list (not the box type), and is the compensating
+        // control for suppressing the ingredient manifest hash mismatch in `ingredient_checks`:
+        // without it, forged content planted in a redacted slot would surface as a genuine,
+        // hash-unverified assertion.
+        for redacted_uri in &svi.redactions {
+            // A fully removed assertion (resolution fails) is a valid form of redaction;
+            // only a *present* box with non-zero content is a violation.
+            if let Ok(claim_assertion) = store.get_claim_assertion_from_uri(redacted_uri) {
+                if !is_zero(claim_assertion.assertion().data()) {
+                    log_item!(
+                        redacted_uri.clone(),
+                        "redacted assertion data must be zeros or empty",
+                        "verify_store"
+                    )
+                    .validation_status(validation_status::ASSERTION_NOT_REDACTED)
+                    .failure(
+                        validation_log,
+                        Error::OtherError("redacted assertion data must be zeros or empty".into()),
+                    )?;
+                }
+            }
+        }
 
         // keep track of already verified ingredients
         let mut visited = HashSet::new();
@@ -2327,75 +2357,140 @@ impl Store {
     /// Signs an already hashed manifest with dynamic assertion support.
     ///
     /// # Arguments
-    /// * `signer` - The signer to use.
-    /// * `settings` - The settings to use.
+    /// * `context` - The active context with signer and settings.
+    /// * `target_len` - When `Some`, the returned bytes are zero-padded up to
+    ///   this length if the signed jumbf comes out smaller (e.g. because a
+    ///   placeholder over-reserved space for exclusions/assertions that ended
+    ///   up smaller once filled with real content). Pass the length of a
+    ///   previously-embedded placeholder so the composed result is
+    ///   byte-for-byte the same size and can be patched in place. The JUMBF
+    ///   parser honours its own internal length field and ignores trailing
+    ///   padding bytes.
     /// # Returns
     /// * The signed manifest bytes.
     /// # Errors
     /// * Returns an [`Error`] if the placeholder cannot be signed.
-    pub fn sign_manifest(&mut self, signer: &dyn Signer, context: &Context) -> Result<Vec<u8>> {
+    /// * Returns [`Error::BadParam`] if `target_len` is `Some` and the signed
+    ///   jumbf is larger than the placeholder reserved, since the caller can no
+    ///   longer patch it into the pre-allocated space in place.
+    pub fn sign_manifest(
+        &mut self,
+        context: &Context,
+        target_len: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        let signer = context.signer()?;
+        self.sign_manifest_impl(signer, context, target_len, true)
+    }
+
+    /// Signs a store whose dynamic-assertion placeholder slots were already
+    /// reserved with [`Store::add_dynamic_assertion_placeholders`] (Castlabs
+    /// fork, e.g. trusted-VSI init reservation, where the reserved JUMBF length
+    /// is committed before signing).
+    ///
+    /// Unlike [`Store::sign_manifest`], this does not append new placeholder
+    /// slots: every dynamic assertion must match an existing exact reservation
+    /// (resolved in registration order against the last matching slots), so
+    /// the signed store keeps the reserved layout.
+    pub(crate) fn sign_manifest_reserved(
+        &mut self,
+        signer: &dyn Signer,
+        context: &Context,
+        target_len: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        self.sign_manifest_impl(signer, context, target_len, false)
+    }
+
+    fn sign_manifest_impl(
+        &mut self,
+        signer: &dyn Signer,
+        context: &Context,
+        target_len: Option<usize>,
+        reserve_placeholders: bool,
+    ) -> Result<Vec<u8>> {
         let settings = context.settings();
         let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
 
         // if user did not supply a hash
-        if pc.hash_assertions().is_empty() {
+        let hash_assertions = pc.hash_assertions();
+        if hash_assertions.is_empty() {
             return Err(Error::BadParam(
                 "Claim must have a valid hard binding assertion".to_string(),
             ));
         };
 
-        // Write any dynamic assertions exposed by the signer. The caller
-        // (`Builder::sign_embeddable`) reserves matching placeholder slots via
-        // `add_dynamic_assertion_placeholders` before calling this, so the assertion
-        // content replaces those slots in place. This must reuse the same
-        // `dynamic_assertions()` result across the whole operation – draining it on an
-        // earlier call is what silently dropped identity assertions in issue #2055.
-        let dynamic_assertions = signer.dynamic_assertions();
-        if !dynamic_assertions.is_empty() {
-            let preferred_labels: Vec<String> =
-                dynamic_assertions.iter().map(|da| da.label()).collect();
-            self.resolve_dynamic_assertion_labels(&preferred_labels)?;
-
-            let mut preliminary_claim = PartialClaim::default();
-            {
-                for assertion in pc.assertions() {
-                    preliminary_claim.add_assertion(assertion);
-                }
-            }
-
-            // Drop pc before calling write_dynamic_assertions
-            let _ = pc;
-
-            let _modified =
-                self.write_dynamic_assertions(&dynamic_assertions, &mut preliminary_claim)?;
-
-            // Get pc again
-            let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
-            let sig = self.sign_claim(pc, signer, signer.reserve_size(), settings)?;
-
-            let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
-            pc.set_signature_val(sig);
-
-            let jumbf_bytes = self.to_jumbf_internal(signer.reserve_size())?;
-
-            if context.settings().verify.verify_after_sign {
-                self.verify_store_strict(None, context)?;
-            }
-
-            return Ok(jumbf_bytes);
-        }
+        // BMFF mdat Merkle-leaf hashing intentionally grows the signed jumbf
+        // beyond `Builder::placeholder`'s reservation (leaf hashes aren't known
+        // until the real content is hashed), so the caller is responsible for
+        // over-reserving embedding space itself. That's safe for BMFF because
+        // the reserved space is a self-describing `free` box rather than a raw
+        // byte range: `inject_manifest_into_free_box` writes the real manifest
+        // and re-splits whatever's left into a smaller trailing `free` box, so
+        // later box offsets never shift as long as the manifest fits inside the
+        // caller's `free` box. We have no way to see that box's size from here,
+        // so exempt BmffHash bindings from the oversize check below and let
+        // that later patch step be the actual ceiling check; every other hard
+        // binding commits to an exact, reproducible size.
+        let is_bmff_binding = hash_assertions
+            .iter()
+            .any(|ca| ca.assertion().label_root() == BmffHash::LABEL);
 
         context.check_progress(ProgressPhase::Signing, 1, 1)?;
 
-        // No dynamic assertions - sign directly
-        let sig = self.sign_claim(pc, signer, signer.reserve_size(), settings)?;
+        // Reserve placeholder slots for any dynamic assertions exposed by the
+        // signer, then write their real content in place. This must reuse the
+        // same `dynamic_assertions()` result across the whole operation –
+        // draining it on an earlier call is what silently dropped identity
+        // assertions in issue #2055.
+        let dynamic_assertions = signer.dynamic_assertions();
+        let sig = if !dynamic_assertions.is_empty() {
+            if reserve_placeholders {
+                self.add_dynamic_assertion_placeholders(&dynamic_assertions)?;
+            } else {
+                // Fail early with an actionable message if a pre-reserved slot is
+                // missing (write_dynamic_assertions resolves the same slots).
+                let preferred_labels: Vec<String> =
+                    dynamic_assertions.iter().map(|da| da.label()).collect();
+                self.resolve_dynamic_assertion_labels(&preferred_labels)?;
+            }
+
+            let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+            let mut preliminary_claim = PartialClaim::default();
+            for assertion in pc.assertions() {
+                preliminary_claim.add_assertion(assertion);
+            }
+
+            self.write_dynamic_assertions(&dynamic_assertions, &mut preliminary_claim)?;
+
+            // Get pc again: write_dynamic_assertions replaced placeholder content
+            // with the real assertions and cleared cached claim data, so the
+            // claim must be re-fetched before signing.
+            let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+            self.sign_claim(pc, signer, signer.reserve_size(), settings)?
+        } else {
+            // No dynamic assertions - sign directly using the claim fetched above.
+            self.sign_claim(pc, signer, signer.reserve_size(), settings)?
+        };
+
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
         pc.set_signature_val(sig);
 
-        let jumbf_bytes = self.to_jumbf_internal(signer.reserve_size())?;
+        let mut jumbf_bytes = self.to_jumbf_internal(signer.reserve_size())?;
 
         if context.settings().verify.verify_after_sign {
             self.verify_store_strict(None, context)?;
+        }
+
+        if let Some(len) = target_len {
+            match jumbf_bytes.len().cmp(&len) {
+                Ordering::Less => jumbf_bytes.resize(len, 0u8),
+                Ordering::Greater if !is_bmff_binding => {
+                    return Err(Error::BadParam(format!(
+                        "signed jumbf ({} bytes) exceeds placeholder-reserved size ({len} bytes)",
+                        jumbf_bytes.len()
+                    )))
+                }
+                _ => {}
+            }
         }
 
         Ok(jumbf_bytes)
@@ -3190,6 +3285,13 @@ impl Store {
 
                 context.check_progress(ProgressPhase::Embedding, 1, 1)?;
 
+                // Sidecar/remote-only signing doesn't embed the manifest into
+                // output_stream; anything else does.
+                self.embedded = !matches!(
+                    self.provenance_claim().map(|pc| pc.remote_manifest()),
+                    Some(RemoteManifest::SideCar) | Some(RemoteManifest::Remote(_))
+                );
+
                 if context.settings().verify.verify_after_sign {
                     let output_len = stream_len(output_stream)?;
                     let validate_hash = context.settings().verify.verify_after_sign_hash;
@@ -3844,29 +3946,32 @@ impl Store {
                 .failure_no_throw(validation_log, e);
         })?;
 
+        // Known here, before verification runs, so verify_hash_binding can tell an
+        // embedded manifest (this asset's own bytes) from a detached one.
+        let embedded = remote_url.is_none();
         let store = if _sync {
-            Self::from_manifest_data_and_stream(
+            Self::from_manifest_data_and_stream_with_embedded(
                 &manifest_bytes,
                 format,
                 &mut stream,
                 validation_log,
                 context,
+                embedded,
             )
         } else {
-            Self::from_manifest_data_and_stream_async(
+            Self::from_manifest_data_and_stream_with_embedded_async(
                 &manifest_bytes,
                 format,
                 &mut stream,
                 validation_log,
                 context,
+                embedded,
             )
             .await
         };
 
         let mut store = store?;
-        if remote_url.is_none() {
-            store.embedded = true;
-        } else {
+        if !embedded {
             store.remote_url = remote_url;
         }
 
@@ -3878,18 +3983,52 @@ impl Store {
     pub fn from_manifest_data_and_stream(
         c2pa_data: &[u8],
         format: &str,
+        stream: impl Read + Seek + MaybeSend,
+        validation_log: &mut StatusTracker,
+        context: &Context,
+    ) -> Result<Self> {
+        if _sync {
+            Self::from_manifest_data_and_stream_with_embedded(
+                c2pa_data,
+                format,
+                stream,
+                validation_log,
+                context,
+                false,
+            )
+        } else {
+            Self::from_manifest_data_and_stream_with_embedded_async(
+                c2pa_data,
+                format,
+                stream,
+                validation_log,
+                context,
+                false,
+            )
+            .await
+        }
+    }
+
+    /// Load store from a manifest data and stream, marking whether `c2pa_data` was read out
+    /// of `stream` itself (embedded) as opposed to supplied separately (sidecar/remote).
+    #[async_generic]
+    pub(crate) fn from_manifest_data_and_stream_with_embedded(
+        c2pa_data: &[u8],
+        format: &str,
         mut stream: impl Read + Seek + MaybeSend,
         validation_log: &mut StatusTracker,
         context: &Context,
+        embedded: bool,
     ) -> Result<Self> {
         stream.rewind()?;
 
         // First we convert the JUMBF into a usable store.
-        let store = Store::from_jumbf_with_context(c2pa_data, validation_log, context)
+        let mut store = Store::from_jumbf_with_context(c2pa_data, validation_log, context)
             .inspect_err(|e| {
                 log_item!("asset", "error loading file", "load_from_asset")
                     .failure_no_throw(validation_log, e);
             })?;
+        store.embedded = embedded;
 
         if context.settings().verify.verify_after_reading {
             stream.rewind()?;
@@ -6130,11 +6269,17 @@ pub mod tests {
             create_test_streams("unsupported_type.txt");
         let mut report = StatusTracker::default();
         let result = Store::from_stream(format, &mut input_stream, &mut report, &context);
-        assert!(matches!(result, Err(Error::UnsupportedType)));
+        // `unsupported_type.txt` is `.txt`/`text/plain`: unsupported by default, but a real
+        // (unsigned) type once the experimental plain-text handler registers that extension.
+        if cfg!(feature = "unstable_plain_text") {
+            assert!(matches!(result, Err(Error::JumbfNotFound)));
+            assert!(report.has_error(Error::JumbfNotFound));
+        } else {
+            assert!(matches!(result, Err(Error::UnsupportedType)));
+            assert!(report.has_error(Error::UnsupportedType));
+        }
         println!("Error report: {report:?}");
         assert!(!report.logged_items().is_empty());
-
-        assert!(report.has_error(Error::UnsupportedType));
     }
 
     fn make_brotli_bomb_jumbf(decompressed_size: usize) -> Vec<u8> {
@@ -7691,6 +7836,216 @@ pub mod tests {
             .is_none());
     }
 
+    // A URI listed in a claim's `redacted_assertions` must, if any box is still
+    // present at that location, contain only zero bytes regardless of the box's JUMBF type
+    // (spec 2.x §15.11.3.3.1). The honest builder removes the assertion entirely, so we
+    // reproduce the attack by building a legitimately-redacted asset and then injecting a
+    // non-zero CBOR assertion box back into the redacted slot — exactly what an attacker does
+    // by editing the manifest-store bytes (no key required, since redaction suppresses the
+    // ingredient manifest hash mismatch). Before the fix this forged box surfaced as a genuine
+    // assertion with no failures; it must now be rejected with `assertion.notRedacted`.
+    #[test]
+    fn test_forged_content_in_redacted_slot_is_rejected() {
+        use crate::{
+            assertions::C2paReason, claim::ClaimAssertionType, Builder, BuilderIntent, Reader,
+        };
+
+        const TEST_IMAGE: &[u8] = include_bytes!("../tests/fixtures/CA.jpg");
+        const ASSERTION_LABEL: &str = "stds.schema-org.CreativeWork";
+
+        // Read the parent so we can address the assertion we are going to redact.
+        let mut input = Cursor::new(TEST_IMAGE);
+        let parent = Reader::default()
+            .with_stream("image/jpeg", &mut input)
+            .expect("read parent");
+        let parent_manifest_label = parent.active_label().unwrap().to_owned();
+        let redacted_uri = to_assertion_uri(&parent_manifest_label, ASSERTION_LABEL);
+
+        // Produce a normal, spec-compliant redaction of that assertion.
+        let mut builder = Builder::default();
+        builder.set_intent(BuilderIntent::Edit);
+        builder.definition.redactions = Some(vec![redacted_uri.clone()]);
+        let redacted_action = Action::new("c2pa.redacted")
+            .set_reason(C2paReason::PiiPresent)
+            .set_parameter("redacted".to_owned(), redacted_uri.clone())
+            .unwrap();
+        builder.add_action(redacted_action).unwrap();
+
+        let signer = test_signer(SigningAlg::Ps256);
+        let mut output = Cursor::new(Vec::new());
+        builder
+            .sign(signer.as_ref(), "image/jpeg", &mut input, &mut output)
+            .expect("builder sign");
+        output.set_position(0);
+
+        let mut load_report = StatusTracker::default();
+        let mut store =
+            Store::from_stream("image/jpeg", &mut output, &mut load_report, &Context::new())
+                .expect("load store");
+
+        // Baseline: the honest redaction removes the assertion, so nothing sits at the
+        // redacted URI and no notRedacted failure is raised.
+        let mut baseline_report = StatusTracker::default();
+        let _ = Store::verify_store(&store, None, &mut baseline_report, &Context::new());
+        assert!(
+            !baseline_report.has_status(validation_status::ASSERTION_NOT_REDACTED),
+            "a properly redacted (removed) assertion must not raise assertion.notRedacted"
+        );
+
+        // Attack: plant a non-zero CBOR assertion box back into the redacted slot of the
+        // ingredient (parent) manifest. `data()` for this box is non-zero, so the reader must
+        // reject it even though its box type is not the C2PA Redaction UUID placeholder.
+        let alg = store
+            .get_claim(&parent_manifest_label)
+            .expect("parent claim present")
+            .alg()
+            .to_owned();
+        // A small non-zero CBOR map ({"x": 1}); the exact contents don't matter, only that
+        // they are not all-zero.
+        let forged = Assertion::from_data_cbor(ASSERTION_LABEL, &[0xa1, 0x61, 0x78, 0x01]);
+        let forged_hash =
+            Claim::calc_assertion_box_hash(ASSERTION_LABEL, &forged, None, &alg).unwrap();
+        let forged_ca = ClaimAssertion::new(
+            forged,
+            0,
+            &forged_hash,
+            &alg,
+            None,
+            ClaimAssertionType::Created,
+        );
+        store
+            .get_claim_mut(&parent_manifest_label)
+            .expect("parent claim present")
+            .put_assertion_store(forged_ca);
+
+        let mut attack_report = StatusTracker::default();
+        let _ = Store::verify_store(&store, None, &mut attack_report, &Context::new());
+        assert!(
+            attack_report.has_status(validation_status::ASSERTION_NOT_REDACTED),
+            "forged non-zero content at a redacted URI must be rejected with assertion.notRedacted"
+        );
+    }
+
+    // `Reader::with_store` used to independently re-derive `assertion.notRedacted`
+    // from presence alone (no zero check), by comparing the claim's declared redactions
+    // against assertions that failed to resolve. That logic predates the zero-content check
+    // above and had no coverage for a *present* redacted box, so it both missed the forged
+    // case's already-correct failure being logged twice, and false-positived on a validly
+    // zeroed box. Drive the same scenarios through `Reader::with_store` (not just
+    // `Store::verify_store`) to prove that's fixed.
+    #[test]
+    fn test_redacted_slot_content_through_reader() {
+        use crate::{
+            assertions::C2paReason, claim::ClaimAssertionType, Builder, BuilderIntent, Reader,
+        };
+
+        const TEST_IMAGE: &[u8] = include_bytes!("../tests/fixtures/CA.jpg");
+        const ASSERTION_LABEL: &str = "stds.schema-org.CreativeWork";
+
+        // Build a legitimately-redacted asset and return the loaded store plus the label
+        // of the manifest whose assertion was redacted.
+        fn build_redacted_store(image: &[u8]) -> (Store, String) {
+            let mut input = Cursor::new(image);
+            let parent = Reader::default()
+                .with_stream("image/jpeg", &mut input)
+                .expect("read parent");
+            let parent_manifest_label = parent.active_label().unwrap().to_owned();
+            let redacted_uri = to_assertion_uri(&parent_manifest_label, ASSERTION_LABEL);
+
+            let mut builder = Builder::default();
+            builder.set_intent(BuilderIntent::Edit);
+            builder.definition.redactions = Some(vec![redacted_uri.clone()]);
+            let redacted_action = Action::new("c2pa.redacted")
+                .set_reason(C2paReason::PiiPresent)
+                .set_parameter("redacted".to_owned(), redacted_uri)
+                .unwrap();
+            builder.add_action(redacted_action).unwrap();
+
+            let signer = test_signer(SigningAlg::Ps256);
+            let mut output = Cursor::new(Vec::new());
+            builder
+                .sign(signer.as_ref(), "image/jpeg", &mut input, &mut output)
+                .expect("builder sign");
+            output.set_position(0);
+
+            let mut load_report = StatusTracker::default();
+            let store =
+                Store::from_stream("image/jpeg", &mut output, &mut load_report, &Context::new())
+                    .expect("load store");
+            (store, parent_manifest_label)
+        }
+
+        // Replace the redacted slot's (removed) assertion with a present box built from
+        // `assertion`, exactly as an attacker editing the manifest-store bytes would.
+        fn plant_assertion(store: &mut Store, parent_manifest_label: &str, assertion: Assertion) {
+            let alg = store
+                .get_claim(parent_manifest_label)
+                .expect("parent claim present")
+                .alg()
+                .to_owned();
+            let hash =
+                Claim::calc_assertion_box_hash(ASSERTION_LABEL, &assertion, None, &alg).unwrap();
+            let claim_assertion =
+                ClaimAssertion::new(assertion, 0, &hash, &alg, None, ClaimAssertionType::Created);
+            store
+                .get_claim_mut(parent_manifest_label)
+                .expect("parent claim present")
+                .put_assertion_store(claim_assertion);
+        }
+
+        fn count_status(log: &StatusTracker, code: &str) -> usize {
+            log.logged_items()
+                .iter()
+                .filter(|item| item.validation_status.as_deref() == Some(code))
+                .count()
+        }
+
+        // A validly zeroed box left in the redacted slot (the spec's alternative to full
+        // removal) must not be flagged at all: not `assertion.notRedacted` (it *is*
+        // correctly redacted) and not `assertion.missing` (it's present, just empty).
+        {
+            let (mut store, parent_manifest_label) = build_redacted_store(TEST_IMAGE);
+            let zeroed = Assertion::from_data_uuid(ASSERTION_LABEL, C2PA_REDACTION_UUID, &[0u8; 4]);
+            plant_assertion(&mut store, &parent_manifest_label, zeroed);
+
+            let mut validation_log = StatusTracker::default();
+            let _ = Store::verify_store(&store, None, &mut validation_log, &Context::new());
+            let mut reader = Reader::default();
+            let _ = reader.with_store(store, &mut validation_log);
+
+            assert_eq!(
+                count_status(&validation_log, validation_status::ASSERTION_NOT_REDACTED),
+                0,
+                "a present, zeroed redacted box must not raise assertion.notRedacted"
+            );
+            assert_eq!(
+                count_status(&validation_log, validation_status::ASSERTION_MISSING),
+                0,
+                "a present, zeroed redacted box must not be counted as missing"
+            );
+        }
+
+        // A forged, non-zero box in the redacted slot must be rejected exactly once, by
+        // `Store::verify_store`'s zero-content check — not a second time by
+        // `Reader::with_store`'s (now removed) presence-only reconciliation.
+        {
+            let (mut store, parent_manifest_label) = build_redacted_store(TEST_IMAGE);
+            let forged = Assertion::from_data_cbor(ASSERTION_LABEL, &[0xa1, 0x61, 0x78, 0x01]);
+            plant_assertion(&mut store, &parent_manifest_label, forged);
+
+            let mut validation_log = StatusTracker::default();
+            let _ = Store::verify_store(&store, None, &mut validation_log, &Context::new());
+            let mut reader = Reader::default();
+            let _ = reader.with_store(store, &mut validation_log);
+
+            assert_eq!(
+                count_status(&validation_log, validation_status::ASSERTION_NOT_REDACTED),
+                1,
+                "forged non-zero content at a redacted URI must be rejected exactly once"
+            );
+        }
+    }
+
     #[test]
     fn test_claim_decoding() {
         // modify a required field label in the claim - causes failure to read claim from cbor
@@ -8200,7 +8555,7 @@ pub mod tests {
             .add_dynamic_assertion_placeholders(&short_signer.dynamic_assertions())
             .unwrap();
         let error = short_store
-            .sign_manifest(&short_signer, &context)
+            .sign_manifest_reserved(&short_signer, &context, None)
             .expect_err("split signing must reject short dynamic assertion content");
         let message = error.to_string();
         assert!(message.contains(RESERVED_DYNAMIC_LABEL));
@@ -8212,7 +8567,7 @@ pub mod tests {
             .add_dynamic_assertion_placeholders(&exact_signer.dynamic_assertions())
             .unwrap();
         let jumbf = exact_store
-            .sign_manifest(&exact_signer, &context)
+            .sign_manifest_reserved(&exact_signer, &context, None)
             .expect("exact dynamic assertion must preserve direct BoxHash signing");
         let mut report = StatusTracker::default();
         let restored = Store::from_jumbf_with_context(&jumbf, &mut report, &context).unwrap();
@@ -9198,11 +9553,18 @@ pub mod tests {
     }
 
     #[test]
-    fn test_sign_manifest_errors_when_dynamic_placeholders_missing() {
-        // A signer that advertises a dynamic assertion but whose placeholder slot is
-        // never reserved. `sign_manifest` must reject it with an actionable error that
-        // names the offending assertion, rather than the opaque `Error::NotFound` that
-        // `write_dynamic_assertions` would otherwise raise (see issue #2055 review).
+    fn test_sign_manifest_reserves_dynamic_assertion_placeholders_itself() {
+        // A signer that advertises a dynamic assertion, with the caller never
+        // reserving a placeholder slot for it. `sign_manifest` must reserve (and
+        // fill in) that slot itself rather than requiring the caller to call
+        // `add_dynamic_assertion_placeholders` first (see issue #2055 review for
+        // why placeholder slots and real content must come from the same
+        // `dynamic_assertions()` call).
+        #[derive(Serialize)]
+        struct TestAssertion {
+            my_tag: String,
+        }
+
         #[derive(Debug)]
         struct TestDynamicAssertion {}
 
@@ -9212,7 +9574,10 @@ pub mod tests {
             }
 
             fn reserve_size(&self) -> Result<usize> {
-                Ok(64)
+                let assertion = TestAssertion {
+                    my_tag: "some value I will replace".to_string(),
+                };
+                Ok(c2pa_cbor::to_vec(&assertion)?.len())
             }
 
             fn content(
@@ -9221,11 +9586,16 @@ pub mod tests {
                 _size: Option<usize>,
                 _claim: &PartialClaim,
             ) -> Result<DynamicAssertionContent> {
-                Ok(DynamicAssertionContent::Cbor(Vec::new()))
+                let assertion = TestAssertion {
+                    my_tag: "some value I will replace".to_string(),
+                };
+                Ok(DynamicAssertionContent::Cbor(
+                    c2pa_cbor::to_vec(&assertion).unwrap(),
+                ))
             }
         }
 
-        struct DynamicSigner(Box<dyn Signer>);
+        struct DynamicSigner(crate::BoxedSigner);
 
         impl crate::Signer for DynamicSigner {
             fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
@@ -9249,25 +9619,28 @@ pub mod tests {
             }
         }
 
-        let context = crate::context::Context::new();
         let signer = DynamicSigner(test_signer(SigningAlg::Ps256));
+        let context = crate::context::Context::new().with_signer(signer);
 
         let mut store = Store::from_context(&context);
         store.commit_claim(create_test_claim().unwrap()).unwrap();
 
         // Reserve the hard-binding placeholder only – no dynamic-assertion slots.
+        let reserve_size = context.signer().unwrap().reserve_size();
         store
-            .get_data_hashed_manifest_placeholder(Signer::reserve_size(&signer), "jpeg", &context)
+            .get_data_hashed_manifest_placeholder(reserve_size, "jpeg", &context)
             .unwrap();
 
-        let err = store.sign_manifest(&signer, &context).unwrap_err();
-        match err {
-            Error::BadParam(msg) => assert!(
-                msg.contains("com.mycompany.myassertion"),
-                "error should name the assertion missing a placeholder slot: {msg}"
-            ),
-            other => panic!("expected Error::BadParam, got {other:?}"),
-        }
+        let jumbf_bytes = store.sign_manifest(&context, None).unwrap();
+
+        let mut validation_log = StatusTracker::default();
+        let signed_store = Store::from_jumbf(&jumbf_bytes, &mut validation_log).unwrap();
+        let pc = signed_store.provenance_claim().unwrap();
+        assert!(
+            pc.assertion_hashed_uri_from_label("com.mycompany.myassertion")
+                .is_some(),
+            "dynamic assertion should be present in the signed manifest"
+        );
     }
 
     #[test]
@@ -10751,6 +11124,28 @@ pub mod tests {
 
         // The redirect endpoint is hit once; the internal target is never contacted.
         redirect.assert_calls(1);
+    }
+
+    // SSRF via a manifest URL that *directly* names a cloud-metadata address, no redirect involved
+    // (CAI-13326, the residual issue left after CAI-12574 closed the redirect vector).
+    //
+    // Under the DEFAULT policy (no `allowed_network_hosts` configured), the initial request is
+    // still rejected when it directly targets a link-local/cloud-metadata address. No network call
+    // is made at all — the guard rejects before dialing out — so this test needs no mock server.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "fetch_remote_manifests"))]
+    #[test]
+    fn test_remote_manifest_direct_metadata_url_blocked() {
+        let context = Context::new();
+        let result =
+            Store::fetch_remote_manifest("http://169.254.169.254/latest/meta-data/", &context);
+
+        let err =
+            result.expect_err("a direct request to a cloud-metadata address must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("link-local") || msg.contains("cloud-metadata"),
+            "error should explain the blocked link-local/metadata target, got: {msg}"
+        );
     }
 
     // With `allow_redirects = false`, the SDK refuses to follow any redirect at all.

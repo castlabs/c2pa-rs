@@ -42,14 +42,13 @@ use crate::{
         c2pa_action,
         labels::{self, parse_label},
         Action, ActionTemplate, Actions, AssertionMetadata, BmffHash, BoxHash, DataHash,
-        DigitalSourceType, EmbeddedData, ExclusionsMap, MerkleMap, Metadata, SoftwareAgent,
-        SubsetMap, Thumbnail, TimeStamp, User, UserCbor,
+        DigitalSourceType, EmbeddedData, ExclusionsMap, Metadata, SoftwareAgent, Thumbnail,
+        TimeStamp, User, UserCbor,
     },
     claim::Claim,
     context::{Context, ProgressPhase},
     crypto::cose,
     error::{Error, Result},
-    hash_utils::hash_by_alg,
     jumbf::labels::manifest_label_from_uri,
     maybe_send_sync::MaybeSend,
     resource_store::{ResourceRef, ResourceResolver, ResourceStore},
@@ -2973,43 +2972,9 @@ impl Builder {
             let mut bmff_hash = self.find_assertion::<BmffHash>(BmffHash::LABEL)?;
             bmff_hash.set_bmff_version(stored_version);
 
-            // Add in the Merkle leaf hashes that were collected via hash_bmff_mdat_bytes().
-            // We add any remainders (partially filled fixed-size leaves that are unhashed) as the last leaf of the Merkle leaves for that mdat_id.
-            for (mdat_id, remainder) in &self.bmff_hasher.fixed_size_remainder {
-                let fragment_hash = hash_by_alg(self.bmff_hasher.alg.as_str(), remainder, None);
-
-                self.bmff_hasher
-                    .merkle_leaves
-                    .entry(*mdat_id)
-                    .and_modify(|leaves| {
-                        leaves.push((remainder.len() as u64, fragment_hash.clone()))
-                    })
-                    .or_insert(vec![(remainder.len() as u64, fragment_hash)]);
-            }
-
-            // If there are Merkle hashes we need to create a MerkleMap and add it to the BmffHash
-            if !self.bmff_hasher.merkle_leaves.is_empty() {
-                // generate MerkleMaps for the mdat leaves stored in C2paHasher
-                let merkle_maps = MerkleMap::create_mms_from_mdat_leaves(
-                    &self.bmff_hasher.alg,
-                    &self.bmff_hasher.merkle_leaves,
-                    self.bmff_hasher.fixed_size,
-                )?;
-
-                // add required mdat exclusion
-                let mut mdat = ExclusionsMap::new("/mdat".to_owned());
-                let subset_mdat = SubsetMap {
-                    offset: 16,
-                    length: 0,
-                };
-                let subset_mdat_vec = vec![subset_mdat];
-                mdat.subset = Some(subset_mdat_vec);
-
-                bmff_hash.add_exclusions(&mut vec![mdat]);
-
-                // add the MerkleMaps
-                bmff_hash.set_merkle(merkle_maps);
-            }
+            // Fill in real Merkle maps from any leaf hashes collected via
+            // hash_bmff_mdat_bytes(); no-op if that was never called.
+            bmff_hash.add_merkle_maps_from_accumulator(&mut self.bmff_hasher)?;
 
             // gen_hash_from_stream uses the BmffHash's own path-based exclusion list
             // and its own alg field (set when the assertion was created).
@@ -3159,24 +3124,11 @@ impl Builder {
         // Build a fresh store from Builder state (contains the real hash assertions).
         let mut store = self.to_store()?;
 
-        // Add dynamic assertion placeholder slots so sign_manifest() will write them.
-        let signer = self.context().signer()?;
-        let dynamic_assertions = signer.dynamic_assertions();
-        if !dynamic_assertions.is_empty() {
-            store.add_dynamic_assertion_placeholders(&dynamic_assertions)?;
-        }
-
-        let mut jumbf = store.sign_manifest(signer, self.context())?;
-
-        // Mode 1 only: zero-pad the signed JUMBF to match the pre-committed placeholder
-        // size so the composed result is byte-for-byte the same length as the composed
-        // placeholder the caller already embedded.  The JUMBF parser honours its own
-        // internal length field and ignores trailing padding bytes.
-        if let Some(len) = placeholder_jumbf_len {
-            if jumbf.len() < len {
-                jumbf.resize(len, 0u8);
-            }
-        }
+        // sign_manifest() reserves and writes any dynamic assertions itself, and
+        // (Mode 1 only) zero-pads the signed JUMBF to match the pre-committed
+        // placeholder size so the composed result is byte-for-byte the same
+        // length as the composed placeholder the caller already embedded.
+        let jumbf = store.sign_manifest(self.context(), placeholder_jumbf_len)?;
 
         Store::get_composed_manifest(&jumbf, format, self.context())
     }
@@ -5331,6 +5283,185 @@ mod tests {
         assert_eq!(
             manifest_store.active_manifest().unwrap().title().unwrap(),
             "Test_Manifest"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "unstable_structured_text")]
+    fn test_builder_sign_structured_text() {
+        let cases: &[(&str, &[u8])] = &[
+            ("text/markdown", b"# Title\n\nStructured-text body.\n"),
+            ("application/yaml", b"title: Example\nvalue: 1\n"),
+            ("application/toml", b"title = \"Example\"\n"),
+        ];
+
+        for (format, content) in cases {
+            let mut source = Cursor::new(content.to_vec());
+            let mut dest = Cursor::new(Vec::new());
+
+            let mut builder = Builder::default().with_definition(manifest_json()).unwrap();
+            builder
+                .add_ingredient_from_stream(parent_json(), format, &mut source)
+                .unwrap();
+            builder
+                .add_resource("thumbnail.jpg", Cursor::new(TEST_THUMBNAIL))
+                .unwrap();
+
+            let signer = test_signer(SigningAlg::Ps256);
+            builder
+                .sign(signer.as_ref(), format, &mut source, &mut dest)
+                .unwrap();
+
+            dest.rewind().unwrap();
+            let manifest_store = Reader::default().with_stream(format, &mut dest).unwrap();
+            assert_eq!(
+                manifest_store.validation_state(),
+                ValidationState::Trusted,
+                "signed {format} did not validate as Trusted"
+            );
+            assert_eq!(
+                manifest_store.active_manifest().unwrap().title().unwrap(),
+                "Test_Manifest"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "unstable_structured_text")]
+    fn test_tampered_structured_text_fails_validation() {
+        let mut source = Cursor::new(b"# Doc\n\nOriginal TAMPER_ME body.\n".to_vec());
+        let mut dest = Cursor::new(Vec::new());
+
+        let mut builder = Builder::default().with_definition(manifest_json()).unwrap();
+        builder
+            .add_ingredient_from_stream(parent_json(), "text/markdown", &mut source)
+            .unwrap();
+        builder
+            .add_resource("thumbnail.jpg", Cursor::new(TEST_THUMBNAIL))
+            .unwrap();
+        let signer = test_signer(SigningAlg::Ps256);
+        builder
+            .sign(signer.as_ref(), "text/markdown", &mut source, &mut dest)
+            .unwrap();
+
+        // Same-length replacement keeps byte offsets (and the manifest block)
+        // stable, so only the visible content changes.
+        let signed = String::from_utf8(dest.into_inner()).unwrap();
+        let tampered = signed.replace("TAMPER_ME", "tampered!");
+        assert_ne!(tampered, signed, "replacement must change the bytes");
+
+        let mut tampered_stream = Cursor::new(tampered.into_bytes());
+        let manifest_store = Reader::default()
+            .with_stream("text/markdown", &mut tampered_stream)
+            .unwrap();
+        assert_ne!(
+            manifest_store.validation_state(),
+            ValidationState::Trusted,
+            "tampered structured text must not validate as Trusted"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "unstable_plain_text")]
+    fn test_builder_sign_plain_text() {
+        let mut source = Cursor::new(b"Plain text provenance, end to end.\n".to_vec());
+        let mut dest = Cursor::new(Vec::new());
+
+        let mut builder = Builder::default().with_definition(manifest_json()).unwrap();
+        builder
+            .add_ingredient_from_stream(parent_json(), "text/plain", &mut source)
+            .unwrap();
+        builder
+            .add_resource("thumbnail.jpg", Cursor::new(TEST_THUMBNAIL))
+            .unwrap();
+
+        let signer = test_signer(SigningAlg::Ps256);
+        builder
+            .sign(signer.as_ref(), "text/plain", &mut source, &mut dest)
+            .unwrap();
+
+        dest.rewind().unwrap();
+        let manifest_store = Reader::default()
+            .with_stream("text/plain", &mut dest)
+            .unwrap();
+        assert_eq!(
+            manifest_store.validation_state(),
+            ValidationState::Trusted,
+            "signed text/plain did not validate as Trusted"
+        );
+        assert_eq!(
+            manifest_store.active_manifest().unwrap().title().unwrap(),
+            "Test_Manifest"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "unstable_plain_text")]
+    fn test_tampered_plain_text_fails_validation() {
+        let mut source = Cursor::new(b"Original TAMPER_ME body.\n".to_vec());
+        let mut dest = Cursor::new(Vec::new());
+
+        let mut builder = Builder::default().with_definition(manifest_json()).unwrap();
+        builder
+            .add_ingredient_from_stream(parent_json(), "text/plain", &mut source)
+            .unwrap();
+        builder
+            .add_resource("thumbnail.jpg", Cursor::new(TEST_THUMBNAIL))
+            .unwrap();
+        let signer = test_signer(SigningAlg::Ps256);
+        builder
+            .sign(signer.as_ref(), "text/plain", &mut source, &mut dest)
+            .unwrap();
+
+        // Same-length replacement keeps the wrapper's byte offset stable, so only the
+        // visible content changes.
+        let signed = String::from_utf8(dest.into_inner()).unwrap();
+        let tampered = signed.replace("TAMPER_ME", "tampered!");
+        assert_ne!(tampered, signed, "replacement must change the bytes");
+
+        let mut tampered_stream = Cursor::new(tampered.into_bytes());
+        let manifest_store = Reader::default()
+            .with_stream("text/plain", &mut tampered_stream)
+            .unwrap();
+        assert_ne!(
+            manifest_store.validation_state(),
+            ValidationState::Trusted,
+            "tampered plain text must not validate as Trusted"
+        );
+    }
+
+    /// The reason `PlainTextIO::write_cai` normalizes to NFC before embedding: content
+    /// that arrives decomposed (NFD) must still sign and validate as `Trusted`, proving
+    /// the generic raw-byte hash engine agrees with the A.8-mandated NFC hash end to end
+    /// (asset_handlers::plain_text_io has the unit-level version of this argument).
+    #[test]
+    #[cfg(feature = "unstable_plain_text")]
+    fn test_builder_sign_plain_text_nfd_input_validates_trusted() {
+        // "café" written NFD: 'e' + U+0301 combining acute accent, instead of precomposed é.
+        let nfd_source = "cafe\u{0301} notes, decomposed on disk.\n";
+        let mut source = Cursor::new(nfd_source.as_bytes().to_vec());
+        let mut dest = Cursor::new(Vec::new());
+
+        let mut builder = Builder::default().with_definition(manifest_json()).unwrap();
+        builder
+            .add_ingredient_from_stream(parent_json(), "text/plain", &mut source)
+            .unwrap();
+        builder
+            .add_resource("thumbnail.jpg", Cursor::new(TEST_THUMBNAIL))
+            .unwrap();
+        let signer = test_signer(SigningAlg::Ps256);
+        builder
+            .sign(signer.as_ref(), "text/plain", &mut source, &mut dest)
+            .unwrap();
+
+        dest.rewind().unwrap();
+        let manifest_store = Reader::default()
+            .with_stream("text/plain", &mut dest)
+            .unwrap();
+        assert_eq!(
+            manifest_store.validation_state(),
+            ValidationState::Trusted,
+            "NFD-decomposed input must still validate as Trusted"
         );
     }
 

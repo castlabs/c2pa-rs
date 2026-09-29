@@ -383,7 +383,7 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_create_callback_v1(
     };
     let session = ok_or_return_null!(
         TrustedVsiPrehashedSession::from_shared_context_with_callback(
-            context,
+            &context,
             manifest_json,
             config,
             options,
@@ -409,7 +409,7 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_reserve_init_uuid(
 ) -> i64 {
     clear_trusted_vsi_bytes(output);
     ptr_or_return_int!(output);
-    let session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
+    let mut session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
     let format = cstr_or_return_int!(format);
     let reservation = ok_or_return_int!(session.session.reserve_init_uuid(&format));
     write_trusted_vsi_bytes(output, reservation.bytes().to_vec())
@@ -446,7 +446,7 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_finalize_init_uuid(
 ) -> i64 {
     clear_trusted_vsi_bytes(output);
     ptr_or_return_int!(output);
-    let session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
+    let mut session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
     let data = bytes_or_return_int!(data, len, "canonical_bmff_hash");
     let signed = ok_or_return_int!(session.session.finalize_init_uuid(data));
     write_trusted_vsi_bytes(output, signed)
@@ -462,7 +462,7 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_finalize_init_uuid(
 pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_commit_init_uuid(
     session: *mut C2paLiveVideoTrustedVsiSession,
 ) -> c_int {
-    let session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
+    let mut session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
     ok_or_return_int!(session.session.commit_init_uuid());
     0
 }
@@ -486,7 +486,7 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_sign_sig_structure(
 ) -> i64 {
     clear_trusted_vsi_bytes(output);
     ptr_or_return_int!(output);
-    let session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
+    let mut session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
     let data = bytes_or_return_int!(data, len, "sig_structure");
     let signature = ok_or_return_int!(session.session.sign_sig_structure(data, sequence_number));
     write_trusted_vsi_bytes(output, signature)
@@ -515,7 +515,7 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_reserve_media_emsg(
     }
     ptr_or_return_int!(output);
     ptr_or_return_int!(signing_context);
-    let session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
+    let mut session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
     let reservation = ok_or_return_int!(session.session.reserve_media_emsg_at(
         sequence_number,
         iat,
@@ -545,7 +545,7 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_finalize_media_emsg
 ) -> i64 {
     clear_trusted_vsi_bytes(output);
     ptr_or_return_int!(output);
-    let session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
+    let mut session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
     let data = bytes_or_return_int!(data, len, "canonical_bmff_hash");
     let signed = ok_or_return_int!(session.session.finalize_media_emsg(data));
     write_trusted_vsi_bytes(output, signed)
@@ -581,7 +581,7 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_import_state(
     data: *const c_uchar,
     len: usize,
 ) -> c_int {
-    let session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
+    let mut session = deref_mut_or_return_int!(session, C2paLiveVideoTrustedVsiSession);
     let data = bytes_or_return_int!(data, len, "state");
     ok_or_return_int!(session.session.import_state(data));
     0
@@ -777,7 +777,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_create_ed25519(
     let session_key = Ed25519SessionKey::from_bytes(&seed);
     seed.zeroize();
     let signer = ok_or_return_null!(LiveVideoVsiSigner::from_shared_context(
-        context,
+        &context,
         manifest_json,
         session_key,
         kid.to_vec(),
@@ -855,7 +855,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_create_callback(
         user_data: user_data as usize,
     };
     let signer = ok_or_return_null!(LiveVideoVsiSigner::from_shared_context_with_session_signer(
-        context,
+        &context,
         manifest_json,
         config,
         session_signer,
@@ -879,7 +879,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_sign_init_segment(
     format: *const c_char,
     signed_segment: *mut *const c_uchar,
 ) -> i64 {
-    let signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
+    let mut signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
     let init_segment = bytes_or_return_int!(init_segment, init_segment_len, "init_segment");
     let format = cstr_or_return_int!(format);
     ptr_or_return_int!(signed_segment);
@@ -910,7 +910,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_sign_media_segment(
     media_segment_len: usize,
     signed_segment: *mut *const c_uchar,
 ) -> i64 {
-    let signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
+    let mut signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
     let media_segment = bytes_or_return_int!(media_segment, media_segment_len, "media_segment");
     ptr_or_return_int!(signed_segment);
     *signed_segment = std::ptr::null();
@@ -941,7 +941,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_sign_media_segment_at(
     signing_time_unix_seconds: i64,
     signed_segment: *mut *const c_uchar,
 ) -> i64 {
-    let signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
+    let mut signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
     let media_segment = bytes_or_return_int!(media_segment, media_segment_len, "media_segment");
     ptr_or_return_int!(signed_segment);
     *signed_segment = std::ptr::null();
@@ -981,7 +981,7 @@ pub unsafe extern "C" fn c2pa_live_video_vsi_signer_recover(
     previous_media_segment_len: usize,
     format: *const c_char,
 ) -> c_int {
-    let signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
+    let mut signer = deref_mut_or_return_int!(signer, C2paLiveVideoVsiSigner);
     let signed_init_segment = bytes_or_return_int!(
         signed_init_segment,
         signed_init_segment_len,
@@ -1055,13 +1055,10 @@ mod tests {
     use p256::ecdsa::signature::Signer as _;
 
     use super::*;
-    use crate::{
-        c_api::{
-            c2pa_context_builder_build, c2pa_context_builder_new,
-            c2pa_context_builder_set_settings, c2pa_context_builder_set_signer, c2pa_free,
-            c2pa_settings_new, c2pa_settings_set_value, c2pa_signer_from_info, C2paSignerInfo,
-        },
-        validate_pointer,
+    use crate::c_api::{
+        c2pa_context_builder_build, c2pa_context_builder_new, c2pa_context_builder_set_settings,
+        c2pa_context_builder_set_signer, c2pa_free, c2pa_settings_new, c2pa_settings_set_value,
+        c2pa_signer_from_info, C2paSignerInfo,
     };
 
     macro_rules! fixture_path {
@@ -2154,7 +2151,8 @@ mod tests {
                 &mut signed_init,
             );
             assert!(init_len > 0);
-            assert!(validate_pointer::<Box<[u8]>>(signed_init.cast_mut().cast()).is_ok());
+            // Tracked-buffer ownership is asserted by the c2pa_free(..) == 0 checks below.
+            assert!(!signed_init.is_null());
 
             assert_eq!(
                 c2pa_live_video_vsi_signer_active_manifest_id(live, &mut manifest_id),
@@ -2173,7 +2171,7 @@ mod tests {
                 &mut signed_media,
             );
             assert!(media_len > media.len() as i64);
-            assert!(validate_pointer::<Box<[u8]>>(signed_media.cast_mut().cast()).is_ok());
+            assert!(!signed_media.is_null());
             assert_eq!(
                 c2pa_live_video_vsi_signer_next_sequence_number(live, &mut next),
                 0

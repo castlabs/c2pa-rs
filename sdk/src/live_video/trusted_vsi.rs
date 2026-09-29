@@ -1159,7 +1159,7 @@ impl TrustedVsiPrehashedSession {
         }
 
         let signer = self.context.signer()?;
-        let jumbf = store.sign_manifest(signer, &self.context)?;
+        let jumbf = store.sign_manifest_reserved(signer, &self.context, None)?;
         if !self.context.settings().verify.verify_after_sign {
             store.verify_store_strict(None, &self.context)?;
         }
