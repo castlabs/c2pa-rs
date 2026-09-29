@@ -40,6 +40,7 @@ pub trait CredentialHolder {
     /// with the actual signer payload to calculate its available capacity.
     ///
     /// [`sign`]: Self::sign
+    /// [`Error::BadParam`]: crate::Error::BadParam
     fn reserve_size(&self) -> usize;
 
     /// Signs the [`SignerPayload`] data structure on behalf of the credential
@@ -75,6 +76,7 @@ pub trait AsyncCredentialHolder: MaybeSync + MaybeSend {
     /// with the actual signer payload to calculate the signature capacity.
     ///
     /// [`sign`]: Self::sign
+    /// [`Error::BadParam`]: crate::Error::BadParam
     fn reserve_size(&self) -> usize;
 
     /// Signs the [`SignerPayload`] data structure on behalf of the credential

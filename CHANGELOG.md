@@ -31,6 +31,7 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 ### Fixed
 
 * Preserve each TFRA entry's fragment target when inserting, resizing, or removing BMFF metadata. Offset adjustment now rejects unsupported TFRA versions instead of interpreting them as version 0. Previously corrupted TFRA tables are not repaired.
+* Generate fragment Merkle bindings when embedding manifests in supported single-track, single-file fragmented MP4 assets. Unsupported addressing, multiplexed layouts, and detached fragment signing fail explicitly; existing Merkle-bound files require an update manifest instead of ordinary re-signing.
 
 ## [0.89.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.2...c2pa-v0.89.3)
 _13 July 2026_

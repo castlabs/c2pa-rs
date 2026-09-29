@@ -389,6 +389,9 @@ fn finalize_identity_assertion(
     // TO DO: Think through how errors map into crate::Error.
 
     if let Some(assertion_size) = size {
+        // Castlabs fork: the exact-fill padding below handles any non-negative
+        // gap without underflow (checked arithmetic), so upstream's 15-byte
+        // minimum (#2697) is not required here.
         if assertion_cbor.len() > assertion_size {
             // TO DO: Think about how to signal this in such a way that
             // the AsyncCredentialHolder implementor understands the problem.
@@ -474,7 +477,7 @@ mod tests {
                 manifest_json, parent_json, NaiveAsyncCredentialHolder, NaiveCredentialHolder,
                 NaiveSignatureVerifier,
             },
-            IdentityAssertion, ToCredentialSummary,
+            IdentityAssertion, SignerPayload, ToCredentialSummary,
         },
         status_tracker::StatusTracker,
         Builder, HashedUri, Reader, SigningAlg,
@@ -727,5 +730,51 @@ mod tests {
         assert!(!explicit_instance
             .iter()
             .any(|url| url.ends_with("/c2pa.soft-binding__2")));
+    }
+
+    /// Reserve sizes smaller than the unpadded assertion are rejected with
+    /// `BadParam` (never a panic/underflow). Castlabs fork: the exact-fill
+    /// padding algorithm fills any gap >= 0, so upstream's fixed 15-byte
+    /// padding minimum (#2697) does not apply; small gaps must fill exactly.
+    #[test]
+    fn rejects_reserve_size_that_is_too_small() {
+        use super::{finalize_identity_assertion, DynamicAssertionContent};
+
+        let signer_payload = SignerPayload {
+            referenced_assertions: vec![],
+            sig_type: "INVALID.identity.naive_credential".to_owned(),
+            roles: vec![],
+        };
+
+        let DynamicAssertionContent::Cbor(unpadded) =
+            finalize_identity_assertion(signer_payload.clone(), None, Ok(vec![])).unwrap()
+        else {
+            panic!("expected CBOR content");
+        };
+        let unpadded_len = unpadded.len();
+
+        for size in [0usize, 1, unpadded_len - 1] {
+            match finalize_identity_assertion(signer_payload.clone(), Some(size), Ok(vec![])) {
+                Err(crate::Error::BadParam(_)) => {}
+                Err(e) => panic!("expected BadParam, got {e:?}"),
+                Ok(_) => panic!("a reserve size that is too small must be rejected"),
+            }
+        }
+
+        for size in [
+            unpadded_len,
+            unpadded_len + 1,
+            unpadded_len + 14,
+            unpadded_len + 15,
+            unpadded_len + 24,
+        ] {
+            let DynamicAssertionContent::Cbor(padded) =
+                finalize_identity_assertion(signer_payload.clone(), Some(size), Ok(vec![]))
+                    .unwrap_or_else(|e| panic!("reserve size {size} should fill exactly: {e:?}"))
+            else {
+                panic!("expected CBOR content");
+            };
+            assert_eq!(padded.len(), size);
+        }
     }
 }
