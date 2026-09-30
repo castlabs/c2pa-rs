@@ -108,6 +108,37 @@ Not an ancestor (the same change arrived as different commits via #16/#17/#18/#1
   passed; qualification support 22 passed; generated C11 header/prototypes,
   trusted capability mask 63, and formatting passed. The debug library SHA-256
   is `dc79e81a084fc7b25e12423539b137f24d69693da46cb0166cb04538bd5589f9`.
-- These are local Linux tests, not Windows/release qualification. The seven
-  candidate merges remain on an unpushed local consolidation branch pending
-  independent review of `c_api.rs`, `store.rs`, and `bmff_hash.rs`.
+- The seven candidate merges were independently reviewed and published as
+  `feat/trusted-vsi-functional` @`5c186c07`; Castlabs live-video qualification
+  run 36659887610 passed on Linux and Windows.
+
+## ContentAuth main @69907b5a
+
+True merge (`--no-ff`) of `contentauth/c2pa-rs` `main` @`69907b5a` into
+`5c186c07`. Merge base `d589cf7e`; seven upstream commits: #2713, #2695, #2688,
+#2658, #2686, #2702, #2746. Upstream changed no Cargo manifest, `Cargo.lock`,
+`c2pa_c_ffi` source or header, so the FFI exports, workspace version
+`0.92.0-dev`, MSRV 1.96.0 and `c2pa_cbor` 0.78.0 are unchanged.
+
+- sdk/src/claim.rs (only conflict, comment-only): the fork already carried the
+  #2746 serialization change; kept the fork's explanatory comment above the
+  identical `spec_version` code. Upstream's round-trip tests merge alongside the
+  fork's duplicate-CGI-version test.
+- #2702 (auto-merged, sdk/src/assertions/bmff_hash.rs): sequential Merkle proof
+  locations are now required on the single-file fragmented, timed-media and
+  mdat verification paths. The fork's single-file and ladder producers emit
+  `location = 0..n` in physical order, Merkle id normalization and tfra/moof
+  offset adjustment do not change locations, and per-segment/live-VSI
+  verification (`verify_stream_segment(s)`) is not affected.
+- #2688 (auto-merged, sdk/src/crypto/cose/ocsp.rs): live OCSP responder
+  certificates are checked with `CertificateTrustPolicy::check_certificate_trust`.
+  In this fork that entry point is scoped to `TrustListKind::Manifest` (trust
+  anchor purpose isolation), whereas upstream checks all anchors. A responder
+  that chains only to a TSA or CAWG anchor is therefore not trusted here. This
+  is intended: OCSP responders vouch for manifest signing certificates.
+- #2686 / #2713 (auto-merged, validation_results.rs, signer_payload.rs):
+  unreferenced claims are ignored when reconciling statuses, and CAWG signer
+  payload mismatches are logged through the status tracker
+  (`cawg.identity.assertion.mismatch`) rather than returned early, except under
+  stop-on-first-error.
+

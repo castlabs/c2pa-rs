@@ -2037,8 +2037,8 @@ impl Claim {
         let sign1 = parse_cose_sign1(sig, data, validation_log)?;
 
         let certificate_serial_num = get_signing_cert_serial_num(&sign1)?.to_string();
-        // check certificate revocation
-        if _sync {
+        // check certificate revocation (revocation/trust failures are already recorded in validation_log)
+        let ocsp_result = if _sync {
             check_ocsp_status(
                 &sign1,
                 data,
@@ -2047,7 +2047,7 @@ impl Claim {
                 svi.timestamps.get(claim.label()),
                 validation_log,
                 context,
-            )?;
+            )
         } else {
             check_ocsp_status_async(
                 &sign1,
@@ -2058,7 +2058,13 @@ impl Claim {
                 validation_log,
                 context,
             )
-            .await?;
+            .await
+        };
+        if let Err(err) = ocsp_result {
+            if !matches!(err, Error::CertificateTrustError(_)) {
+                validation_log.pop_current_uri();
+                return Err(err);
+            }
         }
 
         context.check_progress(ProgressPhase::VerifyingSignature, 1, 1)?;
@@ -5690,6 +5696,47 @@ pub mod tests {
         claim.add_claim_generator_info(cgi);
 
         assert_eq!(claim.spec_version().map(|s| s.as_str()), Some("2.4.0"));
+    }
+
+    #[test]
+    fn test_spec_version_in_claim_generator_info_round_trips() {
+        let mut claim = Claim::new("test", Some("test"), 2);
+        let mut cgi = ClaimGeneratorInfo::new("test app");
+        cgi.set_spec_version("2.4.0");
+        claim.add_claim_generator_info(cgi);
+
+        let data = claim.data().unwrap();
+        let decoded = Claim::from_data("test", &data).unwrap();
+        assert_eq!(decoded.spec_version().map(|s| s.as_str()), Some("2.4.0"));
+
+        let value: c2pa_cbor::Value = c2pa_cbor::from_slice(&data).unwrap();
+        assert!(matches!(
+            &value,
+            c2pa_cbor::Value::Map(map) if !map
+                .keys()
+                .any(|k| matches!(k, c2pa_cbor::Value::Text(t) if t == SPEC_VERSION_F))
+        ));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_legacy_claim_level_spec_version_round_trips() {
+        // legacy callers that set the claim-level specVersion field directly
+        let mut claim = Claim::new("test", Some("test"), 2);
+        claim.add_claim_generator_info(ClaimGeneratorInfo::new("test app"));
+        claim.set_spec_version(Some("2.3".to_owned()));
+
+        let data = claim.data().unwrap();
+        let decoded = Claim::from_data("test", &data).unwrap();
+        assert_eq!(decoded.spec_version.as_deref(), Some("2.3"));
+
+        let value: c2pa_cbor::Value = c2pa_cbor::from_slice(&data).unwrap();
+        assert!(matches!(
+            &value,
+            c2pa_cbor::Value::Map(map) if map
+                .keys()
+                .any(|k| matches!(k, c2pa_cbor::Value::Text(t) if t == SPEC_VERSION_F))
+        ));
     }
 
     #[test]
