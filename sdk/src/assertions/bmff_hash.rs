@@ -70,6 +70,10 @@ const ASSERTION_CREATION_VERSION: usize = 3;
 #[cfg(test)]
 #[path = "single_file_bmff_tests.rs"]
 mod single_file_bmff_tests;
+#[cfg(test)]
+#[cfg(feature = "file_io")]
+#[path = "single_file_ladder_tests.rs"]
+mod single_file_ladder_tests;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct UserHashInfo {
@@ -1205,6 +1209,99 @@ impl BmffHash {
         max_leaves: usize,
         unique_id: usize,
     ) -> crate::Result<Option<Vec<Vec<u8>>>> {
+        let Some((map, uuids)) = self.single_file_merkle_layout(reader, max_leaves, unique_id)?
+        else {
+            return Ok(None);
+        };
+        self.hash = None;
+        self.bmff_version = 3;
+        self.merkle = Some(vec![map]);
+        Ok(Some(uuids))
+    }
+
+    /// Reserve one rendition of an ABR ladder inside the shared assertion.
+    ///
+    /// Every rendition of a ladder is its own single-file fragmented asset with
+    /// its own bytes, so each one gets its own `MerkleMap` -- its own `initHash`
+    /// and its own leaf row -- in the single `c2pa.hash.bmff.v3` assertion the
+    /// shared claim carries. `unique_id` is the rendition's position in the
+    /// ladder and maps must be appended in that order, because `uniqueId` is the
+    /// only thing that tells them apart: splitting a multiplexed source
+    /// renumbers every track to 1, so a real ladder has the same `localId`
+    /// everywhere. Validation picks the map back out with `select_merkle_maps`.
+    ///
+    /// Unlike [`Self::prepare_single_file_merkle`], a rendition that is not a
+    /// single-file fragmented asset is an error rather than a fall-back to mdat
+    /// chunk hashing: a ladder whose rungs are bound in different ways is not
+    /// something the reader can select between.
+    #[cfg(feature = "file_io")]
+    pub(crate) fn add_single_file_rendition(
+        &mut self,
+        reader: &mut dyn CAIRead,
+        max_leaves: usize,
+        unique_id: usize,
+    ) -> crate::Result<Vec<Vec<u8>>> {
+        // 1-based, matching the multi-file writer (the spec's CDDL comment
+        // calls the id 1-based; that comment is non-normative).
+        let expected = self.merkle.as_ref().map_or(0, |maps| maps.len()) + 1;
+        if unique_id != expected {
+            return Err(Error::BadParam(format!(
+                "ladder renditions must be numbered in order: expected uniqueId {expected}, got {unique_id}"
+            )));
+        }
+        // A rendition that already carries a manifest would have that
+        // provenance replaced with no parent ingredient to say so; re-signing
+        // is not something a ladder does. (Existing Merkle boxes are refused
+        // by the layout below, but a whole-file binding has none.)
+        let existing = read_bmff_c2pa_boxes(reader)?;
+        if existing.manifest_box_offset.is_some() || existing.manifest_bytes.is_some() {
+            return Err(Error::BadParam(format!(
+                "rendition {unique_id} already carries a C2PA manifest; ladder signing does not re-sign an asset"
+            )));
+        }
+        let Some((map, uuids)) = self.single_file_merkle_layout(reader, max_leaves, unique_id)?
+        else {
+            return Err(Error::BadParam(format!(
+                "rendition {unique_id} is not a single-file fragmented BMFF; every rendition of a ladder must carry its own moov and moof boxes"
+            )));
+        };
+        // The whole assertion rides in the manifest that every rendition
+        // embeds, so the ladder's leaf rows share the one-map memory limit.
+        let leaves: u64 = self
+            .merkle
+            .iter()
+            .flatten()
+            .chain(std::iter::once(&map))
+            .map(|m| {
+                m.hashes
+                    .0
+                    .iter()
+                    .map(|h| h.len() as u64)
+                    .fold(0u64, u64::saturating_add)
+            })
+            .fold(0u64, u64::saturating_add);
+        if leaves > MAX_MERKLE_LEAVES_SIZE {
+            return Err(Error::BadParam(
+                "ladder fragment Merkle maps exceed memory limit".into(),
+            ));
+        }
+        self.hash = None;
+        self.bmff_version = 3;
+        self.merkle.get_or_insert_with(Vec::new).push(map);
+        Ok(uuids)
+    }
+
+    /// Lay out the leaf row and the per-fragment UUID boxes for one asset
+    /// without touching the assertion.
+    ///
+    /// Returns `None` when the asset is not single-file fragmented, which is a
+    /// caller's signal to bind it some other way.
+    fn single_file_merkle_layout(
+        &self,
+        reader: &mut dyn CAIRead,
+        max_leaves: usize,
+        unique_id: usize,
+    ) -> crate::Result<Option<(MerkleMap, Vec<Vec<u8>>)>> {
         let boxes = read_bmff_c2pa_boxes(reader)?;
         if !boxes.box_infos.iter().any(|b| b.path == "moov")
             || !boxes.box_infos.iter().any(|b| b.path == "moof")
@@ -1274,9 +1371,7 @@ impl BmffHash {
             uuids.push(uuid);
         }
         let placeholder = ByteBuf::from(vec![0; hash_size as usize]);
-        self.hash = None;
-        self.bmff_version = 3;
-        self.merkle = Some(vec![MerkleMap {
+        let map = MerkleMap {
             unique_id,
             local_id,
             count: fragments.len(),
@@ -1285,13 +1380,17 @@ impl BmffHash {
             hashes: VecByteBuf(vec![placeholder; fragments.len()]),
             fixed_block_size: None,
             variable_block_sizes: None,
-        }]);
-        Ok(Some(uuids))
+        };
+        Ok(Some((map, uuids)))
     }
 
+    /// Fill in the `initHash` and the leaf row of one rendition's map, reading
+    /// that rendition's own signed bytes. `unique_id` selects the map; a lone
+    /// asset uses [`SINGLE_RENDITION_ID`].
     pub(crate) fn finalize_single_file_merkle<F>(
         &mut self,
         reader: &mut dyn CAIRead,
+        unique_id: usize,
         progress: &mut F,
     ) -> crate::Result<()>
     where
@@ -1304,7 +1403,7 @@ impl BmffHash {
         let map = self
             .merkle
             .as_mut()
-            .and_then(|maps| maps.first_mut())
+            .and_then(|maps| maps.iter_mut().find(|m| m.unique_id == unique_id))
             .ok_or_else(|| Error::BadParam("missing fragment Merkle map".into()))?;
         if fragments.len() != map.count || boxes.bmff_merkle.len() != map.count {
             return Err(Error::BadParam(

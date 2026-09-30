@@ -30,7 +30,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["openssl", "default_http"]
 add_thumbnails = ["image"]
-file_io = []
+file_io = ["dep:same-file"]
 fetch_remote_manifests = ["dep:wasi"]
 json_schema = ["dep:schemars"]
 openssl = [
@@ -117,6 +117,7 @@ der = { version = "0.7.9", features = ["alloc"] }
 extfmt = "0.2.0"
 getrandom = { version = "0.3.4", default-features = false, features = ["std"] }
 glob = "0.3.1"
+same-file = { version = "1.0.6", optional = true }
 ecdsa = { version = "0.16.9", features = ["digest", "sha2"], optional = true }
 ed25519-dalek = { version = "2.1.1", features = [
     "alloc",
