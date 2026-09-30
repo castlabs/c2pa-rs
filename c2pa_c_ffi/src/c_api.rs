@@ -5872,15 +5872,22 @@ mod tests {
         let reader =
             unsafe { c2pa_reader_with_stream(reader, format.as_ptr(), dest_stream.as_ptr()) };
         assert!(!reader.is_null());
-        let manifest = unsafe { &*reader }.active_manifest().unwrap();
-        let assertions: Vec<_> = manifest
-            .assertions()
-            .iter()
-            .filter(|assertion| assertion.label() == "com.example.dynamic")
-            .collect();
+        // Handles are opaque ids (#2559): check the reader out instead of
+        // dereferencing the handle, and release it before c2pa_free.
+        let assertions: Vec<serde_json::Value> = {
+            let reader = checkout_exclusive::<C2paReader>(reader).unwrap();
+            reader
+                .active_manifest()
+                .unwrap()
+                .assertions()
+                .iter()
+                .filter(|assertion| assertion.label() == "com.example.dynamic")
+                .map(|assertion| assertion.value().unwrap().clone())
+                .collect()
+        };
         assert_eq!(assertions.len(), 2);
-        assert_eq!(assertions[0].value().unwrap()["id"], "a".repeat(58));
-        assert_eq!(assertions[1].value().unwrap()["id"], "b".repeat(58));
+        assert_eq!(assertions[0]["id"], "a".repeat(58));
+        assert_eq!(assertions[1]["id"], "b".repeat(58));
 
         let first_invocations = first_state.invocations.lock().unwrap();
         let second_invocations = second_state.invocations.lock().unwrap();
@@ -6008,7 +6015,9 @@ mod tests {
             0
         );
 
-        let dynamic_assertions = unsafe { &*signer }.dynamic_assertions();
+        let dynamic_assertions = checkout_exclusive::<C2paSigner>(signer)
+            .unwrap()
+            .dynamic_assertions();
         let error = dynamic_assertions[0]
             .content("com.example.error", Some(8), &PartialClaim::default())
             .err()
@@ -6122,7 +6131,10 @@ mod tests {
             )
         };
         assert!(!signer.is_null());
-        let error = unsafe { &*signer }.sign(b"test").unwrap_err();
+        let error = checkout_exclusive::<C2paSigner>(signer)
+            .unwrap()
+            .sign(b"test")
+            .unwrap_err();
         assert!(error.to_string().contains("exceeding output capacity 8"));
         unsafe { c2pa_free(signer as *mut c_void) };
     }
@@ -6893,13 +6905,16 @@ verify_after_sign = true
             "context reader failed: {:?}",
             CimplError::last_message()
         );
-        assert_eq!(unsafe { &*reader }.validation_status(), None);
-        assert!(unsafe { &*reader }
-            .active_manifest()
-            .unwrap()
-            .assertions()
-            .iter()
-            .any(|assertion| assertion.label() == "com.example.fragmented"));
+        {
+            let reader = checkout_exclusive::<C2paReader>(reader).unwrap();
+            assert_eq!(reader.validation_status(), None);
+            assert!(reader
+                .active_manifest()
+                .unwrap()
+                .assertions()
+                .iter()
+                .any(|assertion| assertion.label() == "com.example.fragmented"));
+        }
         assert_eq!(unsafe { c2pa_free(reader as *const c_void) }, 0);
 
         assert_eq!(
@@ -6918,7 +6933,12 @@ verify_after_sign = true
             "legacy reader failed: {:?}",
             CimplError::last_message()
         );
-        assert_eq!(unsafe { &*legacy_reader }.validation_status(), None);
+        assert_eq!(
+            checkout_exclusive::<C2paReader>(legacy_reader)
+                .unwrap()
+                .validation_status(),
+            None
+        );
 
         unsafe {
             assert_eq!(c2pa_free(legacy_reader as *const c_void), 0);
@@ -8268,7 +8288,8 @@ verify_after_sign = true
         );
         let json_ptr = unsafe { c2pa_reader_json(reader) };
         assert!(!json_ptr.is_null());
-        let json_str = unsafe { CString::from_raw(json_ptr) };
+        let json_str = unsafe { CStr::from_ptr(json_ptr) }.to_owned();
+        assert_eq!(unsafe { c2pa_free(json_ptr as *const c_void) }, 0);
         let json = json_str.to_str().unwrap();
         assert!(json.contains("org.test.credential_wrapper"));
         assert!(
@@ -8321,7 +8342,7 @@ verify_after_sign = true
         assert!(result.is_null(), "expected NULL for null c2pa_signer_ptr");
         let error = unsafe { c2pa_error() };
         assert!(!error.is_null());
-        let _ = unsafe { CString::from_raw(error) };
+        assert_eq!(unsafe { c2pa_free(error as *const c_void) }, 0);
 
         let certs = include_str!(fixture_path!("certs/ed25519.pub"));
         let private_key = include_bytes!(fixture_path!("certs/ed25519.pem"));
@@ -8348,7 +8369,9 @@ verify_after_sign = true
             )
         };
         assert!(result.is_null(), "expected NULL for empty sig_type");
-        let error = unsafe { CString::from_raw(c2pa_error()) };
+        let error_ptr = unsafe { c2pa_error() };
+        let error = unsafe { CStr::from_ptr(error_ptr) }.to_owned();
+        assert_eq!(unsafe { c2pa_free(error_ptr as *const c_void) }, 0);
         assert!(error.to_str().unwrap().contains("sig_type"));
         // The signer was NOT consumed by the failed call.
         let result = unsafe {
@@ -8363,7 +8386,9 @@ verify_after_sign = true
             )
         };
         assert!(result.is_null(), "expected NULL for reserve_size 0");
-        let error = unsafe { CString::from_raw(c2pa_error()) };
+        let error_ptr = unsafe { c2pa_error() };
+        let error = unsafe { CStr::from_ptr(error_ptr) }.to_owned();
+        assert_eq!(unsafe { c2pa_free(error_ptr as *const c_void) }, 0);
         assert!(error.to_str().unwrap().contains("reserve_size"));
         let result = unsafe {
             c2pa_identity_signer_create_with_credential_holder(
@@ -8380,7 +8405,9 @@ verify_after_sign = true
             result.is_null(),
             "oversized reservation must not allocate or consume signer"
         );
-        let error = unsafe { CString::from_raw(c2pa_error()) };
+        let error_ptr = unsafe { c2pa_error() };
+        let error = unsafe { CStr::from_ptr(error_ptr) }.to_owned();
+        assert_eq!(unsafe { c2pa_free(error_ptr as *const c_void) }, 0);
         assert!(error.to_str().unwrap().contains("reserve_size"));
         unsafe { c2pa_free(signer as *const c_void) };
     }

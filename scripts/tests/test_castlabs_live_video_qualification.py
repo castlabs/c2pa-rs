@@ -291,7 +291,7 @@ class EvidenceTests(unittest.TestCase):
             evidence = json.loads(first)
             self.assertEqual(evidence["schemaVersion"], 2)
             self.assertEqual(evidence["python"], {"version": "3.12"})
-            self.assertEqual(evidence["rust"]["releaseToolchain"], "1.88.0")
+            self.assertEqual(evidence["rust"]["releaseToolchain"], "1.96.0")
             self.assertEqual(evidence["rust"]["rustfmtToolchain"], "nightly-2026-01-16")
             packages = evidence["qualification"]["packages"]
             self.assertFalse(packages["c2patool"]["noDefaultFeatures"])
@@ -669,7 +669,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("pull_request_target:", text)
         self.assertIn('python-version: "3.12"', text)
         self.assertEqual(text.count("actions/setup-python@"), 2)
-        self.assertIn("toolchain: 1.88.0", text)
+        self.assertIn("toolchain: 1.96.0", text)
         self.assertIn("toolchain: nightly-2026-01-16", text)
         self.assertIn("Select complete Windows Perl for vendored OpenSSL", text)
         self.assertIn("C:\\Strawberry\\perl\\bin\\perl.exe", text)
@@ -678,7 +678,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("export PERL='C:\\Strawberry\\perl\\bin\\perl.exe'", text)
         self.assertLess(
             text.index("export PERL='C:\\Strawberry\\perl\\bin\\perl.exe'"),
-            text.index("cargo +1.88.0 build --locked --release"),
+            text.index("cargo +1.96.0 build --locked --release"),
         )
         self.assertIn("cargo +nightly-2026-01-16 fmt --all -- --check", text)
         self.assertIn('CARGO_BUILD_JOBS: "1"', text)
@@ -715,11 +715,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--manifest-path cli/Cargo.toml", text)
         self.assertRegex(
             text,
-            r"cargo \+1\.88\.0 test --locked --manifest-path cli/Cargo\.toml.*--features",
+            r"cargo \+1\.96\.0 test --locked --manifest-path cli/Cargo\.toml.*--features",
         )
         self.assertRegex(
             text,
-            r"cargo \+1\.88\.0 test --locked --lib --test bmff_timed_media_merkle --manifest-path sdk/Cargo\.toml.*--features",
+            r"cargo \+1\.96\.0 test --locked --lib --test bmff_timed_media_merkle --manifest-path sdk/Cargo\.toml.*--features",
         )
         for action_ref in re.findall(r"uses:\s*([^\s#]+)", text):
             with self.subTest(action=action_ref):

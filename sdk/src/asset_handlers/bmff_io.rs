@@ -3890,8 +3890,13 @@ pub mod tests {
     #[test]
     fn test_segment_context_mime_and_styp_xmp_round_trip() {
         let context = crate::Context::new();
-        for format in ["mp4", "m4s", "cmfv"] {
-            assert_eq!(context.io().format_to_mime(format), "video/mp4");
+        // #17 maps `m4s` to `video/iso.segment`; `mp4`/`cmfv` stay `video/mp4`.
+        for (format, mime) in [
+            ("mp4", "video/mp4"),
+            ("m4s", "video/iso.segment"),
+            ("cmfv", "video/mp4"),
+        ] {
+            assert_eq!(context.io().format_to_mime(format), mime);
             assert!(context.io().is_bmff_format(format));
         }
 

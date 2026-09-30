@@ -1022,9 +1022,18 @@ pub mod tests {
             .add_resource("thumbnail.jpg", Cursor::new(TEST_THUMBNAIL))
             .unwrap();
 
-        builder
-            .sign(&combined_signer, format, &mut source, &mut dest)
-            .unwrap();
+        // The remote signer uses the sync HTTP resolver. With
+        // `http_reqwest_blocking` but not `http_ureq` (the Castlabs
+        // qualification feature set) that is reqwest's blocking client, which
+        // must not run on this async test's runtime thread, so sign on a
+        // scoped plain thread.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| builder.sign(&combined_signer, format, &mut source, &mut dest))
+                .join()
+                .unwrap()
+        })
+        .unwrap();
 
         mock.assert();
 
