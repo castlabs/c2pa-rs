@@ -30,7 +30,7 @@ use crate::{
     assertions::{
         labels::{self, CLAIM},
         BmffHash, BoxHash, CertificateStatus, DataBox, DataHash, Ingredient, Relationship,
-        TimeStamp, User, UserCbor,
+        TimeStamp, User, UserCbor, SINGLE_RENDITION_ID,
     },
     asset_io::{
         CAIRead, CAIReadWrite, HashBlockObjectType, HashObjectPositions, RemoteRefEmbedType,
@@ -3439,9 +3439,15 @@ impl Store {
                 }
 
                 // Fragment binding takes precedence over ordinary mdat chunk hashing.
+                //
+                // `uniqueId` is 1-based per the specification, matching the
+                // multi-file writer. A ladder numbers its renditions 1..N, so
+                // a one-rung ladder is identical to signing that rendition on
+                // its own.
                 if let Some(fragment_boxes) = bmff_hash.prepare_single_file_merkle(
                     &mut intermediate_stream,
                     settings.core.merkle_tree_max_leaves,
+                    SINGLE_RENDITION_ID,
                 )? {
                     let mut temp_stream = io_utils::stream_with_fs_fallback(threshold);
                     crate::asset_handlers::bmff_io::insert_fragment_merkle_boxes(

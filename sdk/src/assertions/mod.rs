@@ -27,6 +27,7 @@ mod asset_types;
 pub use asset_types::{AssetTypeEnum, AssetTypes};
 
 mod bmff_hash;
+pub(crate) use bmff_hash::SINGLE_RENDITION_ID;
 pub use bmff_hash::{
     BmffHash, BmffMerkleMap, DataMap, ExclusionsMap, MerkleMap, SubsetMap, VecByteBuf,
 };

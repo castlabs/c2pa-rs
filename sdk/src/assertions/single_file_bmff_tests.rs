@@ -872,3 +872,135 @@ fn single_file_rejects_multiple_initialization_tracks() {
         "{error}"
     );
 }
+
+/// Rewrite the `uniqueId` every `merkle` uuid box of `signed` carries from
+/// `1` to `0`: the value the writer used before the 1-based fix. CBOR encodes
+/// both as one byte, so the boxes keep their size and every hash still holds.
+fn with_legacy_zero_ids(signed: &[u8]) -> Vec<u8> {
+    let parsed = read_bmff_c2pa_boxes(&mut Cursor::new(signed)).unwrap();
+    assert!(!parsed.bmff_merkle.is_empty());
+    let mut out = signed.to_vec();
+    let key = b"\x68uniqueId\x01";
+    let mut rewritten = 0;
+    for info in &parsed.bmff_merkle_box_infos {
+        let start = info.offset as usize;
+        let end = start + info.size() as usize;
+        if let Some(at) = out[start..end].windows(key.len()).position(|w| w == key) {
+            out[start + at + key.len() - 1] = 0;
+            rewritten += 1;
+        }
+    }
+    assert_eq!(rewritten, parsed.bmff_merkle.len());
+    out
+}
+
+/// The one map a freshly signed lone asset carries.
+fn own_map(signed: &[u8]) -> super::MerkleMap {
+    let mut hash = binding(signed);
+    let mut maps = hash.merkle.take().unwrap();
+    assert_eq!(maps.len(), 1);
+    maps.remove(0)
+}
+
+/// A sibling rendition's map: another `uniqueId`, garbage everywhere else.
+fn invalid_sibling_of(own: &super::MerkleMap) -> super::MerkleMap {
+    use serde_bytes::ByteBuf;
+    super::MerkleMap {
+        unique_id: own.unique_id + 1,
+        local_id: own.local_id,
+        count: own.count + 2,
+        alg: own.alg.clone(),
+        init_hash: Some(ByteBuf::from(vec![0xAA; 32])),
+        hashes: super::VecByteBuf(vec![ByteBuf::from(vec![0xBB; 32]); own.count + 2]),
+        fixed_block_size: None,
+        variable_block_sizes: None,
+    }
+}
+
+/// Verifier-level selection: a lone asset keeps validating against its own
+/// map while an unrelated -- and deliberately invalid -- sibling map sits in
+/// the same assertion, and the ids it selects by are the asset's own.
+#[test]
+fn single_file_verifier_ignores_an_invalid_sibling_map() {
+    let signed = sign(RELATIVE);
+    let own = own_map(&signed);
+    // New output pins the 1-based id.
+    assert_eq!(
+        (own.unique_id, own.local_id),
+        (super::SINGLE_RENDITION_ID, 1)
+    );
+
+    let mut with_sibling = binding(&signed);
+    with_sibling
+        .merkle
+        .as_mut()
+        .unwrap()
+        .push(invalid_sibling_of(&own));
+    with_sibling
+        .verify_stream_hash(&mut Cursor::new(&signed), None)
+        .expect("the asset's own map must be selected; the sibling is not this asset");
+
+    // ...in either order, so neither selected-map loop can be reverted to
+    // "first map" or "every map" without this test noticing.
+    let mut sibling_first = binding(&signed);
+    sibling_first.merkle = Some(vec![invalid_sibling_of(&own), own_map(&signed)]);
+    sibling_first
+        .verify_stream_hash(&mut Cursor::new(&signed), None)
+        .expect("selection must not depend on map order");
+
+    // localId is half of the key: a map sharing this asset's uniqueId but
+    // naming another track is a sibling too, and must not be selected.
+    let mut other_track = binding(&signed);
+    let mut same_id_other_track = invalid_sibling_of(&own);
+    same_id_other_track.unique_id = own.unique_id;
+    same_id_other_track.local_id = own.local_id + 1;
+    other_track.merkle = Some(vec![same_id_other_track, own_map(&signed)]);
+    other_track
+        .verify_stream_hash(&mut Cursor::new(&signed), None)
+        .expect("a map with this uniqueId but another localId is not this asset");
+
+    // With only the sibling present the asset names a tree the manifest
+    // lacks, and must fail rather than be checked against the sibling.
+    let mut only_sibling = binding(&signed);
+    only_sibling.merkle = Some(vec![invalid_sibling_of(&own)]);
+    let err = only_sibling
+        .verify_stream_hash(&mut Cursor::new(&signed), None)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no MerkleMap for this asset"),
+        "{err}"
+    );
+}
+
+/// An asset written before the 1-based fix names tree `0` in its own boxes;
+/// it keeps validating against a map numbered `0`, and is not silently
+/// matched to a map numbered `1`.
+#[test]
+fn single_file_verifier_honours_legacy_zero_ids_end_to_end() {
+    let signed = sign(RELATIVE);
+    let count = own_map(&signed).count;
+    let legacy_asset = with_legacy_zero_ids(&signed);
+    assert_eq!(
+        read_bmff_c2pa_boxes(&mut Cursor::new(&legacy_asset))
+            .unwrap()
+            .bmff_merkle
+            .iter()
+            .map(|b| b.unique_id)
+            .collect::<Vec<_>>(),
+        vec![0; count]
+    );
+
+    let mut legacy_manifest = binding(&signed);
+    legacy_manifest.merkle.as_mut().unwrap()[0].unique_id = 0;
+    legacy_manifest
+        .verify_stream_hash(&mut Cursor::new(&legacy_asset), None)
+        .expect("a pre-fix asset must keep validating against its own map 0");
+
+    let err = binding(&signed)
+        .verify_stream_hash(&mut Cursor::new(&legacy_asset), None)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no MerkleMap for this asset"),
+        "{err}"
+    );
+}

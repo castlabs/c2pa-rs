@@ -383,6 +383,81 @@ pub struct BmffHash {
     bmff_version: usize,
 }
 
+/// Rendition id used when a single-file fragmented asset is signed on its own.
+///
+/// The specification's CDDL describes `uniqueId` as a "1-based unique id to
+/// determine which Merkle tree validates a given mdat box". That comment is
+/// non-normative (C2PA 2.4 says so of CDDL comments), so a historical `0` is
+/// not invalid -- but the multi-file writer already numbers its renditions
+/// `1..N`, and single-file assets were written with `0` only because they
+/// predate ladders. This aligns the two: renditions of a ladder are numbered
+/// `1..N`, so a one-rung ladder produces exactly what signing that asset
+/// alone produces.
+///
+/// Reading is unaffected either way: a map is selected by the ids the asset's
+/// own `merkle` boxes carry, so assets already signed with `0` keep
+/// validating against their own `0`.
+pub(crate) const SINGLE_RENDITION_ID: usize = 1;
+
+/// Pick the `MerkleMap` that describes *this* single-file fragmented asset.
+///
+/// This verifier path supports one layout: a single-file fragmented asset
+/// carrying one track, whose `merkle` uuid boxes therefore all name the same
+/// tree -- the writer refuses anything else -- and that tree is the only one
+/// that may be verified against it. That is the supported-layout boundary of
+/// this path, not a property of fMP4 in general. When one manifest covers
+/// several renditions of the
+/// same content -- an ABR ladder, where each rendition has its own bytes but
+/// they share a claim -- the assertion holds one map per rendition. Checking
+/// this asset against a sibling's map fails on fragment count, or worse,
+/// compares this asset's fragments to another rendition's hashes.
+///
+/// Scope matters here. Other BMFF layouts key their maps differently and must
+/// keep every map: a non-fragmented multi-`mdat` asset gets one map per `mdat`
+/// from [`BmffHash::add_merkle_map_for_mdats`], with `local_id` set to the
+/// `mdat`'s index, and its boxes therefore legitimately name several trees.
+/// Callers must only use this for the fragmented case.
+fn select_fragment_merkle_maps<'a>(
+    mm_vec: &'a [MerkleMap],
+    bmff_merkle: &[BmffMerkleMap],
+    is_fragmented: bool,
+) -> crate::Result<Vec<&'a MerkleMap>> {
+    // The scope check lives here rather than at the call site so a future
+    // caller cannot reintroduce the multi-mdat regression by forgetting it.
+    if !is_fragmented {
+        return Ok(mm_vec.iter().collect());
+    }
+
+    let Some(first) = bmff_merkle.first() else {
+        return Ok(mm_vec.iter().collect());
+    };
+
+    // The supported layout is one track, hence one tree. Boxes that disagree
+    // inside a fragmented asset cannot be attributed to a rendition at all.
+    if let Some(bad) = bmff_merkle
+        .iter()
+        .find(|b| b.unique_id != first.unique_id || b.local_id != first.local_id)
+    {
+        return Err(Error::HashMismatch(format!(
+            "fragmented asset carries Merkle boxes for more than one tree: uniqueId {}/localId {} and uniqueId {}/localId {}",
+            first.unique_id, first.local_id, bad.unique_id, bad.local_id
+        )));
+    }
+
+    let matched: Vec<&MerkleMap> = mm_vec
+        .iter()
+        .filter(|mm| mm.unique_id == first.unique_id && mm.local_id == first.local_id)
+        .collect();
+
+    if matched.is_empty() {
+        return Err(Error::HashMismatch(format!(
+            "no MerkleMap for this asset (uniqueId {}, localId {})",
+            first.unique_id, first.local_id
+        )));
+    }
+    Ok(matched)
+}
+
 impl BmffHash {
     pub const LABEL: &'static str = labels::BMFF_HASH;
 
@@ -1128,6 +1203,7 @@ impl BmffHash {
         &mut self,
         reader: &mut dyn CAIRead,
         max_leaves: usize,
+        unique_id: usize,
     ) -> crate::Result<Option<Vec<Vec<u8>>>> {
         let boxes = read_bmff_c2pa_boxes(reader)?;
         if !boxes.box_infos.iter().any(|b| b.path == "moov")
@@ -1167,7 +1243,7 @@ impl BmffHash {
         // still identifies each fragment's leaf, as required by A.5.4.1.2.
         let mut uuids = Vec::with_capacity(fragments.len());
         let largest_map = BmffMerkleMap {
-            unique_id: 0,
+            unique_id,
             local_id,
             location: fragments.len() - 1,
             hashes: None,
@@ -1177,7 +1253,7 @@ impl BmffHash {
             .len();
         for location in 0..fragments.len() {
             let map = BmffMerkleMap {
-                unique_id: 0,
+                unique_id,
                 local_id,
                 location,
                 hashes: None,
@@ -1201,7 +1277,7 @@ impl BmffHash {
         self.hash = None;
         self.bmff_version = 3;
         self.merkle = Some(vec![MerkleMap {
-            unique_id: 0,
+            unique_id,
             local_id,
             count: fragments.len(),
             alg: Some(alg.to_owned()),
@@ -1422,8 +1498,16 @@ impl BmffHash {
             let first_moof = box_infos.iter().find(|b| b.path == "moof");
             let is_fragmented = first_moof.is_some();
 
+            // A fragmented asset names the one tree it belongs to, and only
+            // that map may be verified against it. Every other layout keys its
+            // maps differently and keeps all of them -- see
+            // select_fragment_merkle_maps. Deliberately a separate binding
+            // rather than a shadow, so the branches below that legitimately
+            // need every map still read `mm_vec`.
+            let selected = select_fragment_merkle_maps(mm_vec, bmff_merkle, is_fragmented)?;
+
             // check initialization segments (must do here in separate loop since MP4 will consume the reader)
-            for mm in mm_vec {
+            for mm in &selected {
                 let alg = match &mm.alg {
                     Some(a) => a,
                     None => self
@@ -1457,7 +1541,7 @@ impl BmffHash {
 
             // is this a fragmented BMFF
             if is_fragmented {
-                for mm in mm_vec {
+                for mm in &selected {
                     let alg = match &mm.alg {
                         Some(a) => a,
                         None => self
@@ -2573,11 +2657,214 @@ fn stsc_index(track: &Mp4Track, sample_id: u32) -> crate::Result<usize> {
 #[cfg(test)]
 mod bmff_hash_tests {
     #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
 
     use std::io::Cursor;
 
     use super::*;
     use crate::asset_handlers::bmff_io::{BoxInfoLite, C2PABmffBoxes};
+
+    // ---- Merkle map selection (ABR ladders) ----------------------------
+    //
+    // One manifest may cover several renditions of one piece of content.
+    // Each rendition's file names the tree it belongs to in its own merkle
+    // uuid boxes, and only that tree may be verified against it.
+
+    fn map_with_ids(unique_id: usize, local_id: usize, count: usize) -> MerkleMap {
+        MerkleMap {
+            unique_id,
+            local_id,
+            count,
+            alg: None,
+            init_hash: None,
+            hashes: VecByteBuf(Vec::new()),
+            fixed_block_size: None,
+            variable_block_sizes: None,
+        }
+    }
+
+    fn box_with_ids(unique_id: usize, local_id: usize, location: usize) -> BmffMerkleMap {
+        BmffMerkleMap {
+            unique_id,
+            local_id,
+            location,
+            hashes: None,
+        }
+    }
+
+    #[test]
+    fn selects_only_the_rendition_the_asset_names() {
+        // A three-rung ladder: the assertion carries a map per rendition and
+        // this file's boxes say it is rendition 2.
+        let maps = vec![
+            map_with_ids(1, 1, 8),
+            map_with_ids(2, 1, 12),
+            map_with_ids(3, 1, 20),
+        ];
+        let boxes: Vec<BmffMerkleMap> = (0..12).map(|i| box_with_ids(2, 1, i)).collect();
+
+        let selected = select_fragment_merkle_maps(&maps, &boxes, true).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].unique_id, 2);
+        // The neighbouring renditions have different fragment counts, which is
+        // exactly what used to make this fail before selecting.
+        assert_eq!(selected[0].count, 12);
+    }
+
+    #[test]
+    fn an_asset_signed_before_the_1_based_fix_still_selects_its_map() {
+        // Everything written before `uniqueId` was corrected to 1-based
+        // carries 0 in BOTH the assertion map and its own merkle boxes.
+        // Selection reads the asset's own ids, so those bindings keep
+        // validating without the reader needing to know which era wrote them.
+        let maps = vec![map_with_ids(0, 1, 8)];
+        let boxes: Vec<BmffMerkleMap> = (0..8).map(|i| box_with_ids(0, 1, i)).collect();
+
+        let selected = select_fragment_merkle_maps(&maps, &boxes, true).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].unique_id, 0);
+    }
+
+    #[test]
+    fn a_conventional_single_rendition_asset_is_unaffected() {
+        // A lone asset carries one map whose ids match its own boxes, and
+        // must keep selecting that map.
+        let maps = vec![map_with_ids(1, 1, 8)];
+        let boxes: Vec<BmffMerkleMap> = (0..8).map(|i| box_with_ids(1, 1, i)).collect();
+
+        let selected = select_fragment_merkle_maps(&maps, &boxes, true).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].unique_id, 1);
+    }
+
+    #[test]
+    fn an_asset_without_merkle_boxes_keeps_every_map() {
+        // An asset with no `merkle` uuid boxes carries no selection key: it
+        // is bound another way (a whole-file or mdat-chunk binding, whose
+        // maps are keyed by block size), so there is nothing to select on
+        // and every map is kept, exactly as before.
+        let maps = vec![map_with_ids(0, 1, 4), map_with_ids(1, 1, 4)];
+        let selected = select_fragment_merkle_maps(&maps, &[], true).unwrap();
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn renditions_are_distinguished_by_unique_id_alone() {
+        // Splitting a multiplexed source renumbers every rendition to track 1,
+        // so localId collides across the whole ladder and uniqueId carries the
+        // entire distinction.
+        let maps = vec![map_with_ids(1, 1, 12), map_with_ids(2, 1, 12)];
+        let boxes: Vec<BmffMerkleMap> = (0..12).map(|i| box_with_ids(2, 1, i)).collect();
+
+        let selected = select_fragment_merkle_maps(&maps, &boxes, true).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].unique_id, 2);
+    }
+
+    #[test]
+    fn an_asset_naming_a_tree_the_manifest_lacks_is_rejected() {
+        let maps = vec![map_with_ids(1, 1, 12)];
+        let boxes: Vec<BmffMerkleMap> = (0..12).map(|i| box_with_ids(7, 1, i)).collect();
+
+        let err = select_fragment_merkle_maps(&maps, &boxes, true).unwrap_err();
+        assert!(
+            err.to_string().contains("no MerkleMap for this asset"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_fragmented_asset_whose_boxes_disagree_is_rejected() {
+        // Only meaningful for a FRAGMENTED asset, which is one track and so
+        // one tree. A non-fragmented multi-mdat asset carries boxes naming
+        // several trees legitimately, and never reaches this function --
+        // see a_multi_mdat_asset_is_not_subject_to_selection.
+        let maps = vec![map_with_ids(1, 1, 2), map_with_ids(2, 1, 2)];
+        let boxes = vec![box_with_ids(1, 1, 0), box_with_ids(2, 1, 1)];
+
+        let err = select_fragment_merkle_maps(&maps, &boxes, true).unwrap_err();
+        assert!(err.to_string().contains("more than one tree"), "{err}");
+
+        // Boxes that AGREE on unique_id but differ on local_id must be
+        // rejected too, or the agreement check degenerates to a unique_id
+        // comparison and half the key goes unchecked.
+        let maps = vec![map_with_ids(0, 1, 2), map_with_ids(0, 2, 2)];
+        let boxes = vec![box_with_ids(0, 1, 0), box_with_ids(0, 2, 1)];
+
+        let err = select_fragment_merkle_maps(&maps, &boxes, true).unwrap_err();
+        assert!(err.to_string().contains("more than one tree"), "{err}");
+    }
+
+    #[test]
+    fn local_id_is_part_of_the_selection_key() {
+        // uniqueId alone is not the key. Dropping local_id from either half of
+        // the comparison must fail this test -- the other cases all hold
+        // local_id constant, so they cannot catch that.
+        let maps = vec![map_with_ids(0, 0, 4), map_with_ids(0, 7, 9)];
+        let boxes: Vec<BmffMerkleMap> = (0..9).map(|i| box_with_ids(0, 7, i)).collect();
+
+        let selected = select_fragment_merkle_maps(&maps, &boxes, true).unwrap();
+        assert_eq!(selected.len(), 1, "local_id was ignored in the filter");
+        assert_eq!(selected[0].local_id, 7);
+        assert_eq!(selected[0].count, 9);
+    }
+
+    #[test]
+    fn a_multi_mdat_asset_is_not_subject_to_selection() {
+        // Regression guard. `add_merkle_map_for_mdats` emits ONE MerkleMap per
+        // mdat with `local_id` = that mdat's index, and stamps each uuid box
+        // with the same ids, so a multi-mdat asset legitimately carries boxes
+        // naming several different trees. It is not fragmented, so it must
+        // keep every map; applying fragment selection to it would reject a
+        // file that validates today.
+        //
+        // Driven through the real writer and the real verifier, with no
+        // hand-written ids anywhere.
+        let mut asset = Vec::new();
+        asset.extend_from_slice(&(16u32).to_be_bytes());
+        asset.extend_from_slice(b"ftyp");
+        asset.extend_from_slice(b"isom\x00\x00\x00\x00");
+        for _ in 0..2 {
+            let payload = vec![0xABu8; 4096];
+            asset.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+            asset.extend_from_slice(b"mdat");
+            asset.extend_from_slice(&payload);
+        }
+
+        let mut bmff_hash = BmffHash::new("multi-mdat", "sha256", None);
+        let mut reader: Box<dyn CAIRead> = Box::new(Cursor::new(asset.clone()));
+        bmff_hash
+            .add_merkle_map_for_mdats(reader.as_mut(), 1, 5)
+            .unwrap();
+
+        // The writer really did produce several trees for one asset.
+        let maps = bmff_hash.merkle().expect("maps");
+        assert_eq!(maps.len(), 2, "expected one MerkleMap per mdat");
+        assert_ne!(
+            maps[0].local_id, maps[1].local_id,
+            "the two mdats must carry different local_ids"
+        );
+
+        let uuid_boxes = bmff_hash
+            .merkle_uuid_boxes
+            .clone()
+            .expect("writer produced uuid boxes");
+        let insertion_point = bmff_hash.merkle_uuid_boxes_insertion_point;
+
+        let mut signed_bytes: Vec<u8> = Vec::new();
+        crate::utils::io_utils::insert_data_at(
+            &mut Cursor::new(asset),
+            &mut signed_bytes,
+            insertion_point,
+            &uuid_boxes,
+        )
+        .unwrap();
+
+        let mut signed: Box<dyn CAIRead> = Box::new(Cursor::new(signed_bytes));
+        bmff_hash
+            .verify_stream_hash(signed.as_mut(), None)
+            .expect("a multi-mdat asset must still validate");
+    }
 
     fn small_mdat_box_info() -> BoxInfoLite {
         // A standard BMFF mdat box with an 8-byte header and no payload (size = 8).
