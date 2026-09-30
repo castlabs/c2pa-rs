@@ -130,12 +130,15 @@ True merge (`--no-ff`) of `contentauth/c2pa-rs` `main` @`69907b5a` into
   `location = 0..n` in physical order, Merkle id normalization and tfra/moof
   offset adjustment do not change locations, and per-segment/live-VSI
   verification (`verify_stream_segment(s)`) is not affected.
-- #2688 (auto-merged, sdk/src/crypto/cose/ocsp.rs): live OCSP responder
-  certificates are checked with `CertificateTrustPolicy::check_certificate_trust`.
-  In this fork that entry point is scoped to `TrustListKind::Manifest` (trust
-  anchor purpose isolation), whereas upstream checks all anchors. A responder
-  that chains only to a TSA or CAWG anchor is therefore not trusted here. This
-  is intended: OCSP responders vouch for manifest signing certificates.
+- #2688 (auto-merged, sdk/src/crypto/cose/ocsp.rs, identical to upstream):
+  a live-fetched OCSP responder certificate is now validated at the current
+  time rather than the manifest signing time; stapled responses still use the
+  signing time. Responder trust goes through
+  `CertificateTrustPolicy::check_certificate_trust`, which this fork already
+  scoped to `TrustListKind::Manifest` before this merge (trust anchor purpose
+  isolation); upstream checks all anchors there. A responder that chains only
+  to a TSA or CAWG anchor is therefore not trusted in this fork. This is
+  intended: OCSP responders vouch for manifest signing certificates.
 - #2686 / #2713 (auto-merged, validation_results.rs, signer_payload.rs):
   unreferenced claims are ignored when reconciling statuses, and CAWG signer
   payload mismatches are logged through the status tracker
