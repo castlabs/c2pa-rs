@@ -45,7 +45,7 @@ fn maybe_write_crjson_output(name: &str, json: &str) {
         let _ = std::fs::create_dir_all(&out_dir);
         let path = out_dir.join(name);
         let _ = std::fs::write(&path, json);
-        eprintln!("CrJSON written to {:?}", path);
+        eprintln!("CrJSON written to {path:?}");
     }
 }
 

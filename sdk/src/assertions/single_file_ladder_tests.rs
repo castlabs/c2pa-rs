@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0 or the MIT license.
 
 // Tests assert by panicking; the crate-wide deny is meant for library code.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::panic, clippy::unwrap_used)]
 
 //! Multi-rendition (ABR ladder) signing of single-file fragmented BMFF assets.
 //!
@@ -494,6 +494,14 @@ fn ladder_never_overwrites_an_existing_file() {
     assert_eq!(std::fs::read(&out_x).unwrap(), b"placeholder");
     assert_eq!(std::fs::read(&out_y).unwrap(), b"placeholder");
 
+    // A later reservation failure cleans up the earlier reservation without
+    // touching the pre-existing destination that caused the refusal.
+    let partial = dir.path().join("partial.mp4");
+    fail(&sources, &[partial.clone(), out_x.clone()]);
+    assert!(!partial.exists(), "the partial reservation was left behind");
+    assert_eq!(std::fs::read(&out_x).unwrap(), b"placeholder");
+    assert_eq!(std::fs::read(&out_y).unwrap(), b"placeholder");
+
     // A dangling symlink named like an output would send the write to its
     // target; `create_new` does not follow it.
     #[cfg(unix)]
@@ -720,12 +728,15 @@ impl Signer for FailingSigner {
     fn sign(&self, _: &[u8]) -> Result<Vec<u8>> {
         Err(crate::Error::OtherError("the HSM is on fire".into()))
     }
+
     fn alg(&self) -> SigningAlg {
         self.0.alg()
     }
+
     fn certs(&self) -> Result<Vec<Vec<u8>>> {
         self.0.certs()
     }
+
     fn reserve_size(&self) -> usize {
         self.0.reserve_size()
     }
@@ -762,15 +773,84 @@ fn ladder_leaves_nothing_behind_when_signing_itself_fails() {
     }
 }
 
+struct CallbackSigner<'a>(Box<dyn Signer>, &'a dyn Fn());
+impl Signer for CallbackSigner<'_> {
+    fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+        (self.1)();
+        self.0.sign(data)
+    }
+
+    fn alg(&self) -> SigningAlg {
+        self.0.alg()
+    }
+
+    fn certs(&self) -> Result<Vec<Vec<u8>>> {
+        self.0.certs()
+    }
+
+    fn reserve_size(&self) -> usize {
+        self.0.reserve_size()
+    }
+}
+
+#[test]
+fn ladder_cleanup_preserves_a_replacement_and_the_renamed_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let renditions = ladder();
+    let sources: Vec<PathBuf> = renditions
+        .iter()
+        .enumerate()
+        .map(|(i, data)| {
+            let path = dir.path().join(format!("r{i}.mp4"));
+            std::fs::write(&path, data).unwrap();
+            path
+        })
+        .collect();
+    let outputs: Vec<PathBuf> = (0..sources.len())
+        .map(|i| dir.path().join(format!("s{i}.mp4")))
+        .collect();
+    let renamed = dir.path().join("renamed.mp4");
+    let original = std::cell::RefCell::new(Vec::new());
+    let replace = || {
+        // Run after the placeholders and hashes exist, but before the final
+        // pre-patch identity check. Standard File opens share delete on Windows;
+        // no path-based identity handle is held while this rename runs.
+        *original.borrow_mut() = std::fs::read(&outputs[0]).unwrap();
+        std::fs::rename(&outputs[0], &renamed).unwrap();
+        std::fs::write(&outputs[0], b"foreign replacement").unwrap();
+    };
+    let signer = CallbackSigner(test_signer(SigningAlg::Es256), &replace);
+    let error = builder()
+        .sign_ladder_files(&signer, &sources, &outputs)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("was replaced while the ladder was being signed"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&outputs[0]).unwrap(), b"foreign replacement");
+    assert!(!original.borrow().is_empty(), "the callback did not run");
+    assert_eq!(std::fs::read(&renamed).unwrap(), *original.borrow());
+    for output in &outputs[1..] {
+        assert!(!output.exists(), "{} was left behind", output.display());
+    }
+    for (source, data) in sources.iter().zip(&renditions) {
+        assert_eq!(&std::fs::read(source).unwrap(), data);
+    }
+}
+
 struct DynamicSigner(Box<dyn Signer>);
 struct Dynamic;
 impl DynamicAssertion for Dynamic {
     fn label(&self) -> String {
         "com.castlabs.ladder-test".into()
     }
+
     fn reserve_size(&self) -> Result<usize> {
         Ok(64)
     }
+
     fn content(
         &self,
         _: &str,
@@ -793,15 +873,19 @@ impl Signer for DynamicSigner {
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
         self.0.sign(data)
     }
+
     fn alg(&self) -> SigningAlg {
         self.0.alg()
     }
+
     fn certs(&self) -> Result<Vec<Vec<u8>>> {
         self.0.certs()
     }
+
     fn reserve_size(&self) -> usize {
         self.0.reserve_size()
     }
+
     fn dynamic_assertions(&self) -> Vec<Box<dyn DynamicAssertion>> {
         vec![Box::new(Dynamic)]
     }

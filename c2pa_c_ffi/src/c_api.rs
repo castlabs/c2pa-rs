@@ -22,7 +22,7 @@ use c2pa::Ingredient;
 use c2pa::{
     assertions::DataHash,
     dynamic_assertion::{DynamicAssertion, DynamicAssertionContent, PartialClaim},
-    identity::validator::{CawgValidator, CawgValidatorWithSettings},
+    identity::validator::CawgValidatorWithSettings,
     Builder as C2paBuilder, CallbackSigner, Context, ProgressPhase, Reader as C2paReader,
     Settings as C2paSettings, Signer, SigningAlg,
 };
@@ -1477,14 +1477,14 @@ pub unsafe extern "C" fn c2pa_reader_from_fragmented_files(
     for i in 0..fragments_count {
         let entry_ptr = *fragments.add(i);
         if entry_ptr.is_null() {
-            CimplError::other(format!("fragments[{}] is a null pointer", i)).set_last();
+            CimplError::other(format!("fragments[{i}] is a null pointer")).set_last();
             return std::ptr::null_mut();
         }
         let c_str = std::ffi::CStr::from_ptr(entry_ptr);
         let rust_str = match c_str.to_str() {
             Ok(s) => s,
             Err(_) => {
-                CimplError::other(format!("fragments[{}] is not valid UTF-8", i)).set_last();
+                CimplError::other(format!("fragments[{i}] is not valid UTF-8")).set_last();
                 return std::ptr::null_mut();
             }
         };
@@ -2329,18 +2329,22 @@ const MAX_LADDER_RENDITIONS: usize = 1024;
 ///   matched to `sources`. None may exist yet: each is created with
 ///   `create_new`, so a source, another output under any spelling or link, or
 ///   any pre-existing file is refused and nothing is overwritten. On error,
-///   the call removes what is then at the output paths it reserved -- by
-///   path, not by identity, so under the assumption below that is exactly
-///   its own outputs, while a file someone else put at an output path during
-///   the call is removed too. Best effort: a removal that fails is not
-///   reported, so do not infer from -1 that no output exists; discard only
-///   the leftovers at the paths you passed, never a destination that existed
-///   before the call, such as a source or a link to one -- those are refused
-///   at reservation and never touched. The destinations are expected to be
-///   stable paths in a directory the caller controls for the duration of the
-///   call; each output is checked to still be the reserved file before it is
-///   patched, which is a consistency check, not a lock. A source that already
-///   carries a C2PA manifest is refused.
+///   including a partial reservation failure, cleanup removes a reserved
+///   output path only if its file identity still matches the original
+///   reservation. Different-file replacements and paths whose identity cannot
+///   be checked are left untouched; a link to the reserved file may still be
+///   removed. Cleanup is best effort: identity lookup or
+///   removal failures are not reported, so do not infer from -1 that no
+///   output exists. Discard leftovers only after confirming they belong to
+///   this call, never a pre-existing destination or someone else's replacement.
+///   The destinations are expected to be stable paths in a directory the
+///   caller controls for the duration of the call. Each output is checked to
+///   still be the reserved file before patching. Neither this check nor
+///   cleanup's identity check is a lock: replacement between a check and the
+///   path-based reopen or unlink is still possible. Reservation handles remain
+///   open through optional verification, but its path-based reopen has no
+///   additional identity check. A source that already carries a C2PA manifest
+///   is refused.
 /// * `count` - number of renditions; 1 to 1024.
 /// * `manifest_bytes_ptr` - out-pointer receiving the manifest embedded in
 ///   every rendition. Released with [`c2pa_free`].
@@ -3353,33 +3357,43 @@ impl Signer for FfiDynamicSignerV2 {
     fn sign(&self, data: &[u8]) -> c2pa::Result<Vec<u8>> {
         self.inner.sign(data)
     }
+
     fn alg(&self) -> SigningAlg {
         self.inner.alg()
     }
+
     fn certs(&self) -> c2pa::Result<Vec<Vec<u8>>> {
         self.inner.certs()
     }
+
     fn reserve_size(&self) -> usize {
         self.inner.reserve_size()
     }
+
     fn time_authority_url(&self) -> Option<String> {
         self.inner.time_authority_url()
     }
+
     fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
         self.inner.timestamp_request_headers()
     }
+
     fn timestamp_request_body(&self, message: &[u8]) -> c2pa::Result<Vec<u8>> {
         self.inner.timestamp_request_body(message)
     }
+
     fn send_timestamp_request(&self, message: &[u8]) -> Option<c2pa::Result<Vec<u8>>> {
         self.inner.send_timestamp_request(message)
     }
+
     fn ocsp_val(&self) -> Option<Vec<u8>> {
         self.inner.ocsp_val()
     }
+
     fn direct_cose_handling(&self) -> bool {
         self.inner.direct_cose_handling()
     }
+
     fn dynamic_assertions(&self) -> Vec<Box<dyn DynamicAssertion>> {
         let mut all = self.inner.dynamic_assertions();
         for params in &self.ffi_assertions {
@@ -3810,7 +3824,7 @@ mod tests {
         let reader = unsafe { c2pa_reader_from_stream(format.as_ptr(), dest_stream.as_ptr()) };
         if reader.is_null() {
             if let Some(msg) = CimplError::last_message() {
-                panic!("Reader creation failed: {}", msg);
+                panic!("Reader creation failed: {msg}");
             }
         }
         assert!(!reader.is_null());
@@ -4177,7 +4191,7 @@ mod tests {
         let result = unsafe { c2pa_reader_from_stream(format.as_ptr(), stream.as_ptr()) };
         if result.is_null() {
             if let Some(msg) = CimplError::last_message() {
-                panic!("Reader creation failed: {}", msg);
+                panic!("Reader creation failed: {msg}");
             } else {
                 panic!("Reader creation failed with no error message");
             }
@@ -4651,7 +4665,7 @@ mod tests {
         let reader = unsafe { c2pa_reader_from_stream(format.as_ptr(), dest_stream.as_ptr()) };
         if reader.is_null() {
             if let Some(msg) = CimplError::last_message() {
-                panic!("Reader creation failed: {}", msg);
+                panic!("Reader creation failed: {msg}");
             }
         }
         assert!(!reader.is_null());

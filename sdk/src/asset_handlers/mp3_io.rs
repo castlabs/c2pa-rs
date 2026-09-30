@@ -350,10 +350,7 @@ pub mod tests {
         let mut f = std::fs::File::open(fixture()).unwrap();
         match reader.read_cai(&mut f) {
             Err(Error::JumbfNotFound) => {}
-            other => panic!(
-                "unexpected result for fixture without manifest: {:?}",
-                other
-            ),
+            other => panic!("unexpected result for fixture without manifest: {other:?}"),
         }
         assert!(handler.supported_types().contains(&"audio/mpeg"));
     }
@@ -363,7 +360,7 @@ pub mod tests {
         let mp3_io = Mp3IO::new("mp3");
         match mp3_io.read_cai_store(Path::new("/nonexistent/sample.mp3")) {
             Err(Error::IoError(_)) => {}
-            other => panic!("expected IoError for missing file, got {:?}", other),
+            other => panic!("expected IoError for missing file, got {other:?}"),
         }
     }
 
@@ -381,10 +378,7 @@ pub mod tests {
         let mut cursor = Cursor::new(mpeg_stream);
         match mp3_io.read_cai(&mut cursor) {
             Err(Error::JumbfNotFound) => {}
-            other => panic!(
-                "expected JumbfNotFound for bare MPEG stream, got {:?}",
-                other
-            ),
+            other => panic!("expected JumbfNotFound for bare MPEG stream, got {other:?}"),
         }
     }
 
@@ -396,10 +390,7 @@ pub mod tests {
         let mut output = Cursor::new(Vec::new());
         match mp3_io.write_cai(&mut input, &mut output, &[1, 2, 3]) {
             Err(Error::UnsupportedType) => {}
-            other => panic!(
-                "expected UnsupportedType for unknown magic, got {:?}",
-                other
-            ),
+            other => panic!("expected UnsupportedType for unknown magic, got {other:?}"),
         }
     }
 
@@ -411,7 +402,7 @@ pub mod tests {
         let mut output = Cursor::new(Vec::new());
         match mp3_io.write_cai(&mut input, &mut output, &[1, 2, 3]) {
             Err(Error::IoError(_)) => {}
-            other => panic!("expected IoError for short stream, got {:?}", other),
+            other => panic!("expected IoError for short stream, got {other:?}"),
         }
     }
 
@@ -424,7 +415,7 @@ pub mod tests {
         let mut output = Cursor::new(Vec::new());
         match mp3_io.write_cai(&mut input, &mut output, &[1, 2, 3]) {
             Err(Error::UnsupportedType) => {}
-            other => panic!("expected UnsupportedType for ID3v1 header, got {:?}", other),
+            other => panic!("expected UnsupportedType for ID3v1 header, got {other:?}"),
         }
     }
 }

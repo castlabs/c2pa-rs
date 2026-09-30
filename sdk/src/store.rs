@@ -3347,24 +3347,25 @@ impl Store {
     /// `outputs` must be the same length as `inputs`, and none may exist yet:
     /// every output is created with `create_new`, so a path that is a source,
     /// another output under any spelling or link, or any other pre-existing
-    /// file is refused and nothing is ever overwritten. On any error after
-    /// the reservation, whatever is then at the reserved output paths is
-    /// removed -- by path, not by identity, so under the stable-path
-    /// assumption that is exactly this call's outputs, and a file placed at
-    /// an output path by someone else during the call goes with them. Best
-    /// effort: a removal that fails is not reported, so a caller must not
-    /// infer from an error that no output exists, and should discard only
-    /// the leftovers at the paths it passed, never a pre-existing
-    /// destination, which the reservation refuses and never touches. The
-    /// outputs are expected to be stable paths in a directory the caller
-    /// controls for the duration of the call; the pre-patch identity check is
-    /// a consistency check, not a lock. No input may already carry a C2PA
-    /// manifest: a
-    /// ladder signing adds no parent ingredient, so re-signing is refused
-    /// rather than silently replacing provenance. The manifest is always
-    /// embedded, so
-    /// remote and sidecar manifests are refused. Returns the JUMBF manifest
-    /// that was written to every rendition.
+    /// file is refused and nothing is ever overwritten. On error, including
+    /// a partial reservation failure, cleanup removes a reserved output path
+    /// only if its file identity still matches the original reservation.
+    /// Different-file replacements and paths whose identity cannot be checked
+    /// are left untouched; a link to the reserved file may still be removed.
+    /// Cleanup is best effort: identity lookup or removal
+    /// failures are not reported, so an error does not imply that no output
+    /// exists. Discard leftovers only after confirming they belong to this
+    /// call, never a pre-existing destination or someone else's replacement.
+    /// The outputs are expected to be stable paths in a directory the caller
+    /// controls for the duration of the call. The pre-patch and cleanup
+    /// identity checks are not locks: replacement between a check and the
+    /// path-based reopen or unlink is still possible. Reservation handles
+    /// remain open through optional verification, but its path-based reopen
+    /// has no additional identity check. No input may already carry a C2PA
+    /// manifest: a ladder signing adds no parent ingredient, so re-signing is
+    /// refused rather than silently replacing provenance. The manifest is
+    /// always embedded, so remote and sidecar manifests are refused. Returns
+    /// the JUMBF manifest that was written to every rendition.
     #[cfg(feature = "file_io")]
     pub fn save_to_bmff_ladder(
         &mut self,
@@ -3426,21 +3427,19 @@ impl Store {
         // follow one on Unix), a case-folded twin of an output created a
         // moment ago on a case-insensitive filesystem, or any other
         // pre-existing file -- is refused, and nothing that existed
-        // before this call is ever truncated. From here on any failure
-        // removes the outputs this call created (best effort: a failed
-        // removal is not reported).
-        let reserved = Store::reserve_ladder_outputs(outputs)?;
-        let result = self.write_bmff_ladder(inputs, reserved, outputs, &format, signer, context);
+        // before this call is ever truncated. Keep the original handles until
+        // writing and verification finish, so failure cleanup can check identity.
+        let mut reserved = Store::reserve_ladder_outputs(outputs)?;
+        let result =
+            self.write_bmff_ladder(inputs, &mut reserved, outputs, &format, signer, context);
         if result.is_err() {
-            for output in outputs {
-                let _ = std::fs::remove_file(output);
-            }
+            Store::cleanup_ladder_outputs(outputs, reserved);
         }
         result
     }
 
     /// Create every ladder output with `create_new`, in order. If one is
-    /// refused, the ones already created are removed again.
+    /// refused, the ones already created are cleaned up by matching identity.
     #[cfg(feature = "file_io")]
     fn reserve_ladder_outputs(outputs: &[PathBuf]) -> Result<Vec<std::fs::File>> {
         let mut reserved = Vec::with_capacity(outputs.len());
@@ -3453,10 +3452,7 @@ impl Store {
             {
                 Ok(file) => reserved.push(file),
                 Err(e) => {
-                    drop(reserved);
-                    for created in &outputs[..index] {
-                        let _ = std::fs::remove_file(created);
-                    }
+                    Store::cleanup_ladder_outputs(&outputs[..index], reserved);
                     return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
                         Error::BadParam(format!(
                             "output {} already exists; ladder signing never overwrites, and an output may not be a source, another output, or a link to either",
@@ -3471,13 +3467,31 @@ impl Store {
         Ok(reserved)
     }
 
+    /// Best-effort cleanup, skipping unknown or non-matching file identities.
+    #[cfg(feature = "file_io")]
+    fn cleanup_ladder_outputs(outputs: &[PathBuf], reserved: Vec<std::fs::File>) {
+        for (output, file) in outputs.iter().zip(reserved) {
+            // Consume the original handle rather than cloning it. Both identity
+            // handles close before unlinking (needed for Windows sharing), so
+            // this is still a check-to-unlink race, not an atomic removal.
+            let matches = same_file::Handle::from_file(file)
+                .and_then(|expected| {
+                    same_file::Handle::from_path(output).map(|actual| actual == expected)
+                })
+                .unwrap_or(false);
+            if matches {
+                let _ = std::fs::remove_file(output);
+            }
+        }
+    }
+
     /// The body of [`Self::save_to_bmff_ladder`], once every output has been
     /// reserved: `reserved[i]` is the open, empty file at `outputs[i]`.
     #[cfg(feature = "file_io")]
     fn write_bmff_ladder(
         &mut self,
         inputs: &[PathBuf],
-        mut reserved: Vec<std::fs::File>,
+        reserved: &mut [std::fs::File],
         outputs: &[PathBuf],
         format: &str,
         signer: &dyn Signer,
@@ -3549,9 +3563,9 @@ impl Store {
         // patch, check that the path still names the file that was reserved
         // and written. This is a consistency check, not a lock: a path
         // replaced between the check and the reopen is not detected, the
-        // verification reopen after the handles are dropped is unguarded,
-        // and the output directory is assumed to be the caller's own while
-        // the call runs.
+        // verification reopen has no additional identity check even though
+        // the reservation handles remain open, and the output directory is
+        // assumed to be the caller's own while the call runs.
 
         // 3) Fold every rendition's hashes back into the one assertion.
         let pc = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
@@ -3612,8 +3626,6 @@ impl Store {
             }
             Store::patch_manifest_in_place(output, &final_jumbf)?;
         }
-        drop(reserved);
-
         context.check_progress(ProgressPhase::Embedding, 1, 1)?;
 
         if settings.verify.verify_after_sign {
@@ -8894,6 +8906,8 @@ pub mod tests {
     fn test_dynamic_assertions_inter_da_hash_visibility() {
         use std::sync::{Arc, Mutex};
 
+        type CapturedAssertions = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
         let context = crate::context::Context::new();
 
         #[derive(Serialize)]
@@ -8910,12 +8924,14 @@ pub mod tests {
             fn label(&self) -> String {
                 "com.example.first".to_string()
             }
+
             fn reserve_size(&self) -> Result<usize> {
                 let a = TestAssertion {
                     tag: "first-da-content".to_string(),
                 };
                 Ok(c2pa_cbor::to_vec(&a)?.len())
             }
+
             fn content(
                 &self,
                 _label: &str,
@@ -8933,19 +8949,21 @@ pub mod tests {
         // assert the first DA's real hash is visible.
         #[derive(Debug)]
         struct SecondDa {
-            captured: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+            captured: CapturedAssertions,
         }
 
         impl DynamicAssertion for SecondDa {
             fn label(&self) -> String {
                 "com.example.second".to_string()
             }
+
             fn reserve_size(&self) -> Result<usize> {
                 let a = TestAssertion {
                     tag: "second-da-content".to_string(),
                 };
                 Ok(c2pa_cbor::to_vec(&a)?.len())
             }
+
             fn content(
                 &self,
                 _label: &str,
@@ -8966,28 +8984,34 @@ pub mod tests {
         // Signer that exposes both DAs in registration order.
         struct TwoDaSigner {
             inner: Box<dyn Signer>,
-            captured: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+            captured: CapturedAssertions,
         }
 
         impl crate::Signer for TwoDaSigner {
             fn sign(&self, data: &[u8]) -> crate::error::Result<Vec<u8>> {
                 self.inner.sign(data)
             }
+
             fn alg(&self) -> SigningAlg {
                 self.inner.alg()
             }
+
             fn certs(&self) -> crate::Result<Vec<Vec<u8>>> {
                 self.inner.certs()
             }
+
             fn reserve_size(&self) -> usize {
                 self.inner.reserve_size()
             }
+
             fn time_authority_url(&self) -> Option<String> {
                 self.inner.time_authority_url()
             }
+
             fn ocsp_val(&self) -> Option<Vec<u8>> {
                 self.inner.ocsp_val()
             }
+
             fn dynamic_assertions(
                 &self,
             ) -> Vec<Box<dyn crate::dynamic_assertion::DynamicAssertion>> {
@@ -9000,7 +9024,7 @@ pub mod tests {
             }
         }
 
-        let captured: Arc<Mutex<Vec<(String, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: CapturedAssertions = Arc::new(Mutex::new(Vec::new()));
         let signer = TwoDaSigner {
             inner: test_signer(SigningAlg::Ps256),
             captured: Arc::clone(&captured),
@@ -9100,12 +9124,14 @@ pub mod tests {
             fn label(&self) -> String {
                 "com.example.lonely".to_string()
             }
+
             fn reserve_size(&self) -> Result<usize> {
                 let a = TestAssertion {
                     tag: "lonely-da-content".to_string(),
                 };
                 Ok(c2pa_cbor::to_vec(&a)?.len())
             }
+
             fn content(
                 &self,
                 _label: &str,
@@ -9132,21 +9158,27 @@ pub mod tests {
             fn sign(&self, data: &[u8]) -> crate::error::Result<Vec<u8>> {
                 self.inner.sign(data)
             }
+
             fn alg(&self) -> SigningAlg {
                 self.inner.alg()
             }
+
             fn certs(&self) -> crate::Result<Vec<Vec<u8>>> {
                 self.inner.certs()
             }
+
             fn reserve_size(&self) -> usize {
                 self.inner.reserve_size()
             }
+
             fn time_authority_url(&self) -> Option<String> {
                 self.inner.time_authority_url()
             }
+
             fn ocsp_val(&self) -> Option<Vec<u8>> {
                 self.inner.ocsp_val()
             }
+
             fn dynamic_assertions(
                 &self,
             ) -> Vec<Box<dyn crate::dynamic_assertion::DynamicAssertion>> {
@@ -9331,8 +9363,8 @@ pub mod tests {
     /// A rendition whose fragment glob matches nothing is refused during
     /// preflight, before any rendition is written. Checked with two rungs,
     /// the first complete and the second an init with no segments: the old
-    /// order signed the first rung and only then discovered the second was
-    /// empty, leaving a partial ladder on disk.
+    /// order copied the first rung's fragments and only then discovered the
+    /// second was empty, leaving partial output on disk before init signing.
     #[test]
     #[cfg(feature = "file_io")]
     fn test_fragmented_refuses_an_empty_fragment_match_before_writing_anything() {

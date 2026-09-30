@@ -281,8 +281,7 @@ mod tests {
         let recovered: C2paError = cimpl_err.into();
         assert!(
             matches!(recovered, C2paError::ManifestNotFound(ref msg) if msg == "test label"),
-            "Expected ManifestNotFound, got: {:?}",
-            recovered
+            "Expected ManifestNotFound, got: {recovered:?}"
         );
     }
 
@@ -300,8 +299,7 @@ mod tests {
         let recovered: C2paError = cimpl_err.into();
         assert!(
             matches!(recovered, C2paError::ManifestNotFound(ref msg) if msg == "claim missing: some label"),
-            "Expected ManifestNotFound with full message, got: {:?}",
-            recovered
+            "Expected ManifestNotFound with full message, got: {recovered:?}"
         );
     }
 
@@ -332,16 +330,14 @@ mod tests {
             assert_eq!(
                 cimpl_err.code(),
                 expected_code,
-                "Code mismatch for {}",
-                original_str
+                "Code mismatch for {original_str}"
             );
 
             let recovered: C2paError = cimpl_err.into();
             let recovered_str = recovered.to_string();
             assert_eq!(
                 original_str, recovered_str,
-                "Round-trip failed: {} -> {}",
-                original_str, recovered_str
+                "Round-trip failed: {original_str} -> {recovered_str}"
             );
         }
     }
@@ -356,8 +352,7 @@ mod tests {
         let msg = cimpl_err.message();
         assert!(
             msg.starts_with("Remote:"),
-            "C2paException in c2pa-c checks for 'Remote:' prefix; got: {}",
-            msg
+            "C2paException in c2pa-c checks for 'Remote:' prefix; got: {msg}"
         );
     }
 
@@ -367,8 +362,7 @@ mod tests {
         let c2pa_err: C2paError = cimpl_err.into();
         assert!(
             matches!(c2pa_err, C2paError::NullParameter(_)),
-            "Expected NullParameter, got: {:?}",
-            c2pa_err
+            "Expected NullParameter, got: {c2pa_err:?}"
         );
     }
 

@@ -1130,8 +1130,7 @@ mod tests {
         let path = Path::new("/Users/lrosenth/Development/crTool/target/test_output/testset/p-actions-created-with-icon.jpg");
         if !path.exists() {
             eprintln!(
-                "Skipping test_claim_generator_info_with_icon_exported: fixture not found at {:?}",
-                path
+                "Skipping test_claim_generator_info_with_icon_exported: fixture not found at {path:?}"
             );
             return Ok(());
         }

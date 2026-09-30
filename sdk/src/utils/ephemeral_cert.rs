@@ -650,9 +650,9 @@ mod tests {
         let stderr = String::from_utf8_lossy(&verify_out.stderr);
         if !verify_out.status.success() {
             if is_openssl_verify_skip(&stderr) {
-                eprintln!("openssl verify skipped (known platform quirk): {}", stderr);
+                eprintln!("openssl verify skipped (known platform quirk): {stderr}");
             } else {
-                panic!("openssl verify failed. stderr: {}", stderr);
+                panic!("openssl verify failed. stderr: {stderr}");
             }
         }
     }
@@ -730,10 +730,9 @@ mod tests {
 
         if let Some(ext) = culprit {
             panic!(
-                "OpenSSL 3.x rejects our EE cert when the '{}' extension is present. \
+                "OpenSSL 3.x rejects our EE cert when the '{ext}' extension is present. \
                  Verify passes when that extension is omitted. Fix the encoding or \
-                 structure of this extension.",
-                ext
+                 structure of this extension."
             );
         }
     }

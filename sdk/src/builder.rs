@@ -3079,7 +3079,7 @@ impl Builder {
     /// *   pattern to find the fragmented files in the same directory/subdirectory as the asset file. For example,
     /// *   if your fragmented files are named `video_1.m4s`, `video_2.m4s`, etc., then the glob pattern should be `video_*.m4s`.
     /// *   It is applied per rendition and must match at least one segment in each.
-    /// * `output_path` - The path to the output file.
+    /// * `output_path` - The output directory containing one subdirectory per rendition.
     ///
     /// # Errors
     /// * Returns an [`Error`] if the manifest cannot be signed, or if the
@@ -3147,24 +3147,25 @@ impl Builder {
     ///   exist yet: unlike [`Self::sign_file`], nothing is overwritten -- every
     ///   output is created with `create_new`, so a path that is a source,
     ///   another output under any spelling or link, or any pre-existing file
-    ///   is an error, and such a pre-existing file is never touched. On any
-    ///   error after the reservation the call removes what is then at the
-    ///   output paths it reserved -- by path, not by identity: it does not
-    ///   re-check that each is still the file it created, so under the
-    ///   assumption below that is exactly its own outputs, and a file someone
-    ///   else put at an output path during the call is removed too, even
-    ///   though the identity check refuses to sign over it. The removal is
-    ///   best effort: one that fails is not reported, so a caller must not
-    ///   infer from an error that no output exists, and should discard only
-    ///   the leftovers at the paths it passed -- never a destination that
-    ///   existed before the call, such as a source or a link to one.
+    ///   is an error, and such a pre-existing file is never touched. On error,
+    ///   including a partial reservation failure, cleanup removes a reserved
+    ///   output path only if its file identity still matches the original
+    ///   reservation. Different-file replacements and paths whose identity
+    ///   cannot be checked are left untouched; a link to the reserved file may
+    ///   still be removed. Cleanup is best effort: identity lookup
+    ///   or removal failures are not reported, so an error does not imply that
+    ///   no output exists. Discard leftovers only after confirming they belong
+    ///   to this call, never a pre-existing destination or someone else's
+    ///   replacement.
     ///
     /// The destinations are expected to be stable paths in a directory the
     /// caller controls for the duration of the call. Each output is checked
     /// to still be the file that was reserved and written before it is
-    /// patched, but that is a consistency check, not a lock: a path replaced
-    /// between the check and the reopen is not detected, and the verification
-    /// reopen after the handles are dropped is unguarded.
+    /// patched. Neither this check nor cleanup's identity check is a lock:
+    /// replacement between a check and the path-based reopen or unlink is
+    /// still possible. Reservation handles remain open through optional
+    /// verification, but its path-based reopen has no additional identity
+    /// check.
     ///
     /// # Returns
     /// * The bytes of the c2pa_manifest that was embedded in every rendition.
@@ -7532,18 +7533,15 @@ mod tests {
         let phases: Vec<ProgressPhase> = r.iter().map(|(p, _, _)| p.clone()).collect();
         assert!(
             phases.contains(&ProgressPhase::VerifyingIngredient),
-            "expected VerifyingIngredient phase, got {:?}",
-            phases
+            "expected VerifyingIngredient phase, got {phases:?}"
         );
         assert!(
             phases.contains(&ProgressPhase::Hashing),
-            "expected Hashing phase, got {:?}",
-            phases
+            "expected Hashing phase, got {phases:?}"
         );
         assert!(
             phases.contains(&ProgressPhase::VerifyingManifest),
-            "expected VerifyingManifest phase (verify_after_sign), got {:?}",
-            phases
+            "expected VerifyingManifest phase (verify_after_sign), got {phases:?}"
         );
         // All checkpoints must have a valid step/total relationship:
         // step >= 1, total >= 1 (or total == 0 for indeterminate), step <= total.
@@ -7573,8 +7571,7 @@ mod tests {
         let result = builder.save_to_stream("image/jpeg", &mut source, &mut dest);
         assert!(
             matches!(result, Err(crate::Error::OperationCancelled)),
-            "expected OperationCancelled, got {:?}",
-            result
+            "expected OperationCancelled, got {result:?}"
         );
         Ok(())
     }
@@ -7638,8 +7635,7 @@ mod tests {
         let result = handle.join().expect("thread should join");
         assert!(
             matches!(result, Err(crate::Error::OperationCancelled)),
-            "expected OperationCancelled, got {:?}",
-            result
+            "expected OperationCancelled, got {result:?}"
         );
         Ok(())
     }

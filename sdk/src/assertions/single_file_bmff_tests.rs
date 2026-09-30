@@ -1,6 +1,9 @@
 // Copyright 2026 Adobe. All rights reserved.
 // Licensed under the Apache License, Version 2.0 or the MIT license.
 
+// Fixture setup and validation intentionally panic on unexpected results.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::io::{Cursor, Seek};
 
 use sha2::{Digest, Sha256};
@@ -86,7 +89,7 @@ fn named(list: &[B], kind: &[u8; 4]) -> B {
 
 fn binding(data: &[u8]) -> BmffHash {
     let reader = Reader::default()
-        .with_stream("video/mp4", &mut Cursor::new(data))
+        .with_stream("video/mp4", Cursor::new(data))
         .unwrap();
     assert_ne!(
         reader.validation_state(),
@@ -243,14 +246,14 @@ fn check_output(original: &[u8], signed: &[u8]) {
             u16::from_be_bytes(signed[entries - 2..entries].try_into().unwrap()),
             count as u16
         );
-        for i in 0..count {
+        for (i, moof) in moofs.iter().enumerate() {
             assert_eq!(start as u64, c2pa.bmff_merkle_box_infos[i].start());
             let length = u32_at(signed, entries + 12 * i);
             assert_eq!(length & 0x80000000, 0);
             start += length as usize;
             let mdat = root
                 .iter()
-                .find(|b| b.kind == *b"mdat" && b.start > moofs[i].start)
+                .find(|b| b.kind == *b"mdat" && b.start > moof.start)
                 .unwrap();
             assert_eq!(start, mdat.end);
         }
@@ -485,9 +488,11 @@ impl DynamicAssertion for Dynamic {
     fn label(&self) -> String {
         "com.castlabs.fragment-test".into()
     }
+
     fn reserve_size(&self) -> Result<usize> {
         Ok(64)
     }
+
     fn content(
         &self,
         _: &str,
@@ -510,15 +515,19 @@ impl Signer for DynamicSigner {
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
         self.0.sign(data)
     }
+
     fn alg(&self) -> SigningAlg {
         self.0.alg()
     }
+
     fn certs(&self) -> Result<Vec<Vec<u8>>> {
         self.0.certs()
     }
+
     fn reserve_size(&self) -> usize {
         self.0.reserve_size()
     }
+
     fn dynamic_assertions(&self) -> Vec<Box<dyn DynamicAssertion>> {
         vec![Box::new(Dynamic)]
     }
@@ -910,8 +919,8 @@ fn invalid_sibling_of(own: &super::MerkleMap) -> super::MerkleMap {
         local_id: own.local_id,
         count: own.count + 2,
         alg: own.alg.clone(),
-        init_hash: Some(ByteBuf::from(vec![0xAA; 32])),
-        hashes: super::VecByteBuf(vec![ByteBuf::from(vec![0xBB; 32]); own.count + 2]),
+        init_hash: Some(ByteBuf::from(vec![0xaa; 32])),
+        hashes: super::VecByteBuf(vec![ByteBuf::from(vec![0xbb; 32]); own.count + 2]),
         fixed_block_size: None,
         variable_block_sizes: None,
     }

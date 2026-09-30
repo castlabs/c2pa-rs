@@ -99,11 +99,11 @@ impl CimplError {
     }
 
     pub fn untracked_pointer(ptr: u64) -> Self {
-        Self::new(3, format!("UntrackedPointer: 0x{:x}", ptr))
+        Self::new(3, format!("UntrackedPointer: 0x{ptr:x}"))
     }
 
     pub fn wrong_pointer_type(ptr: u64) -> Self {
-        Self::new(4, format!("WrongPointerType: 0x{:x}", ptr))
+        Self::new(4, format!("WrongPointerType: 0x{ptr:x}"))
     }
 
     pub fn mutex_poisoned() -> Self {
@@ -111,7 +111,7 @@ impl CimplError {
     }
 
     pub fn invalid_buffer_size(size: usize, param: &str) -> Self {
-        Self::new(7, format!("InvalidBufferSize: {} for '{}'", size, param))
+        Self::new(7, format!("InvalidBufferSize: {size} for '{param}'"))
     }
 
     pub fn other<S: Into<String>>(msg: S) -> Self {

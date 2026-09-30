@@ -392,7 +392,7 @@ mod tests {
         let mut cursor = Cursor::new(MINIMAL_FLAC);
         match flac_io.read_cai(&mut cursor) {
             Err(Error::JumbfNotFound) => {}
-            other => panic!("expected JumbfNotFound for pure FLAC, got {:?}", other),
+            other => panic!("expected JumbfNotFound for pure FLAC, got {other:?}"),
         }
     }
 
@@ -409,7 +409,7 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         match flac_io.read_cai(&mut cursor) {
             Err(Error::FlacError(FlacError::InvalidId3Version)) => {}
-            other => panic!("expected FlacError(InvalidId3Version), got {:?}", other),
+            other => panic!("expected FlacError(InvalidId3Version), got {other:?}"),
         }
     }
 
@@ -444,7 +444,7 @@ mod tests {
         let mut cursor = Cursor::new(MINIMAL_FLAC);
         match reader.read_cai(&mut cursor) {
             Err(Error::JumbfNotFound) => {}
-            other => panic!("unexpected: {:?}", other),
+            other => panic!("unexpected: {other:?}"),
         }
         assert!(handler.supported_types().contains(&"audio/flac"));
     }
@@ -455,7 +455,7 @@ mod tests {
         let path = Path::new("/nonexistent/sample.flac");
         match flac_io.read_cai_store(path) {
             Err(Error::IoError(_)) => {}
-            other => panic!("expected IoError for missing file, got {:?}", other),
+            other => panic!("expected IoError for missing file, got {other:?}"),
         }
     }
 }

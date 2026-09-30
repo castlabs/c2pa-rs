@@ -448,10 +448,7 @@ pub(crate) mod test_helpers {
         let mut cursor = Cursor::new(buf);
         match handler.get_reader().read_cai(&mut cursor) {
             Err(Error::UnsupportedType) => {}
-            other => panic!(
-                "expected UnsupportedType for unknown magic, got {:?}",
-                other
-            ),
+            other => panic!("expected UnsupportedType for unknown magic, got {other:?}"),
         }
     }
 
@@ -461,7 +458,7 @@ pub(crate) mod test_helpers {
         let mut cursor = Cursor::new(b"abc");
         match handler.get_reader().read_cai(&mut cursor) {
             Err(Error::IoError(_)) => {}
-            other => panic!("expected IoError for short stream, got {:?}", other),
+            other => panic!("expected IoError for short stream, got {other:?}"),
         }
     }
 
@@ -495,14 +492,10 @@ pub(crate) mod test_helpers {
             Ok(data) => {
                 assert!(
                     data == b"first" || data == b"second",
-                    "if one GEOB returned, must be first or second; got {:?}",
-                    data
+                    "if one GEOB returned, must be first or second; got {data:?}"
                 );
             }
-            other => panic!(
-                "expected TooManyManifestStores or Ok(first|second), got {:?}",
-                other
-            ),
+            other => panic!("expected TooManyManifestStores or Ok(first|second), got {other:?}"),
         }
     }
 
@@ -543,7 +536,7 @@ pub(crate) mod test_helpers {
         {
             Err(Error::InvalidAsset(msg))
                 if msg.contains("patch_cai_store store size mismatch") => {}
-            other => panic!("expected InvalidAsset(size mismatch), got {:?}", other),
+            other => panic!("expected InvalidAsset(size mismatch), got {other:?}"),
         }
     }
 
@@ -621,10 +614,9 @@ pub(crate) mod test_helpers {
         out_buf.set_position(0);
         match handler.get_reader().read_cai(&mut out_buf) {
             Err(Error::JumbfNotFound) => {}
-            other => panic!(
-                "expected JumbfNotFound after remove_cai_store_from_stream, got {:?}",
-                other
-            ),
+            other => {
+                panic!("expected JumbfNotFound after remove_cai_store_from_stream, got {other:?}")
+            }
         }
     }
 
@@ -642,10 +634,9 @@ pub(crate) mod test_helpers {
         out_buf.set_position(0);
         match handler.get_reader().read_cai(&mut out_buf) {
             Err(Error::JumbfNotFound) => {}
-            other => panic!(
-                "expected JumbfNotFound after write_cai with empty store, got {:?}",
-                other
-            ),
+            other => {
+                panic!("expected JumbfNotFound after write_cai with empty store, got {other:?}")
+            }
         }
     }
 
@@ -659,7 +650,7 @@ pub(crate) mod test_helpers {
             RemoteRefEmbedType::StegoS("x".to_string()),
         ) {
             Err(Error::UnsupportedType) => {}
-            other => panic!("expected UnsupportedType for StegoS, got {:?}", other),
+            other => panic!("expected UnsupportedType for StegoS, got {other:?}"),
         }
     }
 

@@ -2924,7 +2924,7 @@ mod bmff_hash_tests {
         asset.extend_from_slice(b"ftyp");
         asset.extend_from_slice(b"isom\x00\x00\x00\x00");
         for _ in 0..2 {
-            let payload = vec![0xABu8; 4096];
+            let payload = vec![0xabu8; 4096];
             asset.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
             asset.extend_from_slice(b"mdat");
             asset.extend_from_slice(&payload);
