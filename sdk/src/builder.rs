@@ -3053,16 +3053,37 @@ impl Builder {
     ///
     /// Note: Currently this does not support files with existing C2PA manifest.
     ///
+    /// Every rendition is written to `<output_path>/<name of the init segment's
+    /// parent directory>/`, so the renditions' parent directories must have
+    /// distinct names. Names are compared case-insensitively on every
+    /// filesystem, deliberately, because the output filesystem may fold case
+    /// even when the input's does not; the comparison lowercases the name and
+    /// is neither Unicode normalization nor a filesystem identity check, so it
+    /// is a conservative rule rather than a guarantee, and only ASCII names
+    /// have been exercised across platforms.
+    ///
+    /// The whole set is checked before anything is signed or created, so each
+    /// of the following is refused with nothing written: two renditions whose
+    /// parent directories share a name; an output directory that is a link,
+    /// even a dangling one, or that is another rendition's output directory
+    /// under a different name; an output directory that is a source rendition
+    /// directory; a fragment whose flattened file name equals the init's or
+    /// another fragment's, compared case-insensitively as above; a fragment
+    /// glob that matches the init itself, or that matches no media segment
+    /// for a rendition.
+    ///
     /// # Arguments
     /// * `signer` - The signer to use.
     /// * `asset_path` - The path to the primary asset file or glob pattern if there are mulitple init segments in a set.
     /// * `fragment_glob` - The glob pattern to the fragmented files. Do not use the full path, only the
     /// *   pattern to find the fragmented files in the same directory/subdirectory as the asset file. For example,
     /// *   if your fragmented files are named `video_1.m4s`, `video_2.m4s`, etc., then the glob pattern should be `video_*.m4s`.
+    /// *   It is applied per rendition and must match at least one segment in each.
     /// * `output_path` - The path to the output file.
     ///
     /// # Errors
-    /// * Returns an [`Error`] if the manifest cannot be signed.
+    /// * Returns an [`Error`] if the manifest cannot be signed, or if the
+    ///   rendition set fails any of the checks above.
     #[cfg(feature = "file_io")]
     pub fn sign_fragmented_files<P: AsRef<Path>>(
         &mut self,

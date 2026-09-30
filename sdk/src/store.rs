@@ -3002,6 +3002,183 @@ impl Store {
 
         let mut output_map = HashMap::new();
 
+        // Expand every rendition first and settle where each file will be
+        // written, so that nothing is signed or created until the whole set
+        // is known to be safe.
+        //
+        // Every rendition is written to `<output>/<name of the init's parent
+        // dir>/<file name>`, flattening whatever directory structure the
+        // fragment glob reached into. Three things can collide there, each
+        // silently replacing a file the claim still carries a hash for:
+        //  - two renditions whose init parents share a name (`a/video/init.mp4`
+        //    and `b/video/init.mp4`). Names are compared case-insensitively on
+        //    EVERY filesystem, deliberately: the output filesystem may fold
+        //    case even when the input's does not, and the restriction has to
+        //    hold wherever the outputs land. The comparison is a Unicode
+        //    lowercase of the name, not a normalization (`é` and `e\u{301}`
+        //    stay distinct) and not a filesystem identity check, so it is a
+        //    conservative rule, not a promise of detecting every alias; only
+        //    ASCII names have been exercised across platforms;
+        //  - two rendition output directories that already exist and are the
+        //    same directory under different names (`out/high -> out/low`), or
+        //    an output directory that IS a source rendition directory;
+        //  - a fragment whose file name equals the init's or another
+        //    fragment's after flattening (`segments/init.mp4` next to
+        //    `init.mp4`), which the init writer would then replace.
+        struct Rendition {
+            init: PathBuf,
+            fragments: Vec<PathBuf>,
+            output_dir: PathBuf,
+        }
+        let mut renditions: Vec<Rendition> = Vec::with_capacity(init_paths.len());
+        let mut rendition_dirs: HashMap<String, PathBuf> = HashMap::new();
+        let mut output_identities: HashMap<PathBuf, PathBuf> = HashMap::new();
+        let input_dirs: Vec<PathBuf> = init_paths
+            .iter()
+            .filter_map(|p| p.parent())
+            .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf()))
+            .collect();
+        for init_path in init_paths {
+            // make sure it is a supported BMFF format
+            match get_supported_file_extension(init_path.as_ref()) {
+                Some(ext) => {
+                    if !is_bmff_format(&ext) {
+                        return Err(Error::UnsupportedType);
+                    }
+                }
+                None => return Err(Error::UnsupportedType),
+            }
+
+            let init_dir = init_path
+                .parent()
+                .ok_or(Error::BadParam(
+                    "failed to get parent directory for init segment".to_string(),
+                ))?
+                .to_path_buf();
+            let name = init_dir
+                .file_name()
+                .ok_or(Error::BadParam("init segment bad file name".to_string()))?
+                .to_owned();
+            let canonical_input =
+                std::fs::canonicalize(&init_dir).unwrap_or_else(|_| init_dir.clone());
+            let key = name.to_string_lossy().to_lowercase();
+            if let Some(previous) = rendition_dirs.insert(key, canonical_input.clone()) {
+                return Err(Error::BadParam(if previous == canonical_input {
+                    format!(
+                        "init segment directory {} was given more than once",
+                        canonical_input.display()
+                    )
+                } else {
+                    format!(
+                        "init segments in {} and {} would both be written to {}; rendition directories must have distinct names",
+                        previous.display(),
+                        canonical_input.display(),
+                        output_path.as_ref().join(&name).display()
+                    )
+                }));
+            }
+
+            let new_output_path = output_path.as_ref().join(&name);
+            // A symlink where the rendition's directory goes is refused
+            // whether or not its target exists yet: a dangling `out/z ->
+            // out/a` would come alive once rendition `a` is written and
+            // send rendition `z` into the same directory.
+            if std::fs::symlink_metadata(&new_output_path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(Error::BadParam(format!(
+                    "output directory {} is a symlink; every rendition needs its own real directory",
+                    new_output_path.display()
+                )));
+            }
+            if let Ok(canonical_output) = std::fs::canonicalize(&new_output_path) {
+                if input_dirs.contains(&canonical_output) {
+                    return Err(Error::BadParam(format!(
+                        "output directory {} is a source rendition directory; signing would overwrite the input",
+                        new_output_path.display()
+                    )));
+                }
+                if let Some(previous) =
+                    output_identities.insert(canonical_output.clone(), new_output_path.clone())
+                {
+                    return Err(Error::BadParam(format!(
+                        "output directories {} and {} are the same directory ({}); every rendition needs its own",
+                        previous.display(),
+                        new_output_path.display(),
+                        canonical_output.display()
+                    )));
+                }
+            }
+
+            // build the list of fragments for this init segment based on the glob pattern
+            let mut fragments = Vec::new();
+            let frag_glob = init_dir.join(fragment_glob.as_ref());
+            let frag_glob_str = frag_glob
+                .to_str()
+                .ok_or(Error::BadParam("glob pattern is not valid".to_string()))?; // segment match pattern
+
+            // grab the fragments that go with this init segment
+            for entry in glob::glob(frag_glob_str)
+                .map_err(|e| Error::BadParam(format!("glob pattern is not valid: {e}")))?
+            {
+                match entry {
+                    Ok(path) => fragments.push(path),
+                    Err(e) => {
+                        return Err(Error::BadParam(format!(
+                            "error processing glob pattern: {e}"
+                        )))
+                    }
+                }
+            }
+
+            // A rendition without fragments is a layout error, and a cheap one
+            // to catch here: `add_merkmap_for_rendition` would refuse it too,
+            // but only when that rendition's turn comes, by which time earlier
+            // rungs have already been written.
+            if fragments.is_empty() {
+                return Err(Error::BadParam(format!(
+                    "fragment glob {} matched no media segments for init segment {}",
+                    frag_glob.display(),
+                    init_path.display()
+                )));
+            }
+
+            // every written name within the rendition must be distinct
+            let mut written: HashMap<String, PathBuf> = HashMap::new();
+            for file in std::iter::once(init_path).chain(fragments.iter()) {
+                let file_name = file
+                    .file_name()
+                    .ok_or(Error::BadParam(format!(
+                        "{} has no file name",
+                        file.display()
+                    )))?
+                    .to_string_lossy()
+                    .to_lowercase();
+                if let Some(previous) = written.insert(file_name.clone(), file.clone()) {
+                    return Err(Error::BadParam(if &previous == file {
+                        format!(
+                            "the fragment glob matches the init segment {} itself; it must match only media segments",
+                            file.display()
+                        )
+                    } else {
+                        format!(
+                            "{} and {} would both be written to {}; fragment and init file names must be distinct within a rendition",
+                            previous.display(),
+                            file.display(),
+                            new_output_path.join(&file_name).display()
+                        )
+                    }));
+                }
+            }
+
+            renditions.push(Rendition {
+                init: init_path.clone(),
+                fragments,
+                output_dir: new_output_path,
+            });
+        }
+
         // make sure output path is not a file
         if output_path.as_ref().is_file() {
             return Err(crate::Error::BadParam(
@@ -3026,63 +3203,20 @@ impl Store {
         }
 
         // add a Merkle tree map for each init segment and its associated fragments
-        for (i, init_path) in init_paths.iter().enumerate() {
-            // make sure it is a supported BMFF format
-            match get_supported_file_extension(init_path.as_ref()) {
-                Some(ext) => {
-                    if !is_bmff_format(&ext) {
-                        return Err(Error::UnsupportedType);
-                    }
-                }
-                None => return Err(Error::UnsupportedType),
-            }
-
-            // build the list of fragments for this init segment based on the glob pattern
-            let mut fragments = Vec::new();
-            let init_dir = init_path
-                .parent()
-                .ok_or(Error::BadParam(
-                    "failed to get parent directory for init segment".to_string(),
-                ))?
-                .to_path_buf();
-            let frag_glob = init_dir.join(fragment_glob.as_ref());
-            let frag_glob_str = frag_glob
-                .to_str()
-                .ok_or(Error::BadParam("glob pattern is not valid".to_string()))?; // segment match pattern
-
-            // grab the fragments that go with this init segment
-            for entry in glob::glob(frag_glob_str)
-                .map_err(|e| Error::BadParam(format!("glob pattern is not valid: {e}")))?
-            {
-                match entry {
-                    Ok(path) => fragments.push(path),
-                    Err(e) => {
-                        return Err(Error::BadParam(format!(
-                            "error processing glob pattern: {e}"
-                        )))
-                    }
-                }
-            }
-
-            let new_output_path = output_path.as_ref().join(
-                init_dir
-                    .file_name()
-                    .ok_or(Error::BadParam("init segment bad file name".to_string()))?,
-            );
-
+        for (i, rendition) in renditions.iter().enumerate() {
             // add the Merkle tree map for this rendition
             // creating fragments in the output location
             let unique_id = i + 1;
             let local_id = i + 1;
             self.add_merkmap_for_rendition(
-                &fragments,
+                &rendition.fragments,
                 local_id, // local id for this rendition (same as unique since we are only doing one rendition per claim for now)
                 unique_id, // unique id for this rendition
-                &new_output_path,
+                &rendition.output_dir,
                 context.settings(),
             )?;
 
-            output_map.insert(init_path.to_owned(), (unique_id, local_id));
+            output_map.insert(rendition.init.clone(), (unique_id, local_id));
         }
 
         // now save the manifest to each output init segment (the manifest is the same for each segment per the spec to allow related rendtions to be validated as a set)
@@ -9192,6 +9326,231 @@ pub mod tests {
 
         assert!(!report.has_any_error());
         // std::fs::write("target/test.jpg", result).unwrap();
+    }
+
+    /// A rendition whose fragment glob matches nothing is refused during
+    /// preflight, before any rendition is written. Checked with two rungs,
+    /// the first complete and the second an init with no segments: the old
+    /// order signed the first rung and only then discovered the second was
+    /// empty, leaving a partial ladder on disk.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_fragmented_refuses_an_empty_fragment_match_before_writing_anything() {
+        let context = crate::context::Context::new();
+        let tempdir = tempdirectory().expect("temp dir");
+        let root = tempdir.path();
+
+        let source_init =
+            glob::glob(&fixture_path("bunny/**/BigBuckBunny_2s_init.mp4").to_string_lossy())
+                .unwrap()
+                .flatten()
+                .next()
+                .expect("a bunny init segment");
+        let source_dir = source_init.parent().unwrap();
+
+        // Rung `a` is complete; rung `b` has the init segment and nothing else.
+        let complete = root.join("a");
+        let empty = root.join("b");
+        std::fs::create_dir_all(&complete).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        for entry in std::fs::read_dir(source_dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("BigBuckBunny_2s") && entry.path().is_file() {
+                std::fs::copy(entry.path(), complete.join(&name)).unwrap();
+            }
+        }
+        std::fs::copy(&source_init, empty.join("BigBuckBunny_2s_init.mp4")).unwrap();
+        assert!(
+            std::fs::read_dir(&complete).unwrap().count() > 1,
+            "the complete rung should carry fragments"
+        );
+
+        let output_path = root.join("output");
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let signer = test_cawg_signer(SigningAlg::Ps256, &[labels::SCHEMA_ORG]).unwrap();
+        let error = store
+            .save_to_bmff_fragmented(
+                &[
+                    complete.join("BigBuckBunny_2s_init.mp4"),
+                    empty.join("BigBuckBunny_2s_init.mp4"),
+                ],
+                &PathBuf::from("BigBuckBunny_2s*.m4s"),
+                &output_path,
+                signer.as_ref(),
+                &context,
+            )
+            .unwrap_err();
+        assert!(
+            !output_path.exists() || std::fs::read_dir(&output_path).unwrap().count() == 0,
+            "the complete rung's fragments were written despite the refusal"
+        );
+        assert!(
+            error.to_string().contains("matched no media segments"),
+            "{error}"
+        );
+    }
+
+    /// Rendition directory names are compared case-insensitively on every
+    /// filesystem: `a/Video` and `b/video` would land in one output
+    /// directory wherever the output filesystem folds case, so they are
+    /// refused everywhere, with nothing written.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_fragmented_refuses_rendition_directories_that_differ_only_by_case() {
+        let context = crate::context::Context::new();
+        let tempdir = tempdirectory().expect("temp dir");
+        let root = tempdir.path();
+        let source_init =
+            glob::glob(&fixture_path("bunny/**/BigBuckBunny_2s_init.mp4").to_string_lossy())
+                .unwrap()
+                .flatten()
+                .next()
+                .expect("a bunny init segment");
+        let source_dir = source_init.parent().unwrap();
+
+        let mut inits = Vec::new();
+        for (parent, name) in [("a", "Video"), ("b", "video")] {
+            let dir = root.join(parent).join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            for entry in std::fs::read_dir(source_dir).unwrap().flatten() {
+                let file_name = entry.file_name();
+                if file_name.to_string_lossy().starts_with("BigBuckBunny_2s")
+                    && entry.path().is_file()
+                {
+                    std::fs::copy(entry.path(), dir.join(&file_name)).unwrap();
+                }
+            }
+            inits.push(dir.join("BigBuckBunny_2s_init.mp4"));
+        }
+
+        let output_path = root.join("output");
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let signer = test_cawg_signer(SigningAlg::Ps256, &[labels::SCHEMA_ORG]).unwrap();
+        let error = store
+            .save_to_bmff_fragmented(
+                &inits,
+                &PathBuf::from("BigBuckBunny_2s*.m4s"),
+                &output_path,
+                signer.as_ref(),
+                &context,
+            )
+            .unwrap_err();
+        assert!(
+            !output_path.exists() || std::fs::read_dir(&output_path).unwrap().count() == 0,
+            "something was written despite the refusal"
+        );
+        assert!(
+            error.to_string().contains("would both be written to"),
+            "{error}"
+        );
+    }
+
+    /// Two fragments that flatten to one file name -- `x/BigBuckBunny_2s_seg.m4s`
+    /// and `y/BigBuckBunny_2s_SEG.m4s`, reached by the same glob -- would
+    /// overwrite each other in the rendition's output directory. Refused with
+    /// nothing written, and compared case-insensitively like the directory
+    /// names are.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_fragmented_refuses_fragments_that_flatten_onto_each_other() {
+        let context = crate::context::Context::new();
+        let tempdir = tempdirectory().expect("temp dir");
+        let root = tempdir.path();
+        let source_init =
+            glob::glob(&fixture_path("bunny/**/BigBuckBunny_2s_init.mp4").to_string_lossy())
+                .unwrap()
+                .flatten()
+                .next()
+                .expect("a bunny init segment");
+        let source_fragment = std::fs::read_dir(source_init.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "m4s"))
+            .expect("a bunny fragment");
+
+        let video = root.join("video");
+        std::fs::create_dir_all(video.join("x")).unwrap();
+        std::fs::create_dir_all(video.join("y")).unwrap();
+        std::fs::copy(&source_init, video.join("BigBuckBunny_2s_init.mp4")).unwrap();
+        std::fs::copy(
+            &source_fragment,
+            video.join("x").join("BigBuckBunny_2s_seg.m4s"),
+        )
+        .unwrap();
+        std::fs::copy(
+            &source_fragment,
+            video.join("y").join("BigBuckBunny_2s_SEG.m4s"),
+        )
+        .unwrap();
+
+        let output_path = root.join("output");
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let signer = test_cawg_signer(SigningAlg::Ps256, &[labels::SCHEMA_ORG]).unwrap();
+        let error = store
+            .save_to_bmff_fragmented(
+                &[video.join("BigBuckBunny_2s_init.mp4")],
+                &PathBuf::from("*/BigBuckBunny_2s_*.m4s"),
+                &output_path,
+                signer.as_ref(),
+                &context,
+            )
+            .unwrap_err();
+        assert!(
+            !output_path.exists() || std::fs::read_dir(&output_path).unwrap().count() == 0,
+            "something was written despite the refusal"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("fragment and init file names must be distinct"),
+            "{error}"
+        );
+    }
+
+    /// The same rendition twice is not two renditions: both would be written
+    /// to one output directory, the second replacing the first while the
+    /// claim carried a Merkle map for each. Only a direct caller can express
+    /// it -- a glob cannot expand to the same path twice -- so it is checked
+    /// here rather than through the C API.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_fragmented_refuses_the_same_init_twice() {
+        let context = crate::context::Context::new();
+        let tempdir = tempdirectory().expect("temp dir");
+        let output_path = tempdir.path();
+
+        let init = glob::glob(&fixture_path("bunny/**/BigBuckBunny_2s_init.mp4").to_string_lossy())
+            .unwrap()
+            .flatten()
+            .next()
+            .expect("a bunny init segment");
+
+        let mut store = Store::from_context(&context);
+        store.commit_claim(create_test_claim().unwrap()).unwrap();
+        let signer = test_cawg_signer(SigningAlg::Ps256, &[labels::SCHEMA_ORG]).unwrap();
+        let error = store
+            .save_to_bmff_fragmented(
+                &[init.clone(), init],
+                &PathBuf::from("BigBuckBunny_2s*.m4s"),
+                &output_path.to_path_buf(),
+                signer.as_ref(),
+                &context,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("was given more than once"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(output_path).unwrap().count(),
+            0,
+            "something was written despite the refusal"
+        );
     }
 
     #[test]
