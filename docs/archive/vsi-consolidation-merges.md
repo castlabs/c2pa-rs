@@ -145,3 +145,10 @@ True merge (`--no-ff`) of `contentauth/c2pa-rs` `main` @`69907b5a` into
   (`cawg.identity.assertion.mismatch`) rather than returned early, except under
   stop-on-first-error.
 
+- Independent review of the merge: approved with nits (docs wording above).
+  Rust 1.96.0 gates at merge `f8f787cf`: SDK library 1451 passed / 17
+  ignored; BMFF timed-media 27 passed; FFI 204 passed / 25 example doctests
+  ignored; c2patool 25 unit + 38 integration passed; qualification support,
+  C11 header/prototypes, trusted capability mask 63 and formatting passed.
+  Debug library SHA-256
+  `0401bf3da2060fbdae3223ec0feb926f836b59604d9d4fe9c993122e29d5b6fe`.
