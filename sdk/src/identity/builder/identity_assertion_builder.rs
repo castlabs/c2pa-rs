@@ -486,6 +486,7 @@ mod tests {
     const TEST_IMAGE: &[u8] = include_bytes!("../../../tests/fixtures/CA.jpg");
     const TEST_THUMBNAIL: &[u8] = include_bytes!("../../../tests/fixtures/thumbnail.jpg");
 
+    #[allow(clippy::expect_used)]
     #[test]
     fn padding_and_capacity_cover_cbor_boundaries_without_panics() {
         use super::finalize_identity_assertion;

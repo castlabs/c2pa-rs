@@ -3260,7 +3260,7 @@ pub unsafe extern "C" fn c2pa_signer_create(
 ///
 /// Registrations are retained by the signer in call order, including multiple
 /// registrations with the same label. If the signer is transferred to a
-/// [`C2paContext`] with [`c2pa_context_builder_set_signer`], the context retains
+/// `C2paContext` with [`c2pa_context_builder_set_signer`], the context retains
 /// the registrations with it.
 ///
 /// The callback and the pointee addressed by `context` remain owned by the

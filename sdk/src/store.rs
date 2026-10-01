@@ -2393,6 +2393,7 @@ impl Store {
     /// slots: every dynamic assertion must match an existing exact reservation
     /// (resolved in registration order against the last matching slots), so
     /// the signed store keeps the reserved layout.
+    #[cfg(any(test, feature = "unstable_live_video"))]
     pub(crate) fn sign_manifest_reserved(
         &mut self,
         signer: &dyn Signer,

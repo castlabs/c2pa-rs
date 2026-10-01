@@ -885,6 +885,8 @@ mod tests {
     use std::io::Cursor;
 
     use c2pa_macros::c2pa_test_async;
+    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+    use wasm_bindgen_test::wasm_bindgen_test;
 
     use super::*;
     use crate::{
@@ -894,6 +896,7 @@ mod tests {
     };
 
     #[c2pa_test_async]
+    #[allow(clippy::unwrap_used)]
     async fn timestamp_trust_requires_tsa_purpose() {
         let context = Context::new();
         let (bytes, _) = Store::load_jumbf_from_stream(
