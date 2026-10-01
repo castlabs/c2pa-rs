@@ -26,7 +26,7 @@ use crate::{
     error::{Error, Result},
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
-        LIVEVIDEO_ASSERTION_INVALID, LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
+        LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
     },
 };
 
@@ -177,11 +177,10 @@ impl LiveVideoValidator {
         tracker: &mut StatusTracker,
     ) -> Result<()> {
         if let Some(previous) = &self.previous_segment {
-            let expected = previous.sequence_number.checked_add(1);
-            if expected != Some(seq_num) {
+            if seq_num <= previous.sequence_number {
                 return fail_validation(
-                    "VSI sequenceNumber must advance exactly by one from the previous segment",
-                    LIVEVIDEO_ASSERTION_INVALID,
+                    "VSI sequenceNumber must be strictly greater than the previous segment's",
+                    LIVEVIDEO_SEGMENT_INVALID,
                     tracker,
                 );
             }
@@ -564,6 +563,10 @@ mod tests {
     use coset::TaggedCborSerializable;
 
     use super::super::{test_helpers::*, LiveVideoValidator};
+    #[cfg(feature = "rust_native_crypto")]
+    use super::super::{LIVEVIDEO_SEGMENT_GAP, LIVEVIDEO_SEGMENT_LEADING_GAP};
+    #[cfg(feature = "rust_native_crypto")]
+    use crate::status_tracker::{ErrorBehavior, LogKind, StatusTracker};
     use crate::{
         assertions::{SessionKey, SessionKeys},
         cbor_types::DateT,
@@ -959,6 +962,7 @@ mod tests {
     fn vsi_valid_sequence_advances_state() {
         use vsi_crypto_helpers::*;
         let (mut validator, signing_key) = setup_vsi_validator();
+        validator.session_keys[0].min_sequence_number = 1;
         let mut tracker = aggregate_tracker();
 
         validator
@@ -985,10 +989,251 @@ mod tests {
 
     #[cfg(feature = "rust_native_crypto")]
     #[test]
+    fn vsi_gap_and_following_segment_succeed_with_informational_coverage() {
+        use vsi_crypto_helpers::*;
+
+        let (mut validator, signing_key) = setup_vsi_validator();
+        validator.session_keys[0].min_sequence_number = 1;
+        let mut tracker = StatusTracker::with_error_behavior(ErrorBehavior::StopOnFirstError);
+
+        for sequence_number in [1, 3, 4] {
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(sequence_number, TEST_MANIFEST_ID, &signing_key),
+                    &mut tracker,
+                )
+                .unwrap();
+        }
+
+        let coverage = validator.sequence_coverage();
+        assert_eq!(coverage.missing_ranges, vec![2..=2]);
+        assert_eq!(coverage.total_missing, 1);
+        assert!(!coverage.ranges_truncated);
+        assert_eq!(tracker.filter_errors().count(), 0);
+        assert_eq!(tracker.logged_items().len(), 1);
+        let gap = &tracker.logged_items()[0];
+        assert_eq!(
+            gap.validation_status.as_deref(),
+            Some(LIVEVIDEO_SEGMENT_GAP)
+        );
+        assert_eq!(gap.kind, LogKind::Informational);
+        assert!(gap.err_val.is_none());
+        assert_eq!(
+            validator.previous_segment.as_ref().unwrap().sequence_number,
+            4
+        );
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_equal_sequence_number_with_fresh_emsg_id_fails() {
+        use vsi_crypto_helpers::*;
+
+        let (mut validator, signing_key) = setup_vsi_validator();
+        validator.session_keys[0].min_sequence_number = 1;
+        let mut tracker = aggregate_tracker();
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(1, TEST_MANIFEST_ID, &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+
+        let mut duplicate = make_signed_vsi_segment(1, TEST_MANIFEST_ID, &signing_key);
+        // The VSI emsg is hash-excluded; a fresh event ID isolates sequence equality
+        // from replay detection without changing the authenticated payload or media.
+        let id_offset = 12 + b"urn:c2pa:verifiable-segment-info\0".len() + b"fseg\0".len() + 12;
+        duplicate[id_offset..id_offset + 4].copy_from_slice(&2u32.to_be_bytes());
+        validator
+            .validate_verifiable_segment_info(&duplicate, &mut tracker)
+            .unwrap();
+
+        let failures: Vec<_> = tracker.filter_errors().collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].validation_status.as_deref(),
+            Some(LIVEVIDEO_SEGMENT_INVALID)
+        );
+        assert!(failures[0].description.contains("strictly greater"));
+        assert_eq!(validator.sequence_coverage().total_missing, 0);
+        assert_eq!(
+            validator.previous_segment.as_ref().unwrap().sequence_number,
+            1
+        );
+
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(2, TEST_MANIFEST_ID, &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+        assert_eq!(tracker.filter_errors().count(), 1);
+        assert_eq!(validator.sequence_coverage().total_missing, 0);
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_leading_gap_uses_literal_session_key_minimum() {
+        use vsi_crypto_helpers::*;
+
+        for (minimum, first, expected_range, expected_total) in
+            [(10, 12, 10..=11, 2u128), (0, 1, 0..=0, 1u128)]
+        {
+            let (mut validator, signing_key) = setup_vsi_validator();
+            validator.session_keys[0].min_sequence_number = minimum;
+            let mut tracker = aggregate_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(first, TEST_MANIFEST_ID, &signing_key),
+                    &mut tracker,
+                )
+                .unwrap();
+
+            let coverage = validator.sequence_coverage();
+            assert_eq!(coverage.missing_ranges, vec![expected_range]);
+            assert_eq!(coverage.total_missing, expected_total);
+            assert!(!coverage.ranges_truncated);
+            assert_eq!(tracker.filter_errors().count(), 0);
+            assert_eq!(tracker.logged_items().len(), 1);
+            let gap = &tracker.logged_items()[0];
+            assert_eq!(
+                gap.validation_status.as_deref(),
+                Some(LIVEVIDEO_SEGMENT_LEADING_GAP)
+            );
+            assert_eq!(gap.kind, LogKind::Informational);
+            assert!(gap.err_val.is_none());
+        }
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_rejected_media_or_signature_does_not_record_gap_or_advance() {
+        use vsi_crypto_helpers::*;
+
+        for tamper_media in [true, false] {
+            let (mut validator, signing_key) = setup_vsi_validator();
+            validator.session_keys[0].min_sequence_number = 1;
+            let mut tracker = aggregate_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(1, TEST_MANIFEST_ID, &signing_key),
+                    &mut tracker,
+                )
+                .unwrap();
+
+            let mut invalid = if tamper_media {
+                make_signed_vsi_segment(4, TEST_MANIFEST_ID, &signing_key)
+            } else {
+                let (other_key, _) = generate_test_key_pair();
+                make_signed_vsi_segment(4, TEST_MANIFEST_ID, &other_key)
+            };
+            if tamper_media {
+                // The fixture ends in an empty mdat; add a byte while keeping its box valid.
+                let mdat_offset = invalid.len() - 8;
+                invalid[mdat_offset..mdat_offset + 4].copy_from_slice(&9u32.to_be_bytes());
+                invalid.push(1);
+            }
+            validator
+                .validate_verifiable_segment_info(&invalid, &mut tracker)
+                .unwrap();
+
+            let failures: Vec<_> = tracker.filter_errors().collect();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(
+                failures[0].validation_status.as_deref(),
+                Some(LIVEVIDEO_SEGMENT_INVALID)
+            );
+            assert!(failures[0].description.contains(if tamper_media {
+                "bmffHash verification failed"
+            } else {
+                "signature verification failed"
+            }));
+            assert!(validator.sequence_coverage().missing_ranges.is_empty());
+            assert_eq!(validator.sequence_coverage().total_missing, 0);
+            assert!(!tracker.has_status(LIVEVIDEO_SEGMENT_GAP));
+            assert!(!tracker.has_status(LIVEVIDEO_SEGMENT_LEADING_GAP));
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                1
+            );
+
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(4, TEST_MANIFEST_ID, &signing_key),
+                    &mut tracker,
+                )
+                .unwrap();
+            assert_eq!(tracker.filter_errors().count(), 1);
+            assert_eq!(validator.sequence_coverage().missing_ranges, vec![2..=3]);
+            assert_eq!(validator.sequence_coverage().total_missing, 2);
+            assert!(!validator.sequence_coverage().ranges_truncated);
+            assert!(tracker.has_status(LIVEVIDEO_SEGMENT_GAP));
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                4
+            );
+        }
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_reset_allows_replay_retains_coverage_and_suppresses_only_leading_gap() {
+        use vsi_crypto_helpers::*;
+
+        let (mut validator, signing_key) = setup_vsi_validator();
+        validator.session_keys[0].min_sequence_number = 1;
+        let mut tracker = aggregate_tracker();
+        let first = make_signed_vsi_segment(1, TEST_MANIFEST_ID, &signing_key);
+        let third = make_signed_vsi_segment(3, TEST_MANIFEST_ID, &signing_key);
+        validator
+            .validate_verifiable_segment_info(&first, &mut tracker)
+            .unwrap();
+        validator
+            .validate_verifiable_segment_info(&third, &mut tracker)
+            .unwrap();
+        let recorded = validator.sequence_coverage().clone();
+        assert_eq!(recorded.missing_ranges, vec![2..=2]);
+
+        validator.reset_continuity();
+        assert!(validator.previous_segment.is_none());
+        assert!(validator.seen_emsg_ids.is_empty());
+        assert_eq!(validator.session_keys.len(), 1);
+        assert_eq!(validator.session_keys[0].min_sequence_number, 1);
+        assert_eq!(
+            validator.expected_manifest_id.as_deref(),
+            Some(TEST_MANIFEST_ID)
+        );
+        assert_eq!(validator.sequence_coverage(), &recorded);
+        validator
+            .validate_verifiable_segment_info(&third, &mut tracker)
+            .unwrap();
+        assert_eq!(validator.sequence_coverage(), &recorded);
+        assert!(!tracker.has_status(LIVEVIDEO_SEGMENT_LEADING_GAP));
+
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(5, TEST_MANIFEST_ID, &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+        let coverage = validator.sequence_coverage();
+        assert_eq!(coverage.missing_ranges, vec![2..=2, 4..=4]);
+        assert_eq!(coverage.total_missing, 2);
+        assert!(!coverage.ranges_truncated);
+        assert_eq!(tracker.filter_errors().count(), 0);
+        assert_eq!(tracker.logged_items().len(), 2);
+        assert!(tracker.logged_items().iter().all(|item| {
+            item.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_GAP)
+                && item.kind == LogKind::Informational
+        }));
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
     fn vsi_regressed_sequence_number_fails() {
         use vsi_crypto_helpers::*;
 
-        use crate::validation_results::validation_codes::LIVEVIDEO_ASSERTION_INVALID;
+        use crate::validation_results::validation_codes::LIVEVIDEO_SEGMENT_INVALID;
         let (mut validator, signing_key) = setup_vsi_validator();
         let mut tracker = aggregate_tracker();
 
@@ -1004,7 +1249,7 @@ mod tests {
         assert!(tracker
             .logged_items()
             .iter()
-            .any(|i| { i.validation_status.as_deref() == Some(LIVEVIDEO_ASSERTION_INVALID) }));
+            .any(|i| { i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID) }));
     }
 
     #[cfg(feature = "rust_native_crypto")]

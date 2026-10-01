@@ -44,14 +44,24 @@ for ContentAuth. Classify the *hunk*, not just its file, before extracting it.
   fixes, generic Python native-handle ownership, fragmented BMFF signing and
   ladder writing are separate upstream tracks, not hidden dependencies in a
   VSI PR. Preserve their independent review histories and breaking contracts.
-- Section 19.4.1 describes generated VSI sequence numbers increasing by one
-  for each subsequent segment, with MFHD equality or the REaP indexing
-  alternative. A verifier may receive only some segments. This fork currently
-  marks a non-consecutive received VSI sequence invalid; whether to report a
-  missing-segment coverage gap separately instead is a proposed upstream
-  policy change, not current behavior. Do not change that validation rule or
-  require one session key for the whole stream without resolving section 19.7
-  and #2631's reviewer questions first.
+- Section 19.4.1 describes +1 generation, with MFHD equality or the REaP
+  indexing alternative. Receiver validation requires strictly increasing
+  numbers, not necessarily consecutive observations: specs-core
+  [#2521](https://github.com/c2pa-org/specs-core/pull/2521) adds this rule for VSI
+  in section 19.7.3, with `livevideo.segment.invalid` for equality/regression.
+  This fork reports unobserved ranges as vendor **informational**, never fatal,
+  `com.castlabs.livevideo.segment.gap` / `.leadingGap`; a leading comparison is
+  literal against the key minimum, including 0 -> 1. Do not imply that a signed
+  key minimum proves those segments were produced or maliciously removed.
+  Manifest-box predecessor mismatch still fails, but otherwise-validated
+  metadata becomes the next comparison baseline so later segments can recover.
+  Explicit playback discontinuities preserve coverage history. See
+  `docs/live-video-sequence-coverage.md` and the unresolved omission concern in
+  specs-core [#1025](https://github.com/c2pa-org/specs-core/issues/1025). The
+  specs-core session owns the upstream issue; add its eventual approved issue
+  URL here and reconcile the extension, rather than treating vendor codes as
+  standardized. Do not require one session key for the whole stream without
+  resolving #2631's separate reviewer questions.
 
 ## Extraction Checklist
 

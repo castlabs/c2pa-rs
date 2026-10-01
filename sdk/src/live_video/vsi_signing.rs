@@ -623,8 +623,8 @@ impl LiveVideoVsiSigner {
     /// This init-only method is safe only before any media segment from the
     /// session has been published. It restores no media counters, so signing
     /// directly after a post-publication init-only restore can reuse a sequence.
-    /// Durable resume callers must use [`recover_from_artifacts`] with the last
-    /// committed media segment, or call [`resume_from_segment`] before signing.
+    /// Durable resume callers must use [`Self::recover_from_artifacts`] with the last
+    /// committed media segment, or call [`Self::resume_from_segment`] before signing.
     pub fn restore_manifest_id_from_signed_init(
         &mut self,
         signed_init_data: &[u8],
