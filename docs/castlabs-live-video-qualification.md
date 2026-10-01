@@ -1,10 +1,10 @@
 # Castlabs live-video release qualification
 
-The dedicated [Castlabs live-video qualification workflow](../.github/workflows/castlabs-live-video-qualification.yml) qualifies the `feat/live-video-vsi` branch without changing the upstream release workflows. These are release controls for the Castlabs fork and are not a proposal for upstream disposition of the experimental feature. The workflow is a blocking two-platform matrix for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`; no qualification command uses `continue-on-error`.
+The dedicated [Castlabs live-video qualification workflow](../.github/workflows/castlabs-live-video-qualification.yml) qualifies the `feat/live-video-vsi` and `feat/trusted-vsi-api-surface` branches without changing the upstream release workflows. These are release controls for the Castlabs fork and are not a proposal for upstream disposition of the experimental feature. The workflow is a blocking two-platform matrix for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`; no qualification command uses `continue-on-error`.
 
 ## Qualified source and feature profile
 
-The workflow installs SHA-pinned Actions and Python `3.12` explicitly on both platforms. The matrix pins Ubuntu 24.04 and Windows 2022; the latter is the runner used by the successful signer `v1.0.4.dev1` evidence-pinned c2patool build. Before Cargo runs on Windows, qualification explicitly validates the runner's Strawberry Perl and `Locale::Maketext::Simple`. The release-build shell also sets OpenSSL's `PERL` environment variable to that exact executable, because Git Bash otherwise resolves its own incomplete `/usr/bin/perl` even after `GITHUB_PATH` is updated. Release compilation pins Rust `1.88.0`, the workspace SDK's declared MSRV, rather than following the moving `stable` channel. Formatting is a separate gate using the exact `nightly-2026-01-16` rustfmt toolchain used by the upstream formatting workflow, because the repository's `rustfmt.toml` enables nightly-only options. Every Cargo resolution, test, feature report, and release build uses `--locked`. All Cargo commands inherit `CARGO_BUILD_JOBS=1`; qualification intentionally trades throughput for bounded memory on both runners.
+The workflow installs SHA-pinned Actions and Python `3.12` explicitly on both platforms. The matrix pins Ubuntu 24.04 and Windows 2022; the latter is the runner used by the successful signer `v1.0.4.dev1` evidence-pinned c2patool build. Before Cargo runs on Windows, qualification explicitly validates the runner's Strawberry Perl and `Locale::Maketext::Simple`. The release-build shell also sets OpenSSL's `PERL` environment variable to that exact executable, because Git Bash otherwise resolves its own incomplete `/usr/bin/perl` even after `GITHUB_PATH` is updated. Release compilation pins Rust `1.96.0`, the workspace SDK's declared MSRV (raised upstream by contentauth/c2pa-rs#2624), rather than following the moving `stable` channel. Formatting is a separate gate using the exact `nightly-2026-01-16` rustfmt toolchain used by the upstream formatting workflow, because the repository's `rustfmt.toml` enables nightly-only options. Every Cargo resolution, test, feature report, and release build uses `--locked`. All Cargo commands inherit `CARGO_BUILD_JOBS=1`; qualification intentionally trades throughput for bounded memory on both runners.
 
 The workflow addresses packages through their actual workspace manifests. The SDK at `sdk/Cargo.toml` is tested with `--no-default-features` and `rust_native_crypto,http_reqwest,http_reqwest_blocking,add_thumbnails,file_io,fetch_remote_manifests,pdf,unstable_live_video`. The HTTP feature names are the SDK equivalents of the C FFI's `http` feature; `fetch_remote_manifests` and `pdf` are included because `c2pa-c-ffi` enables them unconditionally for its actual native release. The C FFI at `c2pa_c_ffi/Cargo.toml` is tested and built with `--no-default-features` and `rust_native_crypto,http,add_thumbnails,file_io,unstable_live_video`.
 
@@ -14,9 +14,33 @@ This selection excludes `sdk/tests/integration.rs`, whose generic CAWG settings 
 
 `c2patool` is qualified separately from that Rust-native-crypto FFI profile. Its test and release build retain the CLI's default `networking` feature, retain the fixed `c2pa` dependency's `openssl` feature (whose SDK dependency is configured with `vendored`), and add only `unstable_live_video`. The feature report and evidence identify this as the `default-networking-vendored-openssl` profile; they do not imply that the CLI uses the FFI's `rust_native_crypto` profile. After the test and release build, the workflow separately executes the produced `c2patool` binary for its version smoke and live-video command help checks.
 
+Not covered: the two FFmpeg decode-equivalence tests,
+`assertions::bmff_hash::single_file_bmff_tests::single_file_ffmpeg_decode_equivalence`
+and `assertions::bmff_hash::single_file_ladder_tests::ladder_video_audio_decode_equivalence`,
+are `#[ignore]` because they need an `ffmpeg` executable (the ladder test also needs its
+`lavfi` source and `aac` encoder), so `cargo test` in this workflow skips them. The ladder
+test compiles only with `file_io`, so run them with the SDK profile above (a plain run
+without `file_io` silently matches only the first). They are run locally for now, selected
+explicitly with `cargo test ... --lib -- --ignored --exact <both test paths>` (not a bare
+`--ignored`, which would also pick up unrelated ignored tests), and the result is recorded
+on the qualifying PR. Follow-up: install a pinned `ffmpeg` in the matrix and run both
+tests that way as a hard gate.
+
 The SDK, C FFI, and feature-enabled `c2patool` test commands are hard gates on both platforms. The native release library is then inspected for defined dynamic-assertion, fragmented-file, base VSI, callback signer, recovery, explicit-time signing, and MFHD sequence-probe exports; undefined ELF imports do not satisfy this check. The same source SHA builds `c2patool`, whose executable version smoke and `live-video` and `live-video-sign` help are executed and checked.
 
 ## Evidence and bundles
+
+Qualification also requires every functional trusted-VSI export listed in
+[`trusted-vsi-native-contract.md`](trusted-vsi-native-contract.md), including the
+exact `c2pa_live_video_trusted_vsi_session_sign_sig_structure` prototype, and
+rejects the removed expert EMSG skeleton and `recover` symbols in both native
+exports and generated header declarations. `verify-header` compiles
+`scripts/tests/trusted_vsi_abi.c` as C11 with warnings as errors against that
+generated header (`cc` on Linux, `clang` on Windows, or explicit `--compiler`).
+Its static assertions check the exact trusted function types and the V1
+context/status layouts (including the `blocked` status byte).
+`verify-trusted-capabilities` loads the host release library and requires the
+trusted capability mask to equal 63.
 
 Each platform first generates `cargo-commands.json` from the qualification helper. CI runs the corresponding commands directly, without `eval`; structural tests parse every workflow Cargo run line and require its normalized command list to equal the generated manifest exactly. Evidence consumes and hashes that manifest rather than reconstructing an independent command list.
 
@@ -26,7 +50,7 @@ Each platform emits `source-qualification.json` and its SHA-256 sidecar. The sch
 
 The platform-specific native files, evidence, command manifest, and feature reports are packed into a deterministic `tar.gz`. Archive paths are validated against traversal and absolute paths; entries are sorted and normalized to owner/group 0 and timestamp 0. Executables and shared libraries use mode `0755`; the header, Windows import library, checksums, and qualification records use mode `0644`. Gzip stores timestamp zero and no source filename. `SHA256SUMS` covers bundle contents, and a separate `.sha256` file covers the bundle itself. Generation refuses to overwrite any output and removes partial output on failure. Standard-library unit tests enforce evidence shape, path safety, archive determinism, normalization, no-clobber behavior, the absent gzip filename header, exact platform members, complete release-set verification, and workflow structure.
 
-Pull requests and pushes to `feat/live-video-vsi` run qualification and upload Actions artifacts without publishing a release. A push of a versioned `castlabs-live-video-v<major>.<minor>.<patch>[-prerelease][+build]` tag is an explicit release trigger: the workflow file is loaded from the tagged commit, the complete qualification matrix runs for that SHA, and the release job runs only after the matrix succeeds. The tag must be protected by a GitHub ruleset, must be the current GitHub ref, and must resolve exactly to the qualified source SHA.
+Pull requests and pushes to `feat/live-video-vsi`, `feat/trusted-vsi-api-surface`, or `feat/trusted-vsi-functional` run qualification and upload Actions artifacts without publishing a release. A push of a versioned `castlabs-live-video-v<major>.<minor>.<patch>[-prerelease][+build]` tag is an explicit release trigger: the workflow file is loaded from the tagged commit, the complete qualification matrix runs for that SHA, and the release job runs only after the matrix succeeds. The tag must be protected by a GitHub ruleset, must be the current GitHub ref, and must resolve exactly to the qualified source SHA.
 
 Manual publication remains available by dispatching the workflow with `publish_release=true`, selecting the existing protected release tag as the workflow ref, and supplying that exact tag as `release_tag`. GitHub only exposes `workflow_dispatch` for workflow files present on the repository's default branch, so this manual path is unavailable until the qualification workflow has been merged there. The protected tag-push path does not have that prerequisite and works from a tagged feature commit containing the workflow. Manual dispatch with `publish_release=false`, branch pushes, and pull requests cannot enter the release job.
 

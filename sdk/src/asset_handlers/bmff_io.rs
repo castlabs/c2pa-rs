@@ -14,9 +14,8 @@
 use std::{
     cmp::min,
     collections::HashMap,
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::{Cursor, Read, Seek, SeekFrom, Write},
-    path::Path,
 };
 
 use atree::{Arena, Node, Token};
@@ -25,17 +24,16 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use crate::{
     assertions::{BmffMerkleMap, ExclusionsMap},
     asset_io::{
-        rename_or_move, AssetIO, AssetPatch, CAIRead, CAIReadWrite, CAIReader, CAIWriter,
-        ComposedManifestRef, HashObjectPositions, RemoteRefEmbed, RemoteRefEmbedType,
+        AssetIO, AssetPatch, C2paReader, C2paWriter, ComposedManifestRef, ObjectLocations,
+        ReadSeek, ReadWriteSeek, RemoteManifestUrl, WriteXmp,
     },
     error::{Error, Result},
     status_tracker::{ErrorBehavior, StatusTracker},
     store::Store,
     utils::{
         hash_utils::{vec_compare, HashRange},
-        io_utils::{patch_stream, stream_len, tempfile_builder, ReaderUtils},
+        io_utils::{patch_stream, stream_len, ReaderUtils},
         patch::patch_bytes,
-        xmp_inmemory_utils::{add_provenance, MIN_XMP},
     },
 };
 
@@ -71,22 +69,23 @@ const FULL_BOX_TYPES: &[&str; 80] = &[
     "txtC", "mime", "uri ", "uriI", "hmhd", "sthd", "vvhd", "medc",
 ];
 
-static SUPPORTED_TYPES: [&str; 17] = [
+static SUPPORTED_TYPES: [&str; 18] = [
     "avif",
     "heif",
     "heic",
     "mp4",
     "m4a",
-    "m4s",
-    "cmfv",
     "mov",
     "m4v",
+    "m4s",
+    "cmfv",
     "application/mp4",
     "audio/mp4",
     "image/avif",
     "image/heic",
     "image/heif",
     "video/mp4",
+    "video/iso.segment",
     "video/quicktime",
     "video/x-m4v",
 ];
@@ -895,12 +894,458 @@ where
     Ok(exclusions)
 }
 
-// `iloc`, `stco`, `co64`, `mfro`, `saio`, `sidx`, `tdhd`, and `tfra` elements contain absolute file offsets so they need to be adjusted based on whether content was added or removed.
-fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
-    mut output: &mut W,
+/// Single-file fragment trees currently support one stable media track.
+pub(crate) fn single_file_fragment_track_id(input: &mut dyn ReadSeek) -> Result<usize> {
+    let unsupported = || {
+        Error::BadParam(
+        "unsupported single-file fragmented BMFF: requires one tkhd track and one matching tfhd per moof (multiplexed/changing tracks are unsupported)".into(),
+    )
+    };
+    let (tree, map) = BMFFArena::from_stream(input)?;
+    let tracks = map.get("/moov/trak").ok_or_else(unsupported)?;
+    let headers = map.get("/moov/trak/tkhd").ok_or_else(unsupported)?;
+    if tracks.len() != 1 || headers.len() != 1 {
+        return Err(unsupported());
+    }
+    let tkhd = &tree.as_ref()[headers[0]].data;
+    input.seek(SeekFrom::Start(tkhd.offset))?;
+    BoxHeaderLite::read(input)?;
+    let (version, _) = read_box_header_ext(input)?;
+    match version {
+        0 => input.seek(SeekFrom::Current(8))?,
+        1 => input.seek(SeekFrom::Current(16))?,
+        _ => return Err(unsupported()),
+    };
+    let track_id = input.read_u32::<BigEndian>()?;
+    if track_id == 0 || input.stream_position()? > tkhd.offset + tkhd.size {
+        return Err(unsupported());
+    }
+    for moof in map.get("/moof").ok_or_else(unsupported)? {
+        let trafs: Vec<_> = map
+            .get("/moof/traf")
+            .into_iter()
+            .flatten()
+            .filter(|t| tree.as_ref()[**t].data.parent == Some(*moof))
+            .collect();
+        if trafs.len() != 1 {
+            return Err(unsupported());
+        }
+        let tfhds: Vec<_> = map
+            .get("/moof/traf/tfhd")
+            .into_iter()
+            .flatten()
+            .filter(|t| tree.as_ref()[**t].data.parent == Some(*trafs[0]))
+            .collect();
+        if tfhds.len() != 1 {
+            return Err(unsupported());
+        }
+        let tfhd = &tree.as_ref()[*tfhds[0]].data;
+        input.seek(SeekFrom::Start(tfhd.offset))?;
+        BoxHeaderLite::read(input)?;
+        let (version, _) = read_box_header_ext(input)?;
+        if version != 0
+            || input.read_u32::<BigEndian>()? != track_id
+            || input.stream_position()? > tfhd.offset + tfhd.size
+        {
+            return Err(unsupported());
+        }
+    }
+    Ok(track_id as usize)
+}
+
+/// Relocate single-file fragments using old file positions, not a per-track moof map.
+/// Each edit is (old position, removed length, inserted length). No edit may split
+/// a fragment: moof-relative trun offsets and sample/auxiliary data stay together.
+fn relocate_single_file_fragments(
+    mut input: &mut dyn ReadSeek,
+    output: &mut dyn ReadWriteSeek,
+    edits: &[(u64, u64, u64)],
+) -> Result<()> {
+    let unsupported =
+        |why: &str| Error::BadParam(format!("unsupported single-file fragmented BMFF: {why}"));
+    let (tree, map) = BMFFArena::from_stream(input)?;
+    let mut boxes = get_top_level_boxes(&tree, &map);
+    boxes.sort_by_key(|b| b.offset);
+    let size = stream_len(input)?;
+    let moofs: Vec<_> = boxes.iter().filter(|b| b.path == "moof").collect();
+    if moofs.is_empty() || boxes.iter().filter(|b| b.path == "moov").count() != 1 {
+        return Err(unsupported("expected one moov and at least one moof"));
+    }
+    if boxes
+        .iter()
+        .any(|b| b.path == "mdat" && b.offset < moofs[0].offset)
+        || boxes
+            .iter()
+            .any(|b| b.path == "moov" && b.offset > moofs[0].offset)
+    {
+        return Err(unsupported("hybrid or late initialization media"));
+    }
+    // Auxiliary offsets and subsegment byte ranges need additional addressing-mode
+    // handling; rejecting these is safer than emitting a valid hash of broken media.
+    for path in map.keys() {
+        if ["saio", "iloc", "ssix"]
+            .iter()
+            .any(|name| path.ends_with(&format!("/{name}")))
+        {
+            return Err(unsupported(
+                "saio, iloc and ssix relocation is not implemented",
+            ));
+        }
+    }
+    let relocate = |pos: u64, before_edit: bool| -> Result<u64> {
+        let mut value = i128::from(pos);
+        for &(at, removed, inserted) in edits {
+            let end = at
+                .checked_add(removed)
+                .ok_or_else(|| unsupported("edit overflow"))?;
+            // A range ending at the edit excludes the replacement, unlike a target.
+            if before_edit && pos == at {
+                continue;
+            }
+            if pos >= at && pos < end {
+                return Err(unsupported("offset points inside replaced box"));
+            }
+            if pos >= end {
+                value = value
+                    .checked_add(i128::from(inserted) - i128::from(removed))
+                    .ok_or_else(|| unsupported("offset overflow"))?;
+            }
+        }
+        u64::try_from(value).map_err(|_| unsupported("offset overflow"))
+    };
+    let media_end = boxes
+        .iter()
+        .filter(|b| b.path == "moof" || b.path == "mdat")
+        .try_fold(0u64, |end, b| {
+            b.offset
+                .checked_add(b.size)
+                .map(|box_end| end.max(box_end))
+                .ok_or_else(|| unsupported("media box overflow"))
+        })?;
+    for &(at, removed, _) in edits {
+        let end = at
+            .checked_add(removed)
+            .filter(|end| *end <= size)
+            .ok_or_else(|| unsupported("edit outside file"))?;
+        // Only whole, known metadata UUIDs may be edited after all media.
+        let trailing_metadata = at >= media_end
+            && map.get("/uuid").into_iter().flatten().any(|token| {
+                let b = &tree.as_ref()[*token].data;
+                b.offset == at
+                    && b.size == removed
+                    && (b.user_type.as_deref() == Some(XMP_UUID.as_slice())
+                        || b.user_type.as_deref() == Some(C2PA_UUID.as_slice()))
+            });
+        if !(end <= moofs[0].offset
+            || trailing_metadata
+            || (removed == 0 && moofs.iter().any(|b| b.offset == at)))
+        {
+            return Err(unsupported("insertion or replacement inside a fragment"));
+        }
+    }
+    let mut default_sizes = HashMap::new();
+    for token in map.get("/moov/mvex/trex").into_iter().flatten() {
+        let info = &tree.as_ref()[*token].data;
+        input.seek(SeekFrom::Start(info.offset))?;
+        BoxHeaderLite::read(input)?;
+        read_box_header_ext(input)?;
+        let track = input.read_u32::<BigEndian>()?;
+        input.seek(SeekFrom::Current(8))?;
+        default_sizes.insert(track, input.read_u32::<BigEndian>()?);
+        if input.stream_position()? > info.offset + info.size {
+            return Err(unsupported("truncated trex"));
+        }
+    }
+    for (path, tokens) in &map {
+        let name = path.rsplit('/').next().unwrap_or("");
+        if !["tfhd", "tfra", "sidx", "stco", "co64"].contains(&name) {
+            continue;
+        }
+        for token in tokens {
+            let info = &tree.as_ref()[*token].data;
+            // Only metadata tables are buffered, never moof/mdat media payloads.
+            if info.size > 32 * 1024 * 1024 {
+                return Err(unsupported("offset table exceeds 32 MiB"));
+            }
+            input.seek(SeekFrom::Start(info.offset))?;
+            let mut data = Cursor::new(input.read_to_vec(info.size)?);
+            BoxHeaderLite::read(&mut data)?;
+            let (version, flags) = read_box_header_ext(&mut data)?;
+            if version > 1 || (name == "tfhd" && version != 0) {
+                return Err(unsupported("unknown offset table version"));
+            }
+            // Patch a field without changing its width or the enclosing box size.
+            let patch = |data: &mut Cursor<Vec<u8>>, value: u64, wide: bool| -> Result<()> {
+                if wide {
+                    data.write_u64::<BigEndian>(value)?;
+                } else {
+                    data.write_u32::<BigEndian>(
+                        u32::try_from(value).map_err(|_| unsupported("32-bit offset overflow"))?,
+                    )?;
+                }
+                Ok(())
+            };
+            match name {
+                "stco" | "co64" => {
+                    if data.read_u32::<BigEndian>()? != 0 {
+                        return Err(unsupported("nonempty initialization sample offsets"));
+                    }
+                }
+                "tfhd" => {
+                    let track_id = data.read_u32::<BigEndian>()?;
+                    let index = moofs
+                        .iter()
+                        .rposition(|b| b.offset <= info.offset)
+                        .ok_or_else(|| unsupported("tfhd outside fragment"))?;
+                    let fragment_end = moofs.get(index + 1).map_or(size, |b| b.offset);
+                    let mut base = moofs[index].offset;
+                    if flags & 1 != 0 {
+                        let pos = data.position();
+                        base = data.read_u64::<BigEndian>()?;
+                        if base < moofs[index].offset || base >= fragment_end {
+                            return Err(unsupported(&format!(
+                                "tfhd base {base} outside its fragment {}..{fragment_end}",
+                                moofs[index].offset
+                            )));
+                        }
+                        data.set_position(pos);
+                        patch(&mut data, relocate(base, false)?, true)?;
+                    } else if flags & 0x020000 == 0 {
+                        return Err(unsupported(
+                            "implicit tfhd base; use default-base-is-moof or an explicit base",
+                        ));
+                    }
+                    if flags & 2 != 0 {
+                        data.read_u32::<BigEndian>()?;
+                    }
+                    if flags & 8 != 0 {
+                        data.read_u32::<BigEndian>()?;
+                    }
+                    let default_size = if flags & 0x10 != 0 {
+                        data.read_u32::<BigEndian>()?
+                    } else {
+                        default_sizes.get(&track_id).copied().unwrap_or(0)
+                    };
+                    if flags & 0x20 != 0 {
+                        data.read_u32::<BigEndian>()?;
+                    }
+                    let mut previous_end = base;
+                    for trun in map.get("/moof/traf/trun").into_iter().flatten() {
+                        let run = &tree.as_ref()[*trun].data;
+                        if run.parent != info.parent {
+                            continue;
+                        }
+                        if run.size > 32 * 1024 * 1024 {
+                            return Err(unsupported("trun table exceeds 32 MiB"));
+                        }
+                        input.seek(SeekFrom::Start(run.offset))?;
+                        let mut run_data = Cursor::new(input.read_to_vec(run.size)?);
+                        BoxHeaderLite::read(&mut run_data)?;
+                        let (version, flags) = read_box_header_ext(&mut run_data)?;
+                        if version > 1 || flags & !0xf05 != 0 {
+                            return Err(unsupported("unknown trun version or flags"));
+                        }
+                        let count = run_data.read_u32::<BigEndian>()?;
+                        let start = if flags & 1 != 0 {
+                            u64::try_from(
+                                i128::from(base) + i128::from(run_data.read_i32::<BigEndian>()?),
+                            )
+                            .map_err(|_| unsupported("trun data offset overflow"))?
+                        } else {
+                            previous_end
+                        };
+                        if flags & 4 != 0 {
+                            run_data.read_u32::<BigEndian>()?;
+                        }
+                        let mut length = 0u64;
+                        // A no-field run can have a huge count without a huge table.
+                        if flags & 0xf00 == 0 {
+                            length = u64::from(default_size) * u64::from(count);
+                        } else {
+                            for _ in 0..count {
+                                if flags & 0x100 != 0 {
+                                    run_data.read_u32::<BigEndian>()?;
+                                }
+                                let sample_size = if flags & 0x200 != 0 {
+                                    run_data.read_u32::<BigEndian>()?
+                                } else {
+                                    default_size
+                                };
+                                length += u64::from(sample_size);
+                                if flags & 0x400 != 0 {
+                                    run_data.read_u32::<BigEndian>()?;
+                                }
+                                if flags & 0x800 != 0 {
+                                    run_data.read_u32::<BigEndian>()?;
+                                }
+                            }
+                        }
+                        let end = start
+                            .checked_add(length)
+                            .ok_or_else(|| unsupported("sample range overflow"))?;
+                        let mut contained = false;
+                        for mdat in boxes.iter().filter(|b| {
+                            b.path == "mdat"
+                                && b.offset > moofs[index].offset
+                                && b.offset < fragment_end
+                        }) {
+                            input.seek(SeekFrom::Start(mdat.offset))?;
+                            BoxHeaderLite::read(input)?;
+                            if start >= input.stream_position()? && end <= mdat.offset + mdat.size {
+                                contained = true;
+                            }
+                        }
+                        if !contained || (count != 0 && length == 0) {
+                            return Err(unsupported(
+                                "trun samples outside this fragment's mdat or missing sample sizes",
+                            ));
+                        }
+                        previous_end = end;
+                    }
+                }
+                "tfra" => {
+                    let _track_id = data.read_u32::<BigEndian>()?;
+                    let widths = data.read_u32::<BigEndian>()?;
+                    let count = data.read_u32::<BigEndian>()?;
+                    for _ in 0..count {
+                        data.seek(SeekFrom::Current(if version == 1 { 8 } else { 4 }))?;
+                        let pos = data.position();
+                        let old = if version == 1 {
+                            data.read_u64::<BigEndian>()?
+                        } else {
+                            u64::from(data.read_u32::<BigEndian>()?)
+                        };
+                        if !moofs.iter().any(|b| b.offset == old) {
+                            return Err(unsupported("tfra does not address a moof"));
+                        }
+                        data.set_position(pos);
+                        patch(&mut data, relocate(old, false)?, version == 1)?;
+                        let skip = ((widths >> 4) & 3) + ((widths >> 2) & 3) + (widths & 3) + 3;
+                        data.seek(SeekFrom::Current(i64::from(skip)))?;
+                    }
+                }
+                "sidx" => {
+                    data.seek(SeekFrom::Current(8 + if version == 1 { 8 } else { 4 }))?;
+                    let pos = data.position();
+                    let first = if version == 1 {
+                        data.read_u64::<BigEndian>()?
+                    } else {
+                        u64::from(data.read_u32::<BigEndian>()?)
+                    };
+                    let box_end = info
+                        .offset
+                        .checked_add(info.size)
+                        .ok_or_else(|| unsupported("sidx overflow"))?;
+                    let mut start = box_end
+                        .checked_add(first)
+                        .ok_or_else(|| unsupported("sidx overflow"))?;
+                    let new_first = relocate(start, true)?
+                        .checked_sub(relocate(box_end, true)?)
+                        .ok_or_else(|| unsupported("sidx first_offset underflow"))?;
+                    data.set_position(pos);
+                    patch(&mut data, new_first, version == 1)?;
+                    let _reserved = data.read_u16::<BigEndian>()?;
+                    let count = data.read_u16::<BigEndian>()?;
+                    for _ in 0..count {
+                        let pos = data.position();
+                        let reference = data.read_u32::<BigEndian>()?;
+                        if reference & 0x8000_0000 != 0 {
+                            return Err(unsupported("hierarchical sidx"));
+                        }
+                        let end = start
+                            .checked_add(u64::from(reference))
+                            .filter(|end| *end <= size)
+                            .ok_or_else(|| unsupported("sidx reference outside file"))?;
+                        let length = relocate(end, true)?
+                            .checked_sub(relocate(start, true)?)
+                            .ok_or_else(|| unsupported("sidx reference size underflow"))?;
+                        if length > 0x7fff_ffff {
+                            return Err(unsupported("sidx reference size overflow"));
+                        }
+                        data.set_position(pos);
+                        patch(&mut data, length, false)?;
+                        data.seek(SeekFrom::Current(8))?;
+                        start = end;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            if data.position() > info.size || data.get_ref().len() as u64 != info.size {
+                return Err(unsupported("truncated offset table"));
+            }
+            output.seek(SeekFrom::Start(relocate(info.offset, false)?))?;
+            output.write_all(data.get_ref())?;
+        }
+    }
+    // XMP preprocessing may move an existing manifest and its Merkle UUIDs.
+    // Preserve its locator unless that manifest box itself was replaced/removed.
+    for token in map.get("/uuid").into_iter().flatten() {
+        let node = &tree.as_ref()[*token];
+        if node.data.user_type.as_deref() != Some(C2PA_UUID.as_slice())
+            || edits.iter().any(|&(at, removed, _)| {
+                node.data.offset >= at
+                    && at
+                        .checked_add(removed)
+                        .is_some_and(|end| node.data.offset < end)
+            })
+        {
+            continue;
+        }
+        let (purpose, _) = get_uuid_box_purpose(input, node)?;
+        if [MANIFEST, ORIGINAL, UPDATE].contains(&purpose.as_str()) {
+            let field = input.stream_position()?;
+            let offset = input.read_u64::<BigEndian>()?;
+            if offset != 0 {
+                output.seek(SeekFrom::Start(relocate(field, false)?))?;
+                output.write_u64::<BigEndian>(relocate(offset, false)?)?;
+            }
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
+/// Insert one Merkle-purpose UUID immediately before each moof, then relocate
+/// absolute data and index offsets using the original layout.
+pub(crate) fn insert_fragment_merkle_boxes(
+    input: &mut dyn ReadSeek,
+    output: &mut dyn ReadWriteSeek,
+    merkle_boxes: &[Vec<u8>],
+) -> Result<()> {
+    let boxes = read_bmff_c2pa_boxes(input)?;
+    let moofs: Vec<_> = boxes
+        .box_infos
+        .iter()
+        .filter(|b| b.path == "moof")
+        .collect();
+    if moofs.len() != merkle_boxes.len() {
+        return Err(Error::BadParam("fragment Merkle box count mismatch".into()));
+    }
+    let mut edits = Vec::with_capacity(moofs.len());
+    input.rewind()?;
+    output.rewind()?;
+    let mut previous = 0;
+    for (moof, bytes) in moofs.iter().zip(merkle_boxes) {
+        std::io::copy(&mut input.take(moof.offset - previous), output)?;
+        output.write_all(bytes)?;
+        edits.push((moof.offset, 0, bytes.len() as u64));
+        previous = moof.offset;
+    }
+    std::io::copy(input, output)?;
+    relocate_single_file_fragments(input, output, &edits)
+}
+
+// Adjust absolute offsets in `iloc`, `stco`, `co64`, `saio`, `tfhd`, and `tfra`.
+// TFRA uses the replaced range in original-file coordinates; other handlers still
+// apply the delta unconditionally.
+// Validation is per table, not transactional: callers must discard output on error,
+// since earlier tables or entries may already have been patched.
+fn adjust_known_offsets<W: Write + ReadSeek + ?Sized>(
+    output: &mut W,
     bmff_tree: &Arena<BoxInfo>,
     bmff_path_map: &HashMap<String, Vec<Token>>,
     adjust: i64,
+    replaced: std::ops::Range<u64>,
 ) -> Result<()> {
     let start_pos = output.stream_position()?; // save starting point
 
@@ -1223,9 +1668,6 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
         }
     }
 
-    // map to store track to moof mapping
-    let mut track_id_to_moof_mapping = HashMap::new();
-
     // handle moof traf tfhd
     if let Some(tfhd_list) = bmff_path_map.get("/moof/traf/tfhd") {
         for tfhd_token in tfhd_list {
@@ -1248,15 +1690,7 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
             let (_version, tf_flags) = read_box_header_ext(output)?; // box extensions
 
             // track ID
-            let track_id = output.read_u32::<BigEndian>()?;
-
-            // get to outter moof box
-            let ancestors = tfhd_token.ancestors(bmff_tree);
-            for ancestor in ancestors {
-                if ancestor.data.path == "moof" {
-                    track_id_to_moof_mapping.insert(track_id, ancestor.data.offset);
-                }
-            }
+            let _track_id = output.read_u32::<BigEndian>()?;
 
             // fix up base offset and write out if flags indicate to do so
             if tf_flags & 1 == 1 {
@@ -1291,7 +1725,7 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
                 return Err(Error::InvalidAsset("Bad BMFF".to_string()));
             }
 
-            // read iloc box and patch
+            // read tfra box and patch
             output.seek(SeekFrom::Start(tfra_box_info.offset))?;
 
             // read header
@@ -1301,11 +1735,26 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
                 return Err(Error::InvalidAsset("Bad BMFF".to_string()));
             }
 
+            let box_end = tfra_box_info
+                .offset
+                .checked_add(tfra_box_info.size)
+                .ok_or_else(|| Error::InvalidAsset("Bad BMFF: tfra size overflow".to_string()))?;
+            if box_end.saturating_sub(output.stream_position()?) < 16 {
+                return Err(Error::InvalidAsset(
+                    "Bad BMFF: short tfra header".to_string(),
+                ));
+            }
+
             // read extended header
             let (version, _flags) = read_box_header_ext(output)?; // box extensions
+            if version > 1 {
+                return Err(Error::InvalidAsset(
+                    "Bad BMFF: unknown tfra version".to_string(),
+                ));
+            }
 
             // track ID
-            let track_id = output.read_u32::<BigEndian>()?;
+            let _track_id = output.read_u32::<BigEndian>()?;
 
             // tfr flags
             let tfra_info = output.read_u32::<BigEndian>()?;
@@ -1316,38 +1765,55 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
             // num entries
             let num_entries = output.read_u32::<BigEndian>()?;
 
-            // get the moof boxes
-            // fix up the offsets in the entry list
-            for _entries in 0..num_entries {
-                if version == 1 {
-                    let _time = output.read_u64::<BigEndian>()?;
+            let field_size = if version == 1 { 8 } else { 4 };
+            let trailing_size =
+                (length_size_of_traf_num + length_size_of_trun_num + length_size_of_sample_num + 3)
+                    as usize;
+            let num_entries = bounded_entry_count(
+                num_entries,
+                output.stream_position()?,
+                box_end,
+                field_size * 2 + trailing_size as u64,
+            )?;
 
-                    // write out mapped value of the moof position for this track
-                    let moof_offset = track_id_to_moof_mapping
-                        .get(&track_id)
-                        .ok_or(Error::InvalidAsset("Bad BMFF".to_string()))?;
-                    output.write_u64::<BigEndian>(*moof_offset)?;
+            // TFRA entries identify sync samples, not unique fragments. Preserve each
+            // entry's own target, including repeated references to the same moof.
+            for _ in 0..num_entries {
+                let mut time = [0u8; 8];
+                output.read_exact(&mut time[..field_size as usize])?;
+                let offset_pos = output.stream_position()?;
+                let old_offset = if version == 1 {
+                    output.read_u64::<BigEndian>()?
                 } else {
-                    let _time = output.read_u32::<BigEndian>()?;
+                    u64::from(output.read_u32::<BigEndian>()?)
+                };
+                let mut trailing = [0u8; 12];
+                output.read_exact(&mut trailing[..trailing_size])?;
+                let next_entry = output.stream_position()?;
 
-                    // write out mapped value of the moof position for this track
-                    let moof_offset_u64 = track_id_to_moof_mapping
-                        .get(&track_id)
-                        .ok_or(Error::InvalidAsset("Bad BMFF".to_string()))?;
-
-                    let moof_offset = u32::try_from(*moof_offset_u64).map_err(|_e| {
-                        Error::InvalidAsset("Bad BMFF offset adjustment".to_string())
-                    })?;
-                    output.write_u32::<BigEndian>(moof_offset)?;
+                // Field locations are from the output tree, but their targets still
+                // use original-file coordinates. Only surviving targets beyond the
+                // replaced region move; references into removed content are invalid.
+                if replaced.contains(&old_offset) {
+                    return Err(Error::InvalidAsset(
+                        "Bad BMFF: tfra target inside replaced content".to_string(),
+                    ));
                 }
-
-                // read extra stuff to move the position
-                let traf_num_bytes = length_size_of_traf_num + 1;
-                output.read_to_vec(traf_num_bytes as u64)?;
-                let trun_num_bytes = length_size_of_trun_num + 1;
-                output.read_to_vec(trun_num_bytes as u64)?;
-                let sample_num_bytes = length_size_of_sample_num + 1;
-                output.read_to_vec(sample_num_bytes as u64)?;
+                if old_offset >= replaced.end {
+                    let new_offset = old_offset.checked_add_signed(adjust).ok_or_else(|| {
+                        Error::InvalidAsset("Bad BMFF tfra offset adjustment".to_string())
+                    })?;
+                    output.seek(SeekFrom::Start(offset_pos))?;
+                    if version == 1 {
+                        output.write_u64::<BigEndian>(new_offset)?;
+                    } else {
+                        let new_offset = u32::try_from(new_offset).map_err(|_| {
+                            Error::InvalidAsset("Bad BMFF tfra offset adjustment".to_string())
+                        })?;
+                        output.write_u32::<BigEndian>(new_offset)?;
+                    }
+                    output.seek(SeekFrom::Start(next_entry))?;
+                }
             }
         }
     }
@@ -1703,7 +2169,7 @@ fn get_uuid_box_purpose<R: Read + Seek + ?Sized>(
 }
 
 fn get_uuid_token(
-    reader: &mut dyn CAIRead,
+    reader: &mut dyn ReadSeek,
     bmff_tree: &BMFFArena,
     uuid: &[u8; 16],
     purpose: Option<&[&str]>,
@@ -1745,6 +2211,8 @@ pub(crate) struct C2PABmffBoxes {
     pub manifest_bytes: Option<Vec<u8>>,
     pub original_bytes: Option<Vec<u8>>,
     pub update_bytes: Option<Vec<u8>>,
+    /// True if any C2PA box (any purpose) was found.
+    pub c2pa_box_present: bool,
     pub manifest_box_bytes: Option<Vec<u8>>,
     pub update_box_bytes: Option<Vec<u8>>,
     pub bmff_merkle: Vec<BmffMerkleMap>,
@@ -1766,6 +2234,8 @@ fn c2pa_boxes_from_tree_and_map<R: Read + Seek + ?Sized>(
     let mut manifest_bytes: Option<Vec<u8>> = None;
     let mut original_bytes: Option<Vec<u8>> = None;
     let mut update_bytes: Option<Vec<u8>> = None;
+    // True if any C2PA box (any purpose) was found.
+    let mut c2pa_box_present = false;
     let mut manifest_box_bytes: Option<Vec<u8>> = None;
     let mut update_box_bytes: Option<Vec<u8>> = None;
     let mut xmp: Option<String> = None;
@@ -1790,6 +2260,7 @@ fn c2pa_boxes_from_tree_and_map<R: Read + Seek + ?Sized>(
                 if let Some(uuid) = &box_info.data.user_type {
                     // make sure it is a C2PA ContentProvenanceBox box
                     if vec_compare(&C2PA_UUID, uuid) {
+                        c2pa_box_present = true;
                         let (purpose, mut data_len) = get_uuid_box_purpose(reader, box_info)?;
 
                         // is the purpose manifest?
@@ -1881,6 +2352,7 @@ fn c2pa_boxes_from_tree_and_map<R: Read + Seek + ?Sized>(
         manifest_bytes,
         original_bytes,
         update_bytes,
+        c2pa_box_present,
         manifest_box_bytes,
         update_box_bytes,
         bmff_merkle: merkle_boxes,
@@ -1905,25 +2377,22 @@ pub(crate) fn read_bmff_c2pa_boxes<R: Read + Seek + ?Sized>(
     c2pa_boxes_from_tree_and_map(reader, &bmff_tree, &bmff_map)
 }
 
-impl CAIReader for BmffIO {
-    fn read_cai(&self, reader: &mut dyn CAIRead) -> Result<Vec<u8>> {
-        reader.seek(SeekFrom::Start(4))?;
+impl C2paReader for BmffIO {
+    fn read_c2pa(&self, input_stream: &mut dyn ReadSeek) -> Result<Vec<u8>> {
+        input_stream.seek(SeekFrom::Start(4))?;
 
         let mut header = [0u8; 4];
-        reader.read_exact(&mut header)?;
+        input_stream.read_exact(&mut header)?;
 
         let is_styp = header[..4] == *b"styp";
         if header[..4] != *b"ftyp" && !is_styp {
-            return Err(BmffError::InvalidFileSignature {
-                reason: format!(
-                    "invalid BMFF structure: expected box type \"ftyp\" or \"styp\" at offset 4, found {}",
-                    String::from_utf8_lossy(&header[..4])
-                ),
-            }
-            .into());
+            return Err(Error::InvalidAsset(format!(
+                "invalid BMFF structure: expected box type \"ftyp\" or \"styp\" at offset 4, found {}",
+                String::from_utf8_lossy(&header[..4])
+            )));
         }
 
-        let c2pa_boxes = read_bmff_c2pa_boxes(reader)?;
+        let c2pa_boxes = read_bmff_c2pa_boxes(input_stream)?;
 
         // is this an update manifest?
         if let Some(original_bytes) = c2pa_boxes.original_bytes {
@@ -1951,12 +2420,22 @@ impl CAIReader for BmffIO {
             ));
         }
 
-        c2pa_boxes.manifest_bytes.ok_or(Error::JumbfNotFound)
+        match c2pa_boxes.manifest_bytes {
+            Some(manifest_bytes) => Ok(manifest_bytes),
+            // A C2PA box was present but did not resolve to a manifest (retagged
+            // to an unrecognized/merkle purpose). Return C2PAValidation, not
+            // JumbfNotFound, so `Store::load_jumbf_from_stream` rejects rather
+            // than masking the tampering via XMP remote-manifest fallback.
+            None if c2pa_boxes.c2pa_box_present => Err(Error::C2PAValidation(
+                "C2PA box present without a readable manifest".to_string(),
+            )),
+            None => Err(Error::JumbfNotFound),
+        }
     }
 
     // Get XMP block
-    fn read_xmp(&self, reader: &mut dyn CAIRead) -> Option<String> {
-        let c2pa_boxes = read_bmff_c2pa_boxes(reader).ok()?;
+    fn read_xmp(&self, input_stream: &mut dyn ReadSeek) -> Option<String> {
+        let c2pa_boxes = read_bmff_c2pa_boxes(input_stream).ok()?;
 
         c2pa_boxes.xmp
     }
@@ -1965,44 +2444,6 @@ impl CAIReader for BmffIO {
 impl AssetIO for BmffIO {
     fn asset_patch_ref(&self) -> Option<&dyn AssetPatch> {
         Some(self)
-    }
-
-    fn read_cai_store(&self, asset_path: &Path) -> Result<Vec<u8>> {
-        let mut f = File::open(asset_path)?;
-        self.read_cai(&mut f)
-    }
-
-    fn save_cai_store(&self, asset_path: &std::path::Path, store_bytes: &[u8]) -> Result<()> {
-        let mut input_stream = std::fs::OpenOptions::new()
-            .read(true)
-            .open(asset_path)
-            .map_err(Error::IoError)?;
-
-        let mut temp_file = tempfile_builder("c2pa_temp")?;
-
-        self.write_cai(&mut input_stream, &mut temp_file, store_bytes)?;
-
-        // copy temp file to asset
-        rename_or_move(temp_file, asset_path)
-    }
-
-    fn get_object_locations(
-        &self,
-        _asset_path: &std::path::Path,
-    ) -> Result<Vec<HashObjectPositions>> {
-        let vec: Vec<HashObjectPositions> = Vec::new();
-        Ok(vec)
-    }
-
-    fn remove_cai_store(&self, asset_path: &Path) -> Result<()> {
-        let mut input_file = std::fs::File::open(asset_path)?;
-
-        let mut temp_file = tempfile_builder("c2pa_temp")?;
-
-        self.remove_cai_store_from_stream(&mut input_file, &mut temp_file)?;
-
-        // copy temp file to asset
-        rename_or_move(temp_file, asset_path)
     }
 
     fn new(asset_type: &str) -> Self
@@ -2018,15 +2459,19 @@ impl AssetIO for BmffIO {
         Box::new(BmffIO::new(asset_type))
     }
 
-    fn get_reader(&self) -> &dyn CAIReader {
+    fn get_reader(&self) -> &dyn C2paReader {
         self
     }
 
-    fn get_writer(&self, asset_type: &str) -> Option<Box<dyn CAIWriter>> {
+    fn get_writer(&self, asset_type: &str) -> Option<Box<dyn C2paWriter>> {
         Some(Box::new(BmffIO::new(asset_type)))
     }
 
-    fn remote_ref_writer_ref(&self) -> Option<&dyn RemoteRefEmbed> {
+    fn remote_manifest_url_ref(&self) -> Option<&dyn RemoteManifestUrl> {
+        Some(self)
+    }
+
+    fn write_xmp_ref(&self) -> Option<&dyn WriteXmp> {
         Some(self)
     }
 
@@ -2037,13 +2482,35 @@ impl AssetIO for BmffIO {
     fn supported_types(&self) -> &[&str] {
         &SUPPORTED_TYPES
     }
+
+    // BMFF covers several distinct sub-formats (image vs. video vs. audio), each needing
+    // its own MIME type, so the default single-MIME derivation from `supported_types()`
+    // doesn't apply here.
+    fn mime_type_map(&self) -> Vec<(String, String)> {
+        [
+            ("avif", "image/avif"),
+            ("heif", "image/heif"),
+            ("heic", "image/heic"),
+            ("mp4", "video/mp4"),
+            ("m4s", "video/mp4"),
+            ("cmfv", "video/mp4"),
+            ("m4a", "audio/mp4"),
+            ("mov", "video/quicktime"),
+            ("m4v", "video/x-m4v"),
+            ("m4s", "video/iso.segment"),
+            ("cmfv", "video/mp4"),
+        ]
+        .into_iter()
+        .map(|(ext, mime)| (ext.to_string(), mime.to_string()))
+        .collect()
+    }
 }
 
-impl CAIWriter for BmffIO {
-    fn write_cai(
+impl C2paWriter for BmffIO {
+    fn write_c2pa(
         &self,
-        input_stream: &mut dyn CAIRead,
-        output_stream: &mut dyn CAIReadWrite,
+        input_stream: &mut dyn ReadSeek,
+        output_stream: &mut dyn ReadWriteSeek,
         store_bytes: &[u8],
     ) -> Result<()> {
         let (bmff_tree, bmff_map) = BMFFArena::from_stream(input_stream)?;
@@ -2119,6 +2586,20 @@ impl CAIWriter for BmffIO {
         // if we have an ordinary manifest store and we are adding a new update manifest
         // then we need to split off incoming provenance claim into and add to update new update manifest
         if has_manifest && !has_update && is_update {
+            let last_box = c2pa_boxes
+                .box_infos
+                .last()
+                .ok_or_else(|| Error::InvalidAsset("no top-level BMFF box".into()))?;
+            let update_offset = last_box
+                .offset
+                .checked_add(last_box.size)
+                .ok_or_else(|| Error::InvalidAsset("BMFF box size overflow".into()))?;
+            input_stream.seek(SeekFrom::Start(last_box.offset))?;
+            if input_stream.read_u32::<BigEndian>()? == 0 {
+                return Err(Error::BadParam(
+                    "unsupported BMFF update: terminal size-zero box extends to EOF".into(),
+                ));
+            }
             let pc = pc.ok_or(Error::BadParam("no provenance manifest".to_string()))?;
 
             let mut update_store = Store::new();
@@ -2141,20 +2622,21 @@ impl CAIWriter for BmffIO {
                 ORIGINAL.as_bytes(),
             )?;
 
-            // write the stream with manifest bytes containing updated manifest PURPOSE
+            // Insert before any raw EOF suffix, which must remain outside the UUID.
+            let mut update_manifest = Vec::new();
+            write_c2pa_box(&mut update_manifest, &new_update_bytes, UPDATE, &[], 0)?;
             patch_stream(
                 input_stream,
                 output_stream,
-                manifest_box_offset,
-                manifest_box_bytes.len() as u64,
-                &manifest_box_bytes,
+                update_offset,
+                0,
+                &update_manifest,
             )?;
 
-            // append new update manifest store to end of stream
-            let mut update_manifest = Vec::new();
-            write_c2pa_box(&mut update_manifest, &new_update_bytes, UPDATE, &[], 0)?;
+            // Retag the original manifest without changing its bound box header.
+            output_stream.seek(SeekFrom::Start(manifest_box_offset))?;
+            output_stream.write_all(&manifest_box_bytes)?;
             output_stream.seek(SeekFrom::End(0))?;
-            output_stream.write_all(&update_manifest)?;
 
             return Ok(());
         }
@@ -2190,6 +2672,31 @@ impl CAIWriter for BmffIO {
         let merkle_data: &[u8] = &[]; // not yet supported
         write_c2pa_box(&mut new_c2pa_box, store_bytes, MANIFEST, merkle_data, 0)?;
         let new_c2pa_box_size = new_c2pa_box.len();
+
+        if let Some(first_merkle) = c2pa_boxes.bmff_merkle_box_infos.first() {
+            let removed = c2pa_length.unwrap_or(0);
+            let offset = if first_merkle.offset >= c2pa_start + removed {
+                first_merkle
+                    .offset
+                    .checked_sub(removed)
+                    .and_then(|v| v.checked_add(new_c2pa_box_size as u64))
+                    .ok_or_else(|| Error::InvalidAsset("Merkle locator overflow".into()))?
+            } else if first_merkle.offset < c2pa_start {
+                first_merkle.offset
+            } else {
+                return Err(Error::InvalidAsset(
+                    "Merkle UUID inside replaced manifest".into(),
+                ));
+            };
+            new_c2pa_box.clear();
+            write_c2pa_box(
+                &mut new_c2pa_box,
+                store_bytes,
+                MANIFEST,
+                merkle_data,
+                offset,
+            )?;
+        }
 
         let (start, end) = if let Some(c2pa_length) = c2pa_length {
             let start = usize::try_from(c2pa_start)
@@ -2244,8 +2751,17 @@ impl CAIWriter for BmffIO {
             std::io::copy(input_stream, output_stream)?;
         }
 
-        // Manipulating the UUID box means we may need some patch offsets if they are file absolute offsets.
+        // Same-size replacement needs no relocation. TFRA checks in the adjustment
+        // pass are not a general asset-validation pass and are skipped here at zero delta.
         if offset_adjust != 0 {
+            if bmff_map.contains_key("/moov") && bmff_map.contains_key("/moof") {
+                relocate_single_file_fragments(
+                    input_stream,
+                    output_stream,
+                    &[(start as u64, (end - start) as u64, new_c2pa_box_size as u64)],
+                )?;
+                return Ok(());
+            }
             // map box layout of current output file
             let (output_bmff_tree, output_bmff_map) = BMFFArena::from_stream(output_stream)?;
 
@@ -2256,43 +2772,48 @@ impl CAIWriter for BmffIO {
                 output_bmff_tree.as_ref(),
                 &output_bmff_map,
                 offset_adjust,
+                start as u64..end as u64,
             )?;
         }
 
         Ok(())
     }
 
-    fn get_object_locations_from_stream(
+    fn get_object_locations(
         &self,
-        _input_stream: &mut dyn CAIRead,
-    ) -> Result<Vec<HashObjectPositions>> {
-        let vec: Vec<HashObjectPositions> = Vec::new();
+        _input_stream: &mut dyn ReadSeek,
+    ) -> Result<Vec<ObjectLocations>> {
+        let vec: Vec<ObjectLocations> = Vec::new();
         Ok(vec)
     }
 
-    fn remove_cai_store_from_stream(
+    fn remove_c2pa(
         &self,
-        input_stream: &mut dyn CAIRead,
-        output_stream: &mut dyn CAIReadWrite,
+        input_stream: &mut dyn ReadSeek,
+        output_stream: &mut dyn ReadWriteSeek,
     ) -> Result<()> {
-        let (bmff_tree, _bmff_map) = BMFFArena::from_stream(input_stream)?;
+        let (bmff_tree, bmff_map) = BMFFArena::from_stream(input_stream)?;
         input_stream.rewind()?;
 
         // get position of c2pa manifest
-        let (c2pa_start, c2pa_length) =
-            match get_uuid_token(input_stream, &bmff_tree, &C2PA_UUID, None) {
-                Ok(c2pa_token) => {
-                    let uuid_info = &bmff_tree.as_ref()[c2pa_token].data;
+        let (c2pa_start, c2pa_length) = match get_uuid_token(
+            input_stream,
+            &bmff_tree,
+            &C2PA_UUID,
+            Some(&[MANIFEST, ORIGINAL]),
+        ) {
+            Ok(c2pa_token) => {
+                let uuid_info = &bmff_tree.as_ref()[c2pa_token].data;
 
-                    (uuid_info.offset, Some(uuid_info.size))
-                }
-                Err(Error::NotFound) => {
-                    input_stream.rewind()?;
-                    std::io::copy(input_stream, output_stream)?;
-                    return Ok(()); // no box to remove, propagate source to output
-                }
-                Err(e) => return Err(e),
-            };
+                (uuid_info.offset, Some(uuid_info.size))
+            }
+            Err(Error::NotFound) => {
+                input_stream.rewind()?;
+                std::io::copy(input_stream, output_stream)?;
+                return Ok(()); // no box to remove, propagate source to output
+            }
+            Err(e) => return Err(e),
+        };
 
         let (start, end) = if let Some(c2pa_length) = c2pa_length {
             let start = usize::try_from(c2pa_start)
@@ -2322,6 +2843,14 @@ impl CAIWriter for BmffIO {
         input_stream.seek(SeekFrom::Start(end as u64))?;
         std::io::copy(input_stream, output_stream)?;
 
+        if bmff_map.contains_key("/moov") && bmff_map.contains_key("/moof") {
+            return relocate_single_file_fragments(
+                input_stream,
+                output_stream,
+                &[(start as u64, (end - start) as u64, 0)],
+            );
+        }
+
         // Manipulating the UUID box means we may need some patch offsets if they are file absolute offsets.
 
         // map box layout of current output file
@@ -2335,12 +2864,13 @@ impl CAIWriter for BmffIO {
             output_bmff_tree.as_ref(),
             &output_bmff_map,
             offset_adjust,
+            start as u64..end as u64,
         )
     }
 }
 
 impl AssetPatch for BmffIO {
-    fn patch_cai_store(&self, asset_path: &std::path::Path, store_bytes: &[u8]) -> Result<()> {
+    fn patch_c2pa_file(&self, asset_path: &std::path::Path, store_bytes: &[u8]) -> Result<()> {
         let mut asset = OpenOptions::new()
             .write(true)
             .read(true)
@@ -2368,7 +2898,17 @@ impl AssetPatch for BmffIO {
         if let Some(manifest_length) = c2pa_length {
             let mut new_c2pa_box: Vec<u8> = Vec::with_capacity(store_bytes.len() * 2);
             let merkle_data: &[u8] = &[]; // not yet supported
-            write_c2pa_box(&mut new_c2pa_box, store_bytes, MANIFEST, merkle_data, 0)?;
+            let first_merkle = read_bmff_c2pa_boxes(&mut asset)?
+                .bmff_merkle_box_infos
+                .first()
+                .map_or(0, |b| b.offset);
+            write_c2pa_box(
+                &mut new_c2pa_box,
+                store_bytes,
+                MANIFEST,
+                merkle_data,
+                first_merkle,
+            )?;
             let new_c2pa_box_size = new_c2pa_box.len();
 
             if new_c2pa_box_size as u64 == manifest_length {
@@ -2396,143 +2936,108 @@ impl ComposedManifestRef for BmffIO {
     }
 }
 
-impl RemoteRefEmbed for BmffIO {
-    #[allow(unused_variables)]
-    fn embed_reference(
+impl WriteXmp for BmffIO {
+    fn write_xmp(
         &self,
-        asset_path: &Path,
-        embed_ref: crate::asset_io::RemoteRefEmbedType,
+        input_stream: &mut dyn ReadSeek,
+        output_stream: &mut dyn ReadWriteSeek,
+        xmp: &str,
     ) -> Result<()> {
-        match embed_ref {
-            crate::asset_io::RemoteRefEmbedType::Xmp(manifest_uri) => {
-                let output_buf = Vec::new();
-                let mut output_stream = Cursor::new(output_buf);
+        let (bmff_tree, bmff_map) = BMFFArena::from_stream(input_stream)?;
+        input_stream.rewind()?;
 
-                // block so that source file is closed after embed
-                {
-                    let mut source_stream = std::fs::File::open(asset_path)?;
-                    self.embed_reference_to_stream(
-                        &mut source_stream,
-                        &mut output_stream,
-                        RemoteRefEmbedType::Xmp(manifest_uri),
-                    )?;
-                }
+        let c2pa_boxes = c2pa_boxes_from_tree_and_map(input_stream, &bmff_tree, &bmff_map)?;
 
-                // write will replace exisiting contents
-                std::fs::write(asset_path, output_stream.into_inner())?;
-                Ok(())
+        // get position to insert XMP
+        let (xmp_start, xmp_length) = match &c2pa_boxes.xmp {
+            Some(_xmp) => (c2pa_boxes.xmp_box_offset, Some(c2pa_boxes.xmp_box_size)),
+            None => {
+                // Start after the leading type box, including standalone media segments.
+                let type_box_token = bmff_map
+                    .get("/ftyp")
+                    .or_else(|| bmff_map.get("/styp"))
+                    .ok_or(Error::UnsupportedType)?;
+                let type_box_info = &bmff_tree.as_ref()[type_box_token[0]].data;
+
+                ((type_box_info.offset + type_box_info.size), None)
             }
-            crate::asset_io::RemoteRefEmbedType::StegoS(_) => Err(Error::UnsupportedType),
-            crate::asset_io::RemoteRefEmbedType::StegoB(_) => Err(Error::UnsupportedType),
-            crate::asset_io::RemoteRefEmbedType::Watermark(_) => Err(Error::UnsupportedType),
+        };
+
+        let mut new_xmp_box: Vec<u8> = Vec::with_capacity(xmp.len() * 2);
+        write_xmp_box(&mut new_xmp_box, xmp.as_bytes())?;
+        let new_xmp_box_size = new_xmp_box.len();
+
+        let (start, end) = if let Some(xmp_length) = xmp_length {
+            let start = usize::try_from(xmp_start)
+                .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?; // get beginning of chunk which starts 4 bytes before label
+
+            let end = usize::try_from(xmp_start + xmp_length)
+                .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?;
+
+            (start, end)
+        } else {
+            // insert new C2PA
+            let end = usize::try_from(xmp_start)
+                .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?;
+
+            (end, end)
+        };
+
+        // write content before XMP box
+        input_stream.rewind()?;
+        let mut before_xmp = input_stream.take(start as u64);
+        std::io::copy(&mut before_xmp, output_stream)?;
+
+        // write ContentProvenanceBox
+        output_stream.write_all(&new_xmp_box)?;
+
+        // calc offset adjustments. Use i64 so XMP boxes larger than
+        // i32::MAX (2 GiB) do not silently truncate.
+        let new_xmp_box_size_i64 = i64::try_from(new_xmp_box_size)
+            .map_err(|_| Error::InvalidAsset("XMP box too large".to_string()))?;
+        let offset_adjust: i64 = if end == 0 {
+            new_xmp_box_size_i64
+        } else {
+            // value could be negative if box is truncated
+            let existing_xmp_box_size = end - start;
+            let existing_i64 = i64::try_from(existing_xmp_box_size)
+                .map_err(|_| Error::InvalidAsset("existing XMP box too large".to_string()))?;
+            new_xmp_box_size_i64 - existing_i64
+        };
+
+        // write content after XMP box
+        input_stream.seek(SeekFrom::Start(end as u64))?;
+        std::io::copy(input_stream, output_stream)?;
+
+        // Equal-size replacement does not relocate media, including layouts
+        // outside the automatic single-file fragment signing subset.
+        if offset_adjust == 0 {
+            return Ok(());
         }
-    }
 
-    fn embed_reference_to_stream(
-        &self,
-        input_stream: &mut dyn CAIRead,
-        output_stream: &mut dyn CAIReadWrite,
-        embed_ref: RemoteRefEmbedType,
-    ) -> Result<()> {
-        match embed_ref {
-            crate::asset_io::RemoteRefEmbedType::Xmp(manifest_uri) => {
-                let (bmff_tree, bmff_map) = BMFFArena::from_stream(input_stream)?;
-                input_stream.rewind()?;
-
-                let c2pa_boxes = c2pa_boxes_from_tree_and_map(input_stream, &bmff_tree, &bmff_map)?;
-
-                let xmp = match &c2pa_boxes.xmp {
-                    Some(xmp) => add_provenance(xmp, &manifest_uri)?,
-                    None => {
-                        let xmp = MIN_XMP.to_string();
-                        add_provenance(&xmp, &manifest_uri)?
-                    }
-                };
-
-                // get position to insert xmp
-                let (xmp_start, xmp_length) = match &c2pa_boxes.xmp {
-                    Some(_xmp) => (c2pa_boxes.xmp_box_offset, Some(c2pa_boxes.xmp_box_size)),
-                    None => {
-                        // get leading type box location (ftyp for complete files; styp for media
-                        // segments)
-                        let type_box_token = bmff_map
-                            .get("/ftyp")
-                            .or_else(|| bmff_map.get("/styp"))
-                            .ok_or(Error::UnsupportedType)?; // todo check ftyps to make sure we support any special format requirements
-                        let type_box_info = &bmff_tree.as_ref()[type_box_token[0]].data;
-                        let type_box_offset = type_box_info.offset;
-                        let type_box_size = type_box_info.size;
-
-                        ((type_box_offset + type_box_size), None)
-                    }
-                };
-
-                let mut new_xmp_box: Vec<u8> = Vec::with_capacity(xmp.len() * 2);
-                write_xmp_box(&mut new_xmp_box, xmp.as_bytes())?;
-                let new_xmp_box_size = new_xmp_box.len();
-
-                let (start, end) = if let Some(xmp_length) = xmp_length {
-                    let start = usize::try_from(xmp_start)
-                        .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?; // get beginning of chunk which starts 4 bytes before label
-
-                    let end = usize::try_from(xmp_start + xmp_length)
-                        .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?;
-
-                    (start, end)
-                } else {
-                    // insert new c2pa
-                    let end = usize::try_from(xmp_start)
-                        .map_err(|_err| Error::InvalidAsset("value out of range".to_string()))?;
-
-                    (end, end)
-                };
-
-                // write content before XMP box
-                input_stream.rewind()?;
-                let mut before_xmp = input_stream.take(start as u64);
-                std::io::copy(&mut before_xmp, output_stream)?;
-
-                // write ContentProvenanceBox
-                output_stream.write_all(&new_xmp_box)?;
-
-                // calc offset adjustments. Use i64 so XMP boxes larger than
-                // i32::MAX (2 GiB) do not silently truncate.
-                let new_xmp_box_size_i64 = i64::try_from(new_xmp_box_size)
-                    .map_err(|_| Error::InvalidAsset("XMP box too large".to_string()))?;
-                let offset_adjust: i64 = if end == 0 {
-                    new_xmp_box_size_i64
-                } else {
-                    // value could be negative if box is truncated
-                    let existing_xmp_box_size = end - start;
-                    let existing_i64 = i64::try_from(existing_xmp_box_size).map_err(|_| {
-                        Error::InvalidAsset("existing XMP box too large".to_string())
-                    })?;
-                    new_xmp_box_size_i64 - existing_i64
-                };
-
-                // write content after XMP box
-                input_stream.seek(SeekFrom::Start(end as u64))?;
-                std::io::copy(input_stream, output_stream)?;
-
-                // Manipulating the UUID box means we may need some patch offsets if they are file absolute offsets.
-
-                // map box layout of current output file
-                output_stream.rewind()?;
-                let (output_bmff_tree, output_bmff_map) = BMFFArena::from_stream(output_stream)?;
-
-                // adjust offsets based on current layout
-                output_stream.rewind()?;
-                adjust_known_offsets(
-                    output_stream,
-                    output_bmff_tree.as_ref(),
-                    &output_bmff_map,
-                    offset_adjust,
-                )
-            }
-            crate::asset_io::RemoteRefEmbedType::StegoS(_) => Err(Error::UnsupportedType),
-            crate::asset_io::RemoteRefEmbedType::StegoB(_) => Err(Error::UnsupportedType),
-            crate::asset_io::RemoteRefEmbedType::Watermark(_) => Err(Error::UnsupportedType),
+        if bmff_map.contains_key("/moov") && bmff_map.contains_key("/moof") {
+            return relocate_single_file_fragments(
+                input_stream,
+                output_stream,
+                &[(start as u64, (end - start) as u64, new_xmp_box_size as u64)],
+            );
         }
+
+        // Manipulating the UUID box means we may need some patch offsets if they are file absolute offsets.
+
+        // map box layout of current output file
+        output_stream.rewind()?;
+        let (output_bmff_tree, output_bmff_map) = BMFFArena::from_stream(output_stream)?;
+
+        // adjust offsets based on current layout
+        output_stream.rewind()?;
+        adjust_known_offsets(
+            output_stream,
+            output_bmff_tree.as_ref(),
+            &output_bmff_map,
+            offset_adjust,
+            start as u64..end as u64,
+        )
     }
 }
 
@@ -2542,8 +3047,8 @@ impl RemoteRefEmbed for BmffIO {
 // an existing manifest store and that the placeholder box will be replaced with the manifest store during the first update pass.
 #[allow(dead_code)]
 pub(crate) fn inject_placeholder(
-    input_stream: &mut dyn CAIRead,
-    output_stream: &mut dyn CAIReadWrite,
+    input_stream: &mut dyn ReadSeek,
+    output_stream: &mut dyn ReadWriteSeek,
     free_size: usize,
 ) -> Result<u64> {
     let (bmff_tree, bmff_map) = BMFFArena::from_stream(input_stream)?;
@@ -2607,6 +3112,7 @@ pub(crate) fn inject_placeholder(
             output_bmff_tree.as_ref(),
             &output_bmff_map,
             offset_adjust,
+            start..start,
         )?;
     }
 
@@ -2623,7 +3129,7 @@ pub(crate) fn inject_placeholder(
 // the file offset of the beginning of the free box to be replaced by the manifest box.
 #[allow(dead_code)]
 pub(crate) fn inject_manifest_into_free_box(
-    stream: &mut dyn CAIReadWrite,
+    stream: &mut dyn ReadWriteSeek,
     manifest_bytes: &[u8],
     free_box_start: u64,
 ) -> Result<()> {
@@ -2671,12 +3177,6 @@ pub(crate) fn inject_manifest_into_free_box(
         ))?;
     }
     Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum BmffError {
-    #[error("invalid file signature: {reason}")]
-    InvalidFileSignature { reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -3204,16 +3704,36 @@ fn parse_stsz<R: Read + Seek + ?Sized>(
 }
 
 #[cfg(test)]
+mod tfra_tests;
+
+#[cfg(test)]
 pub mod tests {
     #![allow(clippy::expect_used)]
     #![allow(clippy::panic)]
     #![allow(clippy::unwrap_used)]
+
+    use std::io::Cursor;
 
     use super::*;
     use crate::utils::{
         io_utils::tempdirectory,
         test::{fixture_path, temp_dir_path},
     };
+
+    #[test]
+    fn test_fragmented_extensions() {
+        let registry = crate::jumbf_io::default_handler_registry();
+        for (extension, mime) in [("m4s", "video/iso.segment"), ("cmfv", "video/mp4")] {
+            assert!(registry.handler(extension).is_some());
+            assert!(registry.handler(mime).is_some());
+            assert!(registry.is_bmff_format(extension));
+            assert_eq!(registry.mime_for(extension), Some(mime));
+            assert_eq!(
+                registry.format_from_path(format!("init.{extension}")),
+                Some(mime.to_owned())
+            );
+        }
+    }
 
     #[test]
     fn test_read_deep_nesting() {
@@ -3223,7 +3743,7 @@ pub mod tests {
         let mut input_stream = std::fs::File::open(&ap).unwrap();
 
         let bmff = BmffIO::new("mp4");
-        let cai = bmff.read_cai(&mut input_stream);
+        let cai = bmff.read_c2pa(&mut input_stream);
 
         assert!(cai.is_err());
     }
@@ -3236,7 +3756,7 @@ pub mod tests {
         let mut input_stream = std::fs::File::open(&ap).unwrap();
 
         let bmff = BmffIO::new("mp4");
-        let cai = bmff.read_cai(&mut input_stream).unwrap();
+        let cai = bmff.read_c2pa(&mut input_stream).unwrap();
 
         assert!(!cai.is_empty());
     }
@@ -3253,10 +3773,13 @@ pub mod tests {
 
         let bmff = BmffIO::new("mp4");
 
-        let eh = bmff.remote_ref_writer_ref().unwrap();
+        let eh = bmff.remote_manifest_url_ref().unwrap();
 
-        eh.embed_reference(&output, RemoteRefEmbedType::Xmp(data.to_string()))
+        let mut input_stream = std::fs::File::open(&output).unwrap();
+        let mut embed_stream = Cursor::new(Vec::new());
+        eh.write_remote_manifest_url(&mut input_stream, &mut embed_stream, data)
             .unwrap();
+        std::fs::write(&output, embed_stream.into_inner()).unwrap();
 
         let mut output_stream = std::fs::File::open(&output).unwrap();
         let xmp = bmff.get_reader().read_xmp(&mut output_stream).unwrap();
@@ -3279,7 +3802,7 @@ pub mod tests {
                 let bmff = BmffIO::new("mp4");
 
                 //let test_data =  bmff.read_cai_store(&source).unwrap();
-                if let Ok(()) = bmff.save_cai_store(&output, test_data) {
+                if let Ok(()) = bmff.save_c2pa_store(&output, test_data) {
                     if let Ok(read_test_data) = bmff.read_cai_store(&output) {
                         assert!(vec_compare(test_data, &read_test_data));
                         success = true;
@@ -3304,7 +3827,7 @@ pub mod tests {
 
                 if let Ok(mut test_data) = bmff.read_cai_store(&source) {
                     test_data.append(&mut more_data);
-                    if let Ok(()) = bmff.save_cai_store(&output, &test_data) {
+                    if let Ok(()) = bmff.save_c2pa_store(&output, &test_data) {
                         if let Ok(read_test_data) = bmff.read_cai_store(&output) {
                             assert!(vec_compare(&test_data, &read_test_data));
                             success = true;
@@ -3332,7 +3855,7 @@ pub mod tests {
                     // create replacement data of same size
                     let mut new_data = vec![0u8; source_data.len()];
                     new_data[..test_data.len()].copy_from_slice(test_data);
-                    bmff.patch_cai_store(&output, &new_data).unwrap();
+                    bmff.patch_c2pa_file(&output, &new_data).unwrap();
 
                     let replaced = bmff.read_cai_store(&output).unwrap();
 
@@ -3355,12 +3878,57 @@ pub mod tests {
         std::fs::copy(source, &output).unwrap();
         let bmff_io = BmffIO::new("mp4");
 
-        bmff_io.remove_cai_store(&output).unwrap();
+        bmff_io.remove_c2pa_store(&output).unwrap();
 
         // read back in asset, JumbfNotFound is expected since it was removed
         match bmff_io.read_cai_store(&output) {
             Err(Error::JumbfNotFound) => (),
             _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_segment_context_mime_and_styp_xmp_round_trip() {
+        let context = crate::Context::new();
+        // #17 maps `m4s` to `video/iso.segment`; `mp4`/`cmfv` stay `video/mp4`.
+        for (format, mime) in [
+            ("mp4", "video/mp4"),
+            ("m4s", "video/iso.segment"),
+            ("cmfv", "video/mp4"),
+        ] {
+            assert_eq!(context.io().format_to_mime(format), mime);
+            assert!(context.io().is_bmff_format(format));
+        }
+
+        // XMP insertion must accept both complete files and standalone segments.
+        for type_box in [b"ftyp", b"styp"] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&16u32.to_be_bytes());
+            bytes.extend_from_slice(type_box);
+            bytes.extend_from_slice(b"msdh");
+            bytes.extend_from_slice(&0u32.to_be_bytes());
+            bytes.extend_from_slice(&8u32.to_be_bytes());
+            bytes.extend_from_slice(b"mdat");
+            let mut input = Cursor::new(bytes);
+            let mut output = Cursor::new(Vec::new());
+            let handler = context.io().handler("m4s").unwrap();
+            handler
+                .remote_manifest_url_ref()
+                .unwrap()
+                .write_remote_manifest_url(&mut input, &mut output, "https://example.org/a.c2pa")
+                .unwrap();
+            assert_eq!(&output.get_ref()[4..8], type_box);
+            output.rewind().unwrap();
+            assert!(handler
+                .get_reader()
+                .read_xmp(&mut output)
+                .unwrap()
+                .contains("https://example.org/a.c2pa"));
+            output.rewind().unwrap();
+            assert!(matches!(
+                handler.get_reader().read_c2pa(&mut output),
+                Err(Error::JumbfNotFound)
+            ));
         }
     }
 
@@ -3384,7 +3952,7 @@ pub mod tests {
         let bmff_io = BmffIO::new("mp4");
         let mut source = Cursor::new(data);
         assert!(matches!(
-            bmff_io.read_cai(&mut source),
+            bmff_io.read_c2pa(&mut source),
             Err(Error::InvalidAsset(_))
         ));
     }
@@ -3507,7 +4075,7 @@ pub mod tests {
 
         let bmff_io = BmffIO::new("mp4");
         let mut source = Cursor::new(data);
-        let result = bmff_io.read_cai(&mut source);
+        let result = bmff_io.read_c2pa(&mut source);
         assert!(
             matches!(
                 result,
@@ -3524,7 +4092,7 @@ pub mod tests {
 
         let bmff_io = BmffIO::new("mp4");
         let mut source = Cursor::new(data);
-        let result = bmff_io.read_cai(&mut source);
+        let result = bmff_io.read_c2pa(&mut source);
         assert!(
             matches!(
                 result,
@@ -3543,10 +4111,112 @@ pub mod tests {
 
         let bmff_io = BmffIO::new("mp4");
         let mut source = Cursor::new(data);
-        let result = bmff_io.read_cai(&mut source);
+        let result = bmff_io.read_c2pa(&mut source);
         assert!(
             matches!(result, Ok(ref bytes) if bytes == b"dummy manifest bytes"),
             "expected ordinary manifest-only asset to be read as-is, got {result:?}"
+        );
+    }
+
+    // A C2PA box present but resolving to no manifest (e.g. a manifest box
+    // retagged to an unrecognized or merkle purpose - the purpose tag is
+    // hash-excluded) must be rejected, not reported as an unsigned asset.
+
+    #[test]
+    fn test_read_cai_rejects_c2pa_box_with_unrecognized_purpose() {
+        let mut data = minimal_ftyp();
+        // A real manifest box retagged to an unrecognized purpose. It is no
+        // longer sorted into the manifest bytes, so without the check the
+        // reader would report the asset as carrying no manifest at all.
+        write_c2pa_box(&mut data, b"dummy manifest bytes", "notapurpose", &[], 0).unwrap();
+
+        let bmff_io = BmffIO::new("mp4");
+        let mut source = Cursor::new(data);
+        let result = bmff_io.read_c2pa(&mut source);
+        assert!(
+            matches!(
+                result,
+                Err(Error::C2PAValidation(ref m)) if m == "C2PA box present without a readable manifest"
+            ),
+            "expected retagged-purpose box to be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_cai_rejects_merkle_box_without_manifest() {
+        let mut data = minimal_ftyp();
+        // A valid merkle box with no accompanying manifest - merkle boxes are
+        // auxiliary and never travel alone, so this is a retagged/removed
+        // manifest.
+        let mm = BmffMerkleMap {
+            unique_id: 0,
+            local_id: 0,
+            location: 0,
+            hashes: None,
+        };
+        let merkle_data = c2pa_cbor::to_vec(&mm).unwrap();
+        write_c2pa_box(&mut data, &[], MERKLE, &merkle_data, 0).unwrap();
+
+        let bmff_io = BmffIO::new("mp4");
+        let mut source = Cursor::new(data);
+        let result = bmff_io.read_c2pa(&mut source);
+        assert!(
+            matches!(
+                result,
+                Err(Error::C2PAValidation(ref m)) if m == "C2PA box present without a readable manifest"
+            ),
+            "expected merkle-only asset to be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_cai_unsigned_asset_still_reports_not_found() {
+        // No C2PA box at all -> genuinely unsigned, must stay JumbfNotFound
+        // (the new check must not fire when no C2PA box is present).
+        let data = minimal_ftyp();
+        let bmff_io = BmffIO::new("mp4");
+        let mut source = Cursor::new(data);
+        let result = bmff_io.read_c2pa(&mut source);
+        assert!(
+            matches!(result, Err(Error::JumbfNotFound)),
+            "expected unsigned asset to report JumbfNotFound, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_load_jumbf_tampered_box_skips_remote_fallback() {
+        use crate::{
+            utils::xmp_inmemory_utils::{add_provenance, XmpInfo, MIN_XMP},
+            Context,
+        };
+
+        // A BMFF with BOTH a tampered C2PA box (resolves to no manifest) and an
+        // XMP remote-manifest provenance reference: the tampering must be
+        // rejected rather than silently falling back to the remote manifest.
+        let mut data = minimal_ftyp();
+        write_c2pa_box(&mut data, b"dummy manifest bytes", "notapurpose", &[], 0).unwrap();
+        let url = "http://example.com/manifest.c2pa";
+        let xmp = add_provenance(MIN_XMP, url).unwrap();
+        write_xmp_box(&mut data, xmp.as_bytes()).unwrap();
+
+        // The remote reference is genuinely present, so the fallback would fire
+        // on JumbfNotFound.
+        assert_eq!(
+            XmpInfo::from_source(&mut Cursor::new(data.clone()), "mp4")
+                .provenance
+                .as_deref(),
+            Some(url)
+        );
+
+        let context = Context::new();
+        let mut source = Cursor::new(data);
+        let result = crate::store::Store::load_jumbf_from_stream("mp4", &mut source, &context);
+        assert!(
+            matches!(
+                result,
+                Err(Error::C2PAValidation(ref m)) if m == "C2PA box present without a readable manifest"
+            ),
+            "tampered C2PA box must be rejected, not fall back to the remote manifest; got {result:?}"
         );
     }
 
@@ -3620,7 +4290,7 @@ pub mod tests {
         let map: HashMap<String, Vec<Token>> = HashMap::new();
         let mut cursor = Cursor::new(Vec::<u8>::new());
         let big_adjust: i64 = (i32::MAX as i64) + 1;
-        adjust_known_offsets(&mut cursor, &arena, &map, big_adjust).unwrap();
+        adjust_known_offsets(&mut cursor, &arena, &map, big_adjust, 0..0).unwrap();
     }
 
     #[test]
@@ -3642,7 +4312,7 @@ pub mod tests {
         let map: HashMap<String, Vec<Token>> = HashMap::new();
         let mut cursor = Cursor::new(Vec::<u8>::new());
         let big_neg: i64 = (i32::MIN as i64) - 1;
-        adjust_known_offsets(&mut cursor, &arena, &map, big_neg).unwrap();
+        adjust_known_offsets(&mut cursor, &arena, &map, big_neg, 0..0).unwrap();
     }
 
     /// The native sample reader must parse our real MP4/MOV fixtures (which carry

@@ -51,6 +51,40 @@ pub struct IdentityAssertionBuilder {
 }
 
 impl IdentityAssertionBuilder {
+    /// Maximum signature length that fits the complete assertion reservation.
+    ///
+    /// Accounts for the actual signer payload and CBOR byte-string headers.
+    /// The payload is only known at content-generation time; `reserve_size`
+    /// on a credential holder reserves the entire assertion, not just its signature.
+    pub fn signature_capacity(
+        signer_payload: &SignerPayload,
+        assertion_size: usize,
+    ) -> crate::Result<usize> {
+        if assertion_size > isize::MAX as usize {
+            return Err(crate::Error::BadParam(
+                "identity assertion reservation exceeds addressable size".into(),
+            ));
+        }
+        let assertion = IdentityAssertion {
+            signer_payload: signer_payload.clone(),
+            signature: vec![],
+            pad1: vec![],
+            pad2: None,
+            label: None,
+        };
+        let base_size = c2pa_cbor::to_vec(&assertion)?.len();
+        let empty_header = c2pa_cbor::to_vec(&0usize)?.len();
+        let encoded_budget = assertion_size
+            .checked_sub(base_size)
+            .and_then(|remaining| remaining.checked_add(empty_header))
+            .ok_or_else(|| {
+                crate::Error::BadParam(
+                    "identity assertion reservation cannot fit the signer payload".into(),
+                )
+            })?;
+        max_byte_string_payload(encoded_budget)
+    }
+
     /// Create an `IdentityAssertionBuilder` for the given `CredentialHolder`
     /// instance.
     pub fn for_credential_holder<CH: CredentialHolder + 'static + Send + Sync>(
@@ -93,8 +127,6 @@ impl DynamicAssertion for IdentityAssertionBuilder {
 
     fn reserve_size(&self) -> crate::Result<usize> {
         Ok(self.credential_holder.reserve_size())
-        // TO DO: Credential holder will state reserve size for signature.
-        // Add additional size for CBOR wrapper outside signature.
     }
 
     fn content(
@@ -130,6 +162,9 @@ impl DynamicAssertion for IdentityAssertionBuilder {
             roles: self.roles.clone(),
         };
 
+        if let Some(size) = size {
+            Self::signature_capacity(&signer_payload, size)?;
+        }
         let signature_result = self.credential_holder.sign(&signer_payload);
 
         finalize_identity_assertion(signer_payload, size, signature_result)
@@ -230,8 +265,6 @@ impl AsyncDynamicAssertion for AsyncIdentityAssertionBuilder {
 
     fn reserve_size(&self) -> crate::Result<usize> {
         Ok(self.credential_holder.reserve_size())
-        // TO DO: Credential holder will state reserve size for signature.
-        // Add additional size for CBOR wrapper outside signature.
     }
 
     async fn content(
@@ -267,6 +300,9 @@ impl AsyncDynamicAssertion for AsyncIdentityAssertionBuilder {
             roles: self.roles.clone(),
         };
 
+        if let Some(size) = size {
+            IdentityAssertionBuilder::signature_capacity(&signer_payload, size)?;
+        }
         let signature_result = self.credential_holder.sign(&signer_payload).await;
 
         finalize_identity_assertion(signer_payload, size, signature_result)
@@ -302,11 +338,40 @@ impl AsyncDynamicAssertion for Arc<AsyncIdentityAssertionBuilder> {
     }
 }
 
+// CBOR uint and byte-string length headers have the same encoded width. Measuring
+// the uint header avoids allocating a trial signature/padding buffer during sizing.
+fn max_byte_string_payload(encoded_budget: usize) -> crate::Result<usize> {
+    if encoded_budget == 0 {
+        return Err(crate::Error::BadParam(
+            "no room for a CBOR byte string".into(),
+        ));
+    }
+    let (mut low, mut high) = (0, encoded_budget);
+    while low < high {
+        let candidate = low + (high - low) / 2 + 1;
+        let header = c2pa_cbor::to_vec(&candidate)?.len();
+        if candidate
+            .checked_add(header)
+            .is_some_and(|size| size <= encoded_budget)
+        {
+            low = candidate;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    Ok(low)
+}
+
 fn finalize_identity_assertion(
     signer_payload: SignerPayload,
     size: Option<usize>,
     signature_result: Result<Vec<u8>, IdentityBuilderError>,
 ) -> crate::Result<DynamicAssertionContent> {
+    if size.is_some_and(|size| size > isize::MAX as usize) {
+        return Err(crate::Error::BadParam(
+            "identity assertion reservation exceeds addressable size".into(),
+        ));
+    }
     // TO DO: Think through how errors map into crate::Error.
     let signature = signature_result.map_err(|e| crate::Error::BadParam(e.to_string()))?;
 
@@ -324,31 +389,67 @@ fn finalize_identity_assertion(
     // TO DO: Think through how errors map into crate::Error.
 
     if let Some(assertion_size) = size {
+        // Castlabs fork: the exact-fill padding below handles any non-negative
+        // gap without underflow (checked arithmetic), so upstream's 15-byte
+        // minimum (#2697) is not required here.
         if assertion_cbor.len() > assertion_size {
             // TO DO: Think about how to signal this in such a way that
             // the AsyncCredentialHolder implementor understands the problem.
             return Err(crate::Error::BadParam(format!("Serialized assertion is {len} bytes, which exceeds the planned size of {assertion_size} bytes", len = assertion_cbor.len())));
         }
 
-        ia.pad1 = vec![0u8; assertion_size - assertion_cbor.len() - 15];
-
-        assertion_cbor.clear();
-        c2pa_cbor::to_writer(&mut assertion_cbor, &ia)
-            .map_err(|e| crate::Error::BadParam(e.to_string()))?;
-        // TO DO: Think through how errors map into crate::Error.
-
-        ia.pad2 = Some(ByteBuf::from(vec![
-            0u8;
-            assertion_size - assertion_cbor.len() - 6
-        ]));
-
-        assertion_cbor.clear();
-        c2pa_cbor::to_writer(&mut assertion_cbor, &ia)
-            .map_err(|e| crate::Error::BadParam(e.to_string()))?;
-        // TO DO: Think through how errors map into crate::Error.
-
-        // TO DO: See if this approach ever fails. IMHO it "should" work for all cases.
-        assert_eq!(assertion_size, assertion_cbor.len());
+        let empty_header = c2pa_cbor::to_vec(&0usize)?.len();
+        // One padding string covers ordinary lengths. The second bridges holes
+        // where CBOR length headers grow (e.g. a 23-byte string becoming 24).
+        for with_pad2 in [false, true] {
+            ia.pad2 = with_pad2.then(|| ByteBuf::from(Vec::new()));
+            let base_size = c2pa_cbor::to_vec(&ia)?.len();
+            let Some(encoded_budget) = assertion_size
+                .checked_sub(base_size)
+                .and_then(|gap| gap.checked_add(empty_header))
+            else {
+                continue;
+            };
+            let pad1_len = max_byte_string_payload(encoded_budget)?;
+            let pad1_header = c2pa_cbor::to_vec(&pad1_len)?.len();
+            let remainder = encoded_budget
+                .checked_sub(pad1_len)
+                .and_then(|remaining| remaining.checked_sub(pad1_header))
+                .ok_or_else(|| {
+                    crate::Error::BadParam("identity assertion padding exceeds reservation".into())
+                })?;
+            if !with_pad2 && remainder != 0 {
+                continue;
+            }
+            ia.pad1.try_reserve_exact(pad1_len).map_err(|e| {
+                crate::Error::BadParam(format!("identity assertion padding allocation failed: {e}"))
+            })?;
+            ia.pad1.resize(pad1_len, 0);
+            if with_pad2 {
+                let budget = remainder.checked_add(empty_header).ok_or_else(|| {
+                    crate::Error::BadParam("identity assertion padding size overflow".into())
+                })?;
+                let pad2_len = max_byte_string_payload(budget)?;
+                let mut pad2 = Vec::new();
+                pad2.try_reserve_exact(pad2_len).map_err(|e| {
+                    crate::Error::BadParam(format!(
+                        "identity assertion padding allocation failed: {e}"
+                    ))
+                })?;
+                pad2.resize(pad2_len, 0);
+                ia.pad2 = Some(ByteBuf::from(pad2));
+            }
+            assertion_cbor = c2pa_cbor::to_vec(&ia)?;
+            if assertion_cbor.len() != assertion_size {
+                return Err(crate::Error::BadParam(
+                    "identity assertion cannot exactly fill reservation".into(),
+                ));
+            }
+            return Ok(DynamicAssertionContent::Cbor(assertion_cbor));
+        }
+        return Err(crate::Error::BadParam(
+            "identity assertion cannot exactly fill reservation".into(),
+        ));
     }
 
     Ok(DynamicAssertionContent::Cbor(assertion_cbor))
@@ -376,7 +477,7 @@ mod tests {
                 manifest_json, parent_json, NaiveAsyncCredentialHolder, NaiveCredentialHolder,
                 NaiveSignatureVerifier,
             },
-            IdentityAssertion, ToCredentialSummary,
+            IdentityAssertion, SignerPayload, ToCredentialSummary,
         },
         status_tracker::StatusTracker,
         Builder, HashedUri, Reader, SigningAlg,
@@ -384,6 +485,79 @@ mod tests {
 
     const TEST_IMAGE: &[u8] = include_bytes!("../../../tests/fixtures/CA.jpg");
     const TEST_THUMBNAIL: &[u8] = include_bytes!("../../../tests/fixtures/thumbnail.jpg");
+
+    #[allow(clippy::expect_used)]
+    #[test]
+    fn padding_and_capacity_cover_cbor_boundaries_without_panics() {
+        use super::finalize_identity_assertion;
+        use crate::identity::SignerPayload;
+
+        let payload = SignerPayload {
+            referenced_assertions: vec![HashedUri::new(
+                "self#jumbf=c2pa.assertions/c2pa.hash.data".into(),
+                Some("sha256".into()),
+                &[1; 32],
+            )],
+            sig_type: "test.capacity".into(),
+            roles: vec!["cawg.publisher".into()],
+        };
+        for signature_len in [0, 1, 23, 24, 255, 256, 65535, 65536] {
+            let signature = vec![0xa5; signature_len];
+            let DynamicAssertionContent::Cbor(unpadded) =
+                finalize_identity_assertion(payload.clone(), None, Ok(signature.clone())).unwrap()
+            else {
+                panic!("expected CBOR")
+            };
+            for gap in (0..=40).chain([255, 256, 257, 258, 65535, 65536, 65537]) {
+                let size = unpadded.len() + gap;
+                let result = std::panic::catch_unwind(|| {
+                    finalize_identity_assertion(payload.clone(), Some(size), Ok(signature.clone()))
+                })
+                .expect("sized finalization must not panic")
+                .unwrap();
+                let DynamicAssertionContent::Cbor(bytes) = result else {
+                    panic!("expected CBOR")
+                };
+                assert_eq!(bytes.len(), size);
+                let restored: IdentityAssertion = c2pa_cbor::from_slice(&bytes).unwrap();
+                assert_eq!(restored.signature, signature);
+                assert!(restored.pad1.iter().all(|b| *b == 0));
+                assert!(restored
+                    .pad2
+                    .as_ref()
+                    .is_none_or(|p| p.iter().all(|b| *b == 0)));
+
+                let capacity =
+                    IdentityAssertionBuilder::signature_capacity(&payload, size).unwrap();
+                assert!(capacity >= signature_len);
+                let DynamicAssertionContent::Cbor(at_capacity) =
+                    finalize_identity_assertion(payload.clone(), None, Ok(vec![0; capacity]))
+                        .unwrap()
+                else {
+                    panic!("expected CBOR")
+                };
+                assert!(at_capacity.len() <= size);
+                let DynamicAssertionContent::Cbor(above_capacity) =
+                    finalize_identity_assertion(payload.clone(), None, Ok(vec![0; capacity + 1]))
+                        .unwrap()
+                else {
+                    panic!("expected CBOR")
+                };
+                assert!(above_capacity.len() > size);
+            }
+            for size in [0, unpadded.len() - 1, usize::MAX] {
+                assert!(std::panic::catch_unwind(|| finalize_identity_assertion(
+                    payload.clone(),
+                    Some(size),
+                    Ok(signature.clone()),
+                ))
+                .expect("invalid budgets must not panic")
+                .is_err());
+            }
+        }
+        assert!(IdentityAssertionBuilder::signature_capacity(&payload, 0).is_err());
+        assert!(IdentityAssertionBuilder::signature_capacity(&payload, usize::MAX).is_err());
+    }
 
     #[c2pa_test_async]
     async fn simple_case() {
@@ -417,7 +591,13 @@ mod tests {
         dest.rewind().unwrap();
 
         let manifest_store = Reader::default().with_stream(format, &mut dest).unwrap();
-        assert_eq!(manifest_store.validation_status(), None);
+        // The naive credential's sig_type is unrecognized by the default Reader,
+        // which must surface it as a failure.
+        assert!(manifest_store
+            .validation_status()
+            .unwrap()
+            .iter()
+            .any(|s| s.code() == "cawg.identity.sig_type.unknown"));
 
         let manifest = manifest_store.active_manifest().unwrap();
         let mut st = StatusTracker::default();
@@ -472,7 +652,13 @@ mod tests {
         dest.rewind().unwrap();
 
         let manifest_store = Reader::default().with_stream(format, &mut dest).unwrap();
-        assert_eq!(manifest_store.validation_status(), None);
+        // The naive credential's sig_type is unrecognized by the default Reader,
+        // which must surface it as a failure.
+        assert!(manifest_store
+            .validation_status()
+            .unwrap()
+            .iter()
+            .any(|s| s.code() == "cawg.identity.sig_type.unknown"));
 
         let manifest = manifest_store.active_manifest().unwrap();
         let mut st = StatusTracker::default();
@@ -545,5 +731,51 @@ mod tests {
         assert!(!explicit_instance
             .iter()
             .any(|url| url.ends_with("/c2pa.soft-binding__2")));
+    }
+
+    /// Reserve sizes smaller than the unpadded assertion are rejected with
+    /// `BadParam` (never a panic/underflow). Castlabs fork: the exact-fill
+    /// padding algorithm fills any gap >= 0, so upstream's fixed 15-byte
+    /// padding minimum (#2697) does not apply; small gaps must fill exactly.
+    #[test]
+    fn rejects_reserve_size_that_is_too_small() {
+        use super::{finalize_identity_assertion, DynamicAssertionContent};
+
+        let signer_payload = SignerPayload {
+            referenced_assertions: vec![],
+            sig_type: "INVALID.identity.naive_credential".to_owned(),
+            roles: vec![],
+        };
+
+        let DynamicAssertionContent::Cbor(unpadded) =
+            finalize_identity_assertion(signer_payload.clone(), None, Ok(vec![])).unwrap()
+        else {
+            panic!("expected CBOR content");
+        };
+        let unpadded_len = unpadded.len();
+
+        for size in [0usize, 1, unpadded_len - 1] {
+            match finalize_identity_assertion(signer_payload.clone(), Some(size), Ok(vec![])) {
+                Err(crate::Error::BadParam(_)) => {}
+                Err(e) => panic!("expected BadParam, got {e:?}"),
+                Ok(_) => panic!("a reserve size that is too small must be rejected"),
+            }
+        }
+
+        for size in [
+            unpadded_len,
+            unpadded_len + 1,
+            unpadded_len + 14,
+            unpadded_len + 15,
+            unpadded_len + 24,
+        ] {
+            let DynamicAssertionContent::Cbor(padded) =
+                finalize_identity_assertion(signer_payload.clone(), Some(size), Ok(vec![]))
+                    .unwrap_or_else(|e| panic!("reserve size {size} should fill exactly: {e:?}"))
+            else {
+                panic!("expected CBOR content");
+            };
+            assert_eq!(padded.len(), size);
+        }
     }
 }

@@ -11,6 +11,13 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ### Experimental
 
+* Reduce the disabled trusted-VSI expert API to `sign_sig_structure(&[u8])`,
+  returning `TrustedVsiSignResult` with raw signature, assigned `u32` sequence,
+  and optional inclusive sequence maximum. Remove the unshipped expert EMSG
+  skeleton method and C symbol without aliases. Capability bit 2 is now named
+  `EXPERT_SIG_STRUCTURE_BIT`; the capability mask remains zero. Split-init,
+  composed EMSG, status, recovery, and callback-context target APIs remain stubs;
+  complete-buffer VSI behavior is unchanged.
 * Add purpose-aware Ed25519/ES256 callback signing and validated artifact recovery to the
   experimental live-video VSI signer while preserving the local Ed25519 API.
 * Tighten experimental VSI validation and recovery by requiring the deterministic `emsg.id`
@@ -20,6 +27,17 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
   supplied Unix timestamp drives key-validity checks, sizing, final signatures, and callbacks.
 * Add an allocation-free experimental C FFI probe for reading the 32-bit
   `moof/mfhd.sequence_number` from a live-video media segment.
+
+### Fixed
+
+* Preserve each TFRA entry's fragment target when inserting, resizing, or removing BMFF metadata. Offset adjustment now rejects unsupported TFRA versions instead of interpreting them as version 0. Previously corrupted TFRA tables are not repaired.
+* Generate fragment Merkle bindings when embedding manifests in supported single-track, single-file fragmented MP4 assets. Unsupported addressing, multiplexed layouts, and detached fragment signing fail explicitly; existing Merkle-bound files require an update manifest instead of ordinary re-signing.
+* Verify single-file fragmented BMFF assets against the Merkle maps named by their UUID boxes rather than unrelated rendition maps.
+* Use Merkle rendition ID 1 for new single-file fragmented MP4 signatures, aligning with the multi-file writer and C2PA's non-normative 1-based guidance. Existing ID-0 assets remain verifiable.
+
+### Added
+
+* Register `.m4s` and `.cmfv` BMFF extensions for fragmented init segments.
 
 ## [0.89.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.2...c2pa-v0.89.3)
 _13 July 2026_

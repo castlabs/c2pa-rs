@@ -10,6 +10,7 @@ import tomllib
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,7 +27,9 @@ SPEC.loader.exec_module(qualification)
 def _valid_header_bytes() -> bytes:
     version = qualification.workspace_version(ROOT / "Cargo.toml")
     declarations = "\n".join(
-        f"C2PA_API extern int {symbol}(void);"
+        "C2PA_API extern " + qualification.TRUSTED_SIGN_PROTOTYPE
+        if symbol == "c2pa_live_video_trusted_vsi_session_sign_sig_structure"
+        else f"C2PA_API extern int {symbol}(void);"
         for symbol in qualification.REQUIRED_SYMBOLS
     )
     return (
@@ -288,7 +291,7 @@ class EvidenceTests(unittest.TestCase):
             evidence = json.loads(first)
             self.assertEqual(evidence["schemaVersion"], 2)
             self.assertEqual(evidence["python"], {"version": "3.12"})
-            self.assertEqual(evidence["rust"]["releaseToolchain"], "1.88.0")
+            self.assertEqual(evidence["rust"]["releaseToolchain"], "1.96.0")
             self.assertEqual(evidence["rust"]["rustfmtToolchain"], "nightly-2026-01-16")
             packages = evidence["qualification"]["packages"]
             self.assertFalse(packages["c2patool"]["noDefaultFeatures"])
@@ -505,7 +508,8 @@ Symbol {
             (ROOT / relative).read_text(encoding="utf-8")
             for relative in ("c2pa_c_ffi/src/c_api.rs", "c2pa_c_ffi/src/live_video.rs")
         )
-        self.assertEqual(len(qualification.REQUIRED_SYMBOLS), 13)
+        self.assertEqual(len(qualification.REQUIRED_SYMBOLS), 28)
+        self.assertEqual(qualification.TRUSTED_VSI_CAPABILITIES, 63)
         self.assertEqual(
             len(set(qualification.REQUIRED_SYMBOLS)),
             len(qualification.REQUIRED_SYMBOLS),
@@ -515,6 +519,92 @@ Symbol {
                 self.assertRegex(
                     source, rf"extern\s+\"C\"\s+fn\s+{re.escape(symbol)}\s*\("
                 )
+        for symbol in qualification.REMOVED_SYMBOLS:
+            self.assertNotIn(symbol, source)
+        sdk_source = (ROOT / "sdk/src/live_video/trusted_vsi.rs").read_text(
+            encoding="utf-8"
+        )
+        for removed in (
+            "EXPERT_EMSG_SIG_STRUCTURE_BIT",
+            "supports_expert_emsg_sig_structure",
+            "sign_emsg_sig_structure",
+        ):
+            self.assertNotIn(removed, sdk_source)
+
+    def test_trusted_expert_header_rejects_prototype_drift_and_old_symbol(self):
+        version = qualification.workspace_version(ROOT / "Cargo.toml")
+        for before, after in (
+            ("int64_t c2pa_live_video_trusted", "int32_t c2pa_live_video_trusted"),
+            (
+                "struct C2paLiveVideoTrustedVsiSession *",
+                "const struct C2paLiveVideoTrustedVsiSession *",
+            ),
+            ("const unsigned char *data", "unsigned char *data"),
+            ("uintptr_t len", "uint32_t len"),
+            ("const unsigned char **output", "unsigned char **output"),
+            ("uint32_t sequence_number", "uint64_t sequence_number"),
+            ("uint32_t sequence_number", "uint32_t *sequence_number"),
+            (
+                "uint32_t sequence_number,\n    const unsigned char **output",
+                "const unsigned char **output,\n    uint32_t sequence_number",
+            ),
+            (
+                "const unsigned char **output);",
+                "const unsigned char **output, uint32_t *sequence_max, bool *has_sequence_max);",
+            ),
+        ):
+            with self.subTest(after=after), self.assertRaisesRegex(
+                ValueError, "prototype"
+            ):
+                invalid = _valid_header_bytes().replace(before.encode(), after.encode())
+                self.assertNotEqual(invalid, _valid_header_bytes())
+                qualification._validate_header_bytes(invalid, version)
+        for symbol in qualification.REMOVED_SYMBOLS:
+            invalid = _valid_header_bytes() + f"\nint {symbol}(void);\n".encode()
+            with self.assertRaisesRegex(ValueError, "removed header declarations"):
+                qualification._validate_header_bytes(invalid, version)
+
+    def test_export_qualification_rejects_old_symbol_even_with_all_new_exports(self):
+        symbols = (*qualification.REQUIRED_SYMBOLS, *qualification.REMOVED_SYMBOLS)
+        for target in qualification.SUPPORTED_TARGETS:
+            text = "\n".join(
+                f"Export {{\n  Name: {symbol}\n}}"
+                if "windows" in target
+                else f"1: 0000000000001000 24 FUNC GLOBAL DEFAULT 12 {symbol}"
+                for symbol in symbols
+            )
+            with self.subTest(target=target), patch.object(
+                qualification, "_llvm_readobj", return_value=Path("llvm-readobj")
+            ), patch.object(
+                qualification.subprocess, "run", return_value=Namespace(stdout=text)
+            ):
+                with self.assertRaisesRegex(RuntimeError, "removed native exports"):
+                    qualification.verify_symbols(Path("library"), target)
+
+    def test_trusted_capabilities_must_be_fully_wired(self):
+        for value, ok in ((63, True), (0, False), (31, False)):
+            function = MagicMock(return_value=value)
+            handle = Namespace(c2pa_live_video_trusted_vsi_capabilities=function)
+            with self.subTest(value=value), patch("ctypes.CDLL", return_value=handle):
+                if ok:
+                    qualification.verify_trusted_capabilities(Path("library"))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "expected 63"):
+                        qualification.verify_trusted_capabilities(Path("library"))
+
+    def test_verify_header_runs_c11_abi_compilation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            header = Path(directory) / "c2pa.h"
+            header.write_bytes(_valid_header_bytes())
+            with patch.object(qualification.subprocess, "run") as run:
+                qualification.verify_header(header, "test-cc")
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], "test-cc")
+            self.assertIn("-std=c11", command)
+            self.assertIn("-Werror", command)
+            self.assertIn("-fsyntax-only", command)
+            self.assertTrue(command[-1].endswith("trusted_vsi_abi.c"))
+            self.assertTrue(run.call_args.kwargs["check"])
 
     def test_package_manifests_features_and_crypto_profiles_are_real(self):
         for kind in ("sdk", "ffi", "c2patool"):
@@ -579,7 +669,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("pull_request_target:", text)
         self.assertIn('python-version: "3.12"', text)
         self.assertEqual(text.count("actions/setup-python@"), 2)
-        self.assertIn("toolchain: 1.88.0", text)
+        self.assertIn("toolchain: 1.96.0", text)
         self.assertIn("toolchain: nightly-2026-01-16", text)
         self.assertIn("Select complete Windows Perl for vendored OpenSSL", text)
         self.assertIn("C:\\Strawberry\\perl\\bin\\perl.exe", text)
@@ -588,7 +678,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("export PERL='C:\\Strawberry\\perl\\bin\\perl.exe'", text)
         self.assertLess(
             text.index("export PERL='C:\\Strawberry\\perl\\bin\\perl.exe'"),
-            text.index("cargo +1.88.0 build --locked --release"),
+            text.index("cargo +1.96.0 build --locked --release"),
         )
         self.assertIn("cargo +nightly-2026-01-16 fmt --all -- --check", text)
         self.assertIn('CARGO_BUILD_JOBS: "1"', text)
@@ -625,11 +715,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--manifest-path cli/Cargo.toml", text)
         self.assertRegex(
             text,
-            r"cargo \+1\.88\.0 test --locked --manifest-path cli/Cargo\.toml.*--features",
+            r"cargo \+1\.96\.0 test --locked --manifest-path cli/Cargo\.toml.*--features",
         )
         self.assertRegex(
             text,
-            r"cargo \+1\.88\.0 test --locked --lib --test bmff_timed_media_merkle --manifest-path sdk/Cargo\.toml.*--features",
+            r"cargo \+1\.96\.0 test --locked --lib --test bmff_timed_media_merkle --manifest-path sdk/Cargo\.toml.*--features",
         )
         for action_ref in re.findall(r"uses:\s*([^\s#]+)", text):
             with self.subTest(action=action_ref):
@@ -638,9 +728,21 @@ class WorkflowTests(unittest.TestCase):
         if workflow is not None:
             triggers = workflow.get("on", workflow.get(True))
             self.assertEqual(
-                triggers["pull_request"]["branches"], ["feat/live-video-vsi"]
+                triggers["pull_request"]["branches"],
+                [
+                    "feat/live-video-vsi",
+                    "feat/trusted-vsi-api-surface",
+                    "feat/trusted-vsi-functional",
+                ],
             )
-            self.assertEqual(triggers["push"]["branches"], ["feat/live-video-vsi"])
+            self.assertEqual(
+                triggers["push"]["branches"],
+                [
+                    "feat/live-video-vsi",
+                    "feat/trusted-vsi-api-surface",
+                    "feat/trusted-vsi-functional",
+                ],
+            )
             self.assertEqual(triggers["push"]["tags"], ["castlabs-live-video-v*"])
             self.assertIn("workflow_dispatch", triggers)
             self.assertEqual(workflow["permissions"], {"contents": "read"})

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Experimental
+
+* Replace the unshipped expert EMSG skeleton symbol with
+  `c2pa_live_video_trusted_vsi_session_sign_sig_structure`. Inputs are the mutable
+  session pointer and exact Sig_structure bytes/length; outputs are the existing
+  allocated-byte pointer, `uint32_t` sequence, `uint32_t` inclusive sequence
+  maximum, and `bool` maximum-presence flag, in that order. Disabled calls clear
+  all supplied outputs independently and return -1 with `NotSupported`, without
+  callbacks, signature allocation, or state changes. All trusted capabilities
+  remain zero; no compatibility alias or CBOR/COSE validator is provided.
+
 ### Added
 
 * Add an experimental, feature-gated stateful C API for local Ed25519 C2PA
@@ -19,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit-time VSI signing with a mandatory protected `iat`.
 * Add `c2pa_live_video_moof_sequence_number`, an allocation-free C probe for
   reading a media segment's 32-bit `moof/mfhd.sequence_number`.
+* Add `c2pa_builder_sign_fragmented` (with `file_io`) for signing single or glob-selected BMFF renditions and returning their embedded manifest. Preflight output names and exclusively reserve rendition directories and init files to prevent overwrites, including filesystem aliases. Reservation or signing errors may leave empty or partial outputs.
 
 ## [0.88.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-c-ffi-v0.87.0...c2pa-c-ffi-v0.88.0)
 _11 June 2026_
