@@ -152,3 +152,30 @@ True merge (`--no-ff`) of `contentauth/c2pa-rs` `main` @`69907b5a` into
   C11 header/prototypes, trusted capability mask 63 and formatting passed.
   Debug library SHA-256
   `0401bf3da2060fbdae3223ec0feb926f836b59604d9d4fe9c993122e29d5b6fe`.
+
+## ContentAuth main @518fe03a
+
+True merge (`--no-ff`) of `contentauth/c2pa-rs` `main` @`518fe03a` into
+`09ed9582` (merge `965c002c`), two upstream commits past `69907b5a`. No
+conflicts; upstream changed no Cargo manifest, `Cargo.lock`, `c2pa_c_ffi`
+source or header.
+
+- #2728 (`178d7c02`, auto-merged, sdk/src/crypto/ocsp/mod.rs,
+  sdk/src/crypto/cose/ocsp.rs, sdk/src/store.rs): OCSP validation status
+  entries now carry the claim signature box URI (pushed as the tracker's
+  current URI around stapled and fetched OCSP checks) instead of the
+  `OCSP_RESPONSE` placeholder label. Status codes and revocation decisions are
+  unchanged; the fork's `TrustListKind::Manifest` scoping of responder trust is
+  not touched.
+- #2749 (`518fe03a`, sdk/src/crypto/cose/ocsp.rs): binds the sync/async OCSP
+  check result to a local before `if let`, fixing Rust 1.99's new
+  `clippy::block_scrutinee` lint, which broke Tier 1A Clippy on GitHub's stable
+  toolchain. No behavior change.
+- Not requalified downstream by decision (VSI work in progress): c2pa-python
+  paired CI and the signer stack stay pinned to `6b506352` until the next
+  planned repin.
+- Rust 1.96.0 gates at merge `965c002c`: SDK library (qualification profile)
+  1453 passed / 17 ignored, including the two new upstream OCSP URI tests;
+  BMFF timed-media 27 passed; OpenSSL-backend OCSP tests 22 passed; FFI 205
+  passed / 25 example doctests ignored; nonexperimental Clippy `-D warnings`,
+  qualification support and formatting passed.
