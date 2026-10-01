@@ -4617,6 +4617,221 @@ mod tests {
         assert_eq!(unsafe { c2pa_free(signer.cast()) }, 0);
     }
 
+    /// A dynamic assertion registered through the C ABI is invoked once for the
+    /// shared ladder manifest, endorses the rendition hard binding, and lands in
+    /// every rendition; a failing callback aborts the ladder, leaves no validly
+    /// signed output and keeps the builder reusable.
+    #[test]
+    #[cfg(feature = "file_io")]
+    fn test_sign_ladder_with_dynamic_assertion() {
+        unsafe extern "C" fn callback_error(
+            _context: *const c_void,
+            _label: *const c_char,
+            _reserve_size: usize,
+            _partial_claim_json: *const c_char,
+            _out_data: *mut c_uchar,
+            _out_data_max_len: usize,
+        ) -> isize {
+            -17
+        }
+
+        let definition = CString::new(r#"{"assertions":[{"label":"c2pa.actions","data":{"actions":[{"action":"c2pa.created","digitalSourceType":"http://cv.iptc.org/newscodes/digitalsourcetype/digitalCreation"}]}}]}"#).unwrap();
+        let label = CString::new("com.example.dynamic").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures: [&[u8]; 2] = [
+            include_bytes!(fixture_path!("single_file_fragments.mp4")),
+            include_bytes!(fixture_path!("single_file_fragments_absolute.mp4")),
+        ];
+        let source_strings: Vec<_> = fixtures
+            .iter()
+            .enumerate()
+            .map(|(i, data)| {
+                let path = dir.path().join(format!("source{i}.mp4"));
+                std::fs::write(&path, data).unwrap();
+                CString::new(path.to_str().unwrap()).unwrap()
+            })
+            .collect();
+        let sources: Vec<_> = source_strings.iter().map(|s| s.as_ptr()).collect();
+        let sources_unchanged = || {
+            for (i, original) in fixtures.iter().enumerate() {
+                assert_eq!(
+                    std::fs::read(dir.path().join(format!("source{i}.mp4"))).unwrap(),
+                    *original
+                );
+            }
+        };
+
+        let (failing_signer, builder) = setup_signer_and_builder_for_signing_tests();
+        let builder = unsafe { c2pa_builder_with_definition(builder, definition.as_ptr()) };
+        assert!(!builder.is_null());
+        assert_eq!(
+            unsafe {
+                c2pa_signer_add_dynamic_assertion(
+                    failing_signer,
+                    std::ptr::null(),
+                    Some(callback_error),
+                    label.as_ptr(),
+                    64,
+                )
+            },
+            0
+        );
+        let failed_paths: Vec<_> = (0..2)
+            .map(|i| dir.path().join(format!("failed{i}.mp4")))
+            .collect();
+        let failed_strings: Vec<_> = failed_paths
+            .iter()
+            .map(|p| CString::new(p.to_str().unwrap()).unwrap())
+            .collect();
+        let failed_dests: Vec<_> = failed_strings.iter().map(|s| s.as_ptr()).collect();
+        let mut bytes = std::ptr::dangling();
+        assert_eq!(
+            unsafe {
+                c2pa_builder_sign_ladder(
+                    builder,
+                    failing_signer,
+                    sources.as_ptr(),
+                    failed_dests.as_ptr(),
+                    2,
+                    &mut bytes,
+                )
+            },
+            -1
+        );
+        assert!(bytes.is_null());
+        let error = unsafe { c2pa_error() };
+        assert!(!error.is_null());
+        let message = unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(unsafe { c2pa_free(error.cast()) }, 0);
+        assert!(message.contains("error code -17"), "{message}");
+        // The callback runs after the outputs received their placeholder
+        // manifest. Partial outputs are permitted (no rollback), but none may
+        // appear successfully signed.
+        for output in failed_paths.iter().filter(|p| p.exists()) {
+            if let Ok(reader) = c2pa::Reader::default().with_stream(
+                "video/mp4",
+                std::io::Cursor::new(std::fs::read(output).unwrap()),
+            ) {
+                assert_eq!(
+                    reader.validation_state(),
+                    c2pa::ValidationState::Invalid,
+                    "{reader}"
+                );
+            }
+        }
+        sources_unchanged();
+        assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
+        assert!(checkout_exclusive::<C2paSigner>(failing_signer).is_ok());
+        assert_eq!(unsafe { c2pa_free(failing_signer.cast()) }, 0);
+
+        // The same builder signs successfully with a well-behaved callback.
+        let (signer, unused_builder) = setup_signer_and_builder_for_signing_tests();
+        assert_eq!(unsafe { c2pa_free(unused_builder.cast()) }, 0);
+        let state = DynamicCallbackState {
+            value: b'a',
+            invocations: Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            unsafe {
+                c2pa_signer_add_dynamic_assertion(
+                    signer,
+                    &state as *const DynamicCallbackState as *const c_void,
+                    Some(dynamic_assertion_callback),
+                    label.as_ptr(),
+                    64,
+                )
+            },
+            0
+        );
+        let output_paths: Vec<_> = (0..2)
+            .map(|i| dir.path().join(format!("output{i}.mp4")))
+            .collect();
+        let output_strings: Vec<_> = output_paths
+            .iter()
+            .map(|p| CString::new(p.to_str().unwrap()).unwrap())
+            .collect();
+        let dests: Vec<_> = output_strings.iter().map(|s| s.as_ptr()).collect();
+        let mut bytes = std::ptr::dangling();
+        let len = unsafe {
+            c2pa_builder_sign_ladder(
+                builder,
+                signer,
+                sources.as_ptr(),
+                dests.as_ptr(),
+                2,
+                &mut bytes,
+            )
+        };
+        assert!(
+            len > 0,
+            "ladder signing failed: {:?}",
+            CimplError::last_message()
+        );
+        assert!(!bytes.is_null());
+        sources_unchanged();
+
+        {
+            let invocations = state.invocations.lock().unwrap();
+            assert_eq!(invocations.len(), 1, "one shared manifest, one callback");
+            assert_eq!(invocations[0].label, "com.example.dynamic");
+            assert_eq!(invocations[0].reserve_size, 64);
+            let partial_claim = invocations[0].partial_claim.as_array().unwrap();
+            let hard_binding = partial_claim
+                .iter()
+                .find(|entry| {
+                    entry["url"]
+                        .as_str()
+                        .is_some_and(|url| url.contains("c2pa.hash.bmff"))
+                })
+                .expect("the dynamic assertion should endorse the rendition hard binding");
+            assert!(hard_binding["alg"].is_string());
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            assert_eq!(
+                STANDARD
+                    .decode(hard_binding["hash"].as_str().unwrap())
+                    .unwrap()
+                    .len(),
+                32
+            );
+        }
+
+        let manifest = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
+        for output in &output_paths {
+            assert_eq!(
+                c2pa::jumbf_io::load_jumbf_from_file(output).unwrap(),
+                manifest
+            );
+            let reader = c2pa::Reader::default()
+                .with_stream(
+                    "video/mp4",
+                    std::io::Cursor::new(std::fs::read(output).unwrap()),
+                )
+                .unwrap();
+            assert_ne!(
+                reader.validation_state(),
+                c2pa::ValidationState::Invalid,
+                "{reader}"
+            );
+            let dynamic: Vec<_> = reader
+                .active_manifest()
+                .unwrap()
+                .assertions()
+                .iter()
+                .filter(|assertion| assertion.label() == "com.example.dynamic")
+                .map(|assertion| assertion.value().unwrap().clone())
+                .collect();
+            assert_eq!(dynamic.len(), 1);
+            assert_eq!(dynamic[0]["id"], "a".repeat(58));
+        }
+        assert!(checkout_exclusive::<C2paBuilder>(builder).is_ok());
+        assert!(checkout_exclusive::<C2paSigner>(signer).is_ok());
+        assert_eq!(unsafe { c2pa_free(bytes.cast()) }, 0);
+        assert_eq!(unsafe { c2pa_free(builder.cast()) }, 0);
+        assert_eq!(unsafe { c2pa_free(signer.cast()) }, 0);
+    }
+
     #[test]
     #[allow(deprecated)]
     fn test_ed25519_sign() {
