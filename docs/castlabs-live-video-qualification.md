@@ -14,6 +14,18 @@ This selection excludes `sdk/tests/integration.rs`, whose generic CAWG settings 
 
 `c2patool` is qualified separately from that Rust-native-crypto FFI profile. Its test and release build retain the CLI's default `networking` feature, retain the fixed `c2pa` dependency's `openssl` feature (whose SDK dependency is configured with `vendored`), and add only `unstable_live_video`. The feature report and evidence identify this as the `default-networking-vendored-openssl` profile; they do not imply that the CLI uses the FFI's `rust_native_crypto` profile. After the test and release build, the workflow separately executes the produced `c2patool` binary for its version smoke and live-video command help checks.
 
+Not covered: the two FFmpeg decode-equivalence tests,
+`assertions::bmff_hash::single_file_bmff_tests::single_file_ffmpeg_decode_equivalence`
+and `assertions::bmff_hash::single_file_ladder_tests::ladder_video_audio_decode_equivalence`,
+are `#[ignore]` because they need an `ffmpeg` executable (the ladder test also needs its
+`lavfi` source and `aac` encoder), so `cargo test` in this workflow skips them. The ladder
+test compiles only with `file_io`, so run them with the SDK profile above (a plain run
+without `file_io` silently matches only the first). They are run locally for now, selected
+explicitly with `cargo test ... --lib -- --ignored --exact <both test paths>` (not a bare
+`--ignored`, which would also pick up unrelated ignored tests), and the result is recorded
+on the qualifying PR. Follow-up: install a pinned `ffmpeg` in the matrix and run both
+tests that way as a hard gate.
+
 The SDK, C FFI, and feature-enabled `c2patool` test commands are hard gates on both platforms. The native release library is then inspected for defined dynamic-assertion, fragmented-file, base VSI, callback signer, recovery, explicit-time signing, and MFHD sequence-probe exports; undefined ELF imports do not satisfy this check. The same source SHA builds `c2patool`, whose executable version smoke and `live-video` and `live-video-sign` help are executed and checked.
 
 ## Evidence and bundles
