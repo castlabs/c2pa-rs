@@ -658,9 +658,9 @@ mod tests {
                 let size = unpadded.len() + gap;
                 let result = std::panic::catch_unwind(|| {
                     finalize_identity_assertion(payload.clone(), Some(size), Ok(signature.clone()))
-                })
-                .expect("sized finalization must not panic")
-                .unwrap();
+                });
+                assert!(result.is_ok(), "sized finalization must not panic");
+                let result = result.unwrap().unwrap();
                 let DynamicAssertionContent::Cbor(bytes) = result else {
                     panic!("expected CBOR")
                 };
@@ -692,13 +692,11 @@ mod tests {
                 assert!(above_capacity.len() > size);
             }
             for size in [0, unpadded.len() - 1, usize::MAX] {
-                assert!(std::panic::catch_unwind(|| finalize_identity_assertion(
-                    payload.clone(),
-                    Some(size),
-                    Ok(signature.clone()),
-                ))
-                .expect("invalid budgets must not panic")
-                .is_err());
+                let result = std::panic::catch_unwind(|| {
+                    finalize_identity_assertion(payload.clone(), Some(size), Ok(signature.clone()))
+                });
+                assert!(result.is_ok(), "invalid budgets must not panic");
+                assert!(result.unwrap().is_err());
             }
         }
         assert!(IdentityAssertionBuilder::signature_capacity(&payload, 0).is_err());
