@@ -32,6 +32,7 @@ This implementation tracks decisions, not ownership of those discussions.
 | [#2559](https://github.com/c2pa-org/specs-core/issues/2559) | Define the VSI signing unit for chunked CMAF, covered-moof MFHD equality, and normative +1 numbering per track. | Current single-moof/traf profile and integer-range reporting do not implement general chunked-CMAF or REaP chunk-index semantics. Do not present the proposal as an existing guarantee. |
 | [#2560](https://github.com/c2pa-org/specs-core/issues/2560) | Prefer continued numbering; otherwise require a signed declaration for a numbering restart, not unsigned HLS/DASH signals. | No signed-discontinuity declaration is parsed or verified here. `reset_continuity()` is trusted caller control only. |
 | [#2561](https://github.com/c2pa-org/specs-core/issues/2561) | Report gap/leading-gap ranges separately from failures; preserve comparison across ordinary updates; recover after an otherwise-valid manifest-chain mismatch. | Vendor notices and manifest mismatch recovery exist. Update-spanning comparison and explicit join/seek reporting are not fully implemented; see below. |
+| [#2563](https://github.com/c2pa-org/specs-core/issues/2563) | Start the produced media chain by omitting `previousManifestId`; init is not a chain member. Report unavailable predecessors on receipt. | This supersedes our init-rooted design direction, but the signer and first-media/reset validator behavior have not yet been reconciled. |
 
 [#1025 was cross-referenced, not reopened](https://github.com/c2pa-org/specs-core/issues/1025#issuecomment-6007455215).
 The proposed standard names `livevideo.segment.gap` and
@@ -57,6 +58,13 @@ The distinct per-segment-manifest bootstrap question is staged in
 correction is [draft #22](https://github.com/mstattma/c2pa-rs/pull/22). These do not
 authorize additional ContentAuth or specs-core publication or functional-branch
 integration.
+
+The operator-approved direction in #2563 supersedes the init-rooted policy staged
+in draft #23. Keep its history, but do not merge that proposal. The combined
+implementation design is [Live Video Continuity Reconciliation](roadmap/live-video-continuity-reconciliation.md),
+tracked by [mstattma#24](https://github.com/mstattma/c2pa-rs/issues/24). It covers
+gap-reporting reconciliation as well as preserving comparison across updates;
+open API and persisted-state decisions remain prerequisites to implementation.
 
 ## Report-Only Gaps
 
@@ -105,7 +113,10 @@ seek. It clears the predecessor and per-interval EMSG replay-ID set and suppress
 the leading-gap/init-predecessor comparison until the next otherwise-validated
 observation; failed attempts do not consume the suppression. Required predecessor
 metadata must still be present. It retains trusted keys,
-key minima, manifest/track checks, signature/hash validation and prior coverage.
+key minima, VSI manifest/track checks, signature/hash validation and prior coverage.
+For the manifest method, clearing `previous_segment` currently also loses the
+`streamId` comparison baseline until the next accepted segment; retaining that
+identity separately is part of the reconciliation design, not current behavior.
 Only trusted playback control may call it, never a stream-supplied reset flag.
 Duplicate/reversed sequences and repeated EMSG IDs still fail within each new
 interval. Repeated traversals count as separate observations; the totals are

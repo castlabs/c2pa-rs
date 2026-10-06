@@ -69,6 +69,14 @@ for ContentAuth. Classify the *hunk*, not just its file, before extracting it.
   implemented. See the coverage document for reconciliation details. Do not
   require one session key for the whole stream without resolving #2631's
   separate reviewer questions.
+- The operator-selected proposal in specs-core
+  [#2563](https://github.com/c2pa-org/specs-core/issues/2563) starts the produced
+  media chain by omitting `previousManifestId`; init is not a chain member.
+  This supersedes the init-rooted design direction, not the current code.
+  Read `docs/roadmap/live-video-continuity-reconciliation.md` before implementing
+  update/reset/bootstrap changes. Resolve its explicit API, key-overlap and
+  persisted-state choices; retain vendor codes and distinguish proposals from
+  adopted standards. Implementation is tracked in mstattma/c2pa-rs#24.
 
 ## Extraction Checklist
 
