@@ -31,7 +31,7 @@ This implementation tracks decisions, not ownership of those discussions.
 | [#2558](https://github.com/c2pa-org/specs-core/issues/2558) | Scope first/previous checks per track or CMAF switching set. | Current state is per validator instance, with a pinned VSI track ID. No switching-set coordination is implemented. |
 | [#2559](https://github.com/c2pa-org/specs-core/issues/2559) | Define the VSI signing unit for chunked CMAF, covered-moof MFHD equality, and normative +1 numbering per track. | Current single-moof/traf profile and integer-range reporting do not implement general chunked-CMAF or REaP chunk-index semantics. Do not present the proposal as an existing guarantee. |
 | [#2560](https://github.com/c2pa-org/specs-core/issues/2560) | Prefer continued numbering; otherwise require a signed declaration for a numbering restart, not unsigned HLS/DASH signals. | No signed-discontinuity declaration is parsed or verified here. `reset_continuity()` is trusted caller control only. |
-| [#2561](https://github.com/c2pa-org/specs-core/issues/2561) | Report gap/leading-gap ranges separately from failures; preserve comparison across ordinary updates; recover after an otherwise-valid manifest-chain mismatch. | Vendor notices and manifest mismatch recovery exist. Update-spanning comparison and explicit join/seek reporting are not fully implemented; see below. |
+| [#2561](https://github.com/c2pa-org/specs-core/issues/2561) | Report gap/leading-gap ranges separately from failures; preserve comparison across ordinary updates; recover after an otherwise-valid manifest-chain mismatch. | Vendor notices and manifest mismatch recovery exist. The opt-in VSI context update preserves comparison; explicit join/seek reporting remains deferred. |
 | [#2563](https://github.com/c2pa-org/specs-core/issues/2563) | Start the produced media chain by omitting `previousManifestId`; init is not a chain member. Report unavailable predecessors on receipt. | This supersedes our init-rooted design direction, but the signer and first-media/reset validator behavior have not yet been reconciled. |
 
 [#1025 was cross-referenced, not reopened](https://github.com/c2pa-org/specs-core/issues/1025#issuecomment-6007455215).
@@ -39,13 +39,11 @@ The proposed standard names `livevideo.segment.gap` and
 `livevideo.segment.leadingGap` are not replacements for the vendor codes until
 agreed upstream. The upstream issues deliberately do not mention our vendor codes.
 
-In particular, #2561 proposes preserving the comparison baseline across key
-rotation, repeated init segments and manifest updates. This is a desired policy,
-**not current implemented behavior**: `validate_init_segment` still clears the
-predecessor/key/replay state. Preserving accumulated ranges does not close that
-continuity gap. Our reset also suppresses the next leading comparison without
-emitting a separate player-join/seek status. Both differences require follow-up
-design and tests rather than being silently described as compliance.
+The opt-in `update_vsi_context` implements VSI comparison preservation across key
+rotation, repeated init segments and manifest updates. `validate_init_segment`
+still clears predecessor/key/replay state and is not the update API. Reset still
+suppresses the next leading comparison without emitting a separate player-join/seek
+status. This is not full implementation of the proposal.
 
 Leading ranges remain literal: a zero key minimum with epoch-based REaP numbers
 can describe billions of unobserved sequence integers. Ranges are stored as
@@ -64,7 +62,8 @@ in draft #23. Keep its history, but do not merge that proposal. The combined
 implementation design is [Live Video Continuity Reconciliation](roadmap/live-video-continuity-reconciliation.md),
 tracked by [mstattma#24](https://github.com/mstattma/c2pa-rs/issues/24). It covers
 gap-reporting reconciliation as well as preserving comparison across updates;
-open API and persisted-state decisions remain prerequisites to implementation.
+open manifest-method and persisted signer-state decisions do not block the narrowed
+VSI update. Breaking changes are acceptable; this slice requires no migration.
 
 ## Report-Only Gaps
 
@@ -123,10 +122,48 @@ interval. Repeated traversals count as separate observations; the totals are
 not a deduplicated inventory of content missing from the full presentation.
 
 Coverage history also survives `validate_init_segment`, but that method still
-resets predecessor/key/replay state as before. Continuity across repeated init
-segments or key rotation is unresolved and is not claimed by these reports.
+resets predecessor/key/replay state as before. Use `update_vsi_context` for
+same-stream VSI updates that must preserve continuity.
 Range retention is bounded; callers must also manage their `StatusTracker`
 lifetime because its informational log history is not capped by this API.
+
+## Atomic VSI Updates
+
+`LiveVideoValidator::update_vsi_context(init: Option<&[u8]>, assertion: &SessionKeys,
+manifest_id: &str, ee_cert_der: Option<&[u8]>, tracker: &mut StatusTracker)` returns
+`Result<(), Error>`. `Ok` guarantees that the complete context was installed;
+`Err` leaves every validator field unchanged, while retaining failure diagnostics.
+New failures veto commit even with `ContinueWhenPossible`; unrelated prior tracker
+failures do not. No partial valid-key subset is installed.
+
+The caller must first verify the manifest using `Reader`: signature, claim trust,
+assertion integrity and applicable init hard binding. Assertion, manifest label and
+end-entity certificate must all come from that verified context. This API checks
+the existing key shape/algorithm/kid/validity-period constraints and every signer
+binding against that certificate, not its trust chain. Raw arguments do not prove
+claim trust. Per-segment signature, time eligibility, minimum sequence and hash
+checks remain in the media validator.
+
+An initialized track is required even when supplying init bytes. A supplied init
+passes the existing single-track BMFF layout checks and must exactly match track
+ID, timescale and optional default sample duration (including `None` versus
+`Some`). `None` init retains the current configuration. These are the exact
+compatibility checks, not a codec/sample-entry equivalence check or proof of
+logical-stream identity. The trusted caller owns same-stream selection and the
+binding between verified manifest and retained init in a key-only update.
+Manifest-box contexts, including those whose predecessor was cleared by reset,
+are rejected by this VSI update operation. This is a one-way update guard, not
+a global symmetric method guard on the existing validation APIs. The update
+does not authorize a numbering restart.
+
+Successful updates preserve previous accepted sequence, EMSG replay IDs, coverage
+and explicit playback-reset suppression. Multiple keys are supported within the
+installed manifest. The old context is discarded: late media referring to an old
+manifest fails, including when its `kid` is reused by the new context. Historical
+overlap/caching is deferred with association, bounds and eviction requirements in
+the roadmap. `previousManifestId` is not a VSI field. Manifest-box bootstrap,
+signing, trusted VSI/keystore and reset APIs are unchanged. No consumers are
+silently switched to the opt-in API.
 
 ## c2patool
 
@@ -141,6 +178,51 @@ presentation. True live streams have an advancing live edge; JIT-packaged VOD
 needs a separate authenticated expected endpoint to detect tail truncation.
 
 ## Local Verification
+
+### Narrowed Atomic Update
+
+Implemented on `feat/vsi-sequence-gap-reporting` starting from `0f5c864c`, with
+no commits, publication, downstream repins or hosted qualification. The only
+runtime implementation change is the opt-in update and its private one-way guard;
+existing signing, reset and manifest-box acceptance behavior is unchanged.
+
+The update tests exercise both aggregate and stop-on-first-error trackers:
+repeated init, rotation, key-only replacement, two usable keys in one manifest,
+duplicate/regressing sequence, replay ID reuse, old-manifest rejection, removed-key
+signature/lookup rejection under the new manifest, rotated minima and ordinary gaps,
+invalid/mixed keys, malformed/incompatible init, missing initialized context,
+manifest-method rejection after reset, prior diagnostics and reset suppression.
+These are local cryptographic unit fixtures, not proof that a caller honored the
+Reader trust precondition. The three new tests use the existing Rust-native-only
+ES256 fixture helpers; the OpenSSL suite separately covers existing regressions.
+
+All build/check commands use Rust 1.96.0 and a target isolated inside the current
+worktree, never a shared target cache. Run from the worktree root:
+
+```bash
+export CARGO_TARGET_DIR="$PWD/target-vsi-update"
+export CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+cargo +1.96.0 test --locked -p c2pa --lib --no-default-features --features rust_native_crypto,unstable_live_video live_video::
+cargo +1.96.0 test --locked -p c2pa --lib --no-default-features --features openssl,unstable_live_video live_video::
+cargo +1.96.0 check --locked -p c2pa --lib --no-default-features --features rust_native_crypto
+cargo +1.96.0 clippy --locked -p c2pa --lib --no-default-features --features rust_native_crypto,unstable_live_video -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo +1.96.0 doc --locked -p c2pa --no-deps --no-default-features --features rust_native_crypto,unstable_live_video
+```
+
+Results: Rust-native **136 passed**, OpenSSL **121 passed**; feature-off check,
+library Clippy and rustdoc all passed. `git diff --check` passed. Temporary logs
+and generated artifacts in the isolated target are not authoritative or part of
+the source change; this summary records the verification results independently
+of their retention.
+
+Review follow-up: the focused Rust-native `vsi_update` filter passed all **3 tests**
+after adding isolated reused-kid signature rejection, removed distinct-kid lookup
+rejection, and rotated-minimum coverage checks in both tracker modes. The command
+is the native test command above with `live_video::` replaced by `vsi_update`.
+Rustfmt checks and `git diff --check` also passed; runtime code was unchanged.
+
+### Earlier Sequence-Gap Baseline
 
 Rust 1.96.0, `CARGO_BUILD_JOBS=1`, `CARGO_INCREMENTAL=0`; no hosted qualification
 or downstream repin is implied by these local results:

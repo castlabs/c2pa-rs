@@ -2,9 +2,14 @@
 
 ## Status And Scope
 
-**Design only; not implemented.** Operator-approved order: cleanup, unified design,
-then implementation of agreed choices. Open decisions below require approval before
-their code changes. These proposals are **not adopted C2PA standard requirements**.
+**Narrowed VSI update implemented; other reconciliation remains design only.**
+The approved slice is `LiveVideoValidator::update_vsi_context`: atomic replacement
+of one current verified init/manifest/key context while retaining VSI sequence,
+replay and coverage state. `previousManifestId` is NOT part of VSI. Manifest-box
+bootstrap (#21/#23), signing and reset APIs are separate held work, not dependencies
+of this slice. Breaking changes are acceptable for this experimental scope; no
+migration or backward-compatibility layer is required. Open decisions below still
+require approval outside this slice. These proposals are **not adopted C2PA standard requirements**.
 Scope is experimental complete-buffer live-video signing/validation; no trusted-
 processor protocol changes, hosted qualification, downstream repins or publication.
 
@@ -34,6 +39,14 @@ behavior; neither should be treated as its finished implementation.
 - `validate_session_keys` clears installed keys first; aggregate error handling
   can install a verified subset after signer-binding failures. It is not an
   atomic update, and `Ok(())` alone does not imply validation success.
+- `update_vsi_context` instead stages those existing checks on an isolated
+  candidate, rejects any newly recorded failure in either tracker mode, and
+  commits only the complete context. `Ok(())` guarantees installation. It requires
+  an initialized, non-manifest-box track context. Optional init must match the
+  current track ID, timescale and optional default sample duration exactly; `None`
+  retains them. Multiple keys in the installed manifest remain supported. No
+  historical manifest/key cache is installed. See the current
+  [API contract and trust boundary](../live-video-sequence-coverage.md#atomic-vsi-updates).
 - `reset_continuity` retains keys, init track and coverage but clears
   `previous_segment`, including the manifest-method `streamId` baseline. Its
   documentation must not be read as preserving that identity check today.
@@ -98,23 +111,22 @@ resettable predecessor. Selecting retained history/scope evidence is part of
 the open reset/epoch design, not an already-approved API. Reporting a predecessor
 not received is informational unverified continuity, not a predecessor mismatch.
 
-## Minimal API Choices (Open)
+## API Decisions And Remaining Choices
 
-- **Update boundary:** prefer a new opt-in atomic same-stream update operation
-  taking candidate init plus authenticated manifest/key context. Alternative:
-  prepare/commit candidate APIs when callers need staged trust verification.
-  Candidates must not be forgeable proof of trust or commit after scope changes.
-  Choose API scope and initial callers; do not silently redefine legacy
-  `validate_init_segment` or its two-step key-installation contract.
-- **Key overlap:** smallest option replaces one complete manifest/key context
-  atomically, deliberately rejecting late media tied to the previous context.
-  If overlap is required, retain bounded contexts and resolve by signed
-  `manifestId` plus `kid`, verifying against exactly that issuing context.
-  Never union keys under one global manifest ID. Reused kids, changed minima,
-  validity windows, init timing and eviction need explicit rules. Operator must
-  choose replacement versus overlap before implementation; no one-key-per-stream
-  restriction is implied. Recommend all-or-nothing candidate admission rather
-  than the legacy partial-install behavior; this too needs scope approval.
+- **Update boundary (approved/implemented):** opt-in `update_vsi_context`, taking
+  optional init plus the existing caller-verified manifest assertion, ID and signer
+  certificate. No prepare/commit type or raw-input trust shortcut. Existing initial
+  setup APIs retain their contracts; callers must opt into this operation for updates.
+- **Key overlap (deferred roadmap item):** current policy replaces one complete
+  context atomically and rejects late media from unavailable old manifests, even
+  when a `kid` is reused. Future overlap/cache support must bound contexts by count,
+  bytes and lifetime, define eviction and late-arrival behavior, and associate
+  signed `manifestId` + `kid` with exactly the issuing manifest. Never union keys
+  under one global manifest ID. Risks include reused kids, changed minima/validity
+  windows, incompatible init timing, stale trust/revocation, memory exhaustion and
+  eviction-dependent availability. Retention must not reset sequence/replay or let
+  an old context reauthorize regression. This is not implemented or authorized by
+  the current update slice; multiple keys within the current manifest are supported.
 - **Reset/epoch control:** choose an additive reason-bearing playback operation
   versus an explicitly approved change to `reset_continuity`; separately decide
   whether a new epoch uses a new validator or an explicit trusted-caller API.
@@ -123,10 +135,10 @@ not received is informational unverified continuity, not a predecessor mismatch.
   and `com.castlabs.livevideo.player.discontinuity` are candidate spellings only,
   **OPEN and not authorized names**. Decide names, payload and event timing.
   Existing vendor gap codes stay informational pending upstream decisions.
-- **Signer reconciliation:** separate init readiness from media predecessor;
-  init sign/restore must not overwrite a resumed media chain. Decide treatment
-  of persisted init-rooted signer JSON/artifacts before removing the old policy;
-  do not guess whether an existing predecessor denotes init or media.
+- **Signer reconciliation (separate manifest-box work):** separate init readiness
+  from media predecessor. Breaking changes are approved; no migration machinery
+  is required. This is not a prerequisite for VSI context updates and is not
+  implemented in this slice.
 
 ## Security And Acceptance Gates
 
@@ -135,7 +147,7 @@ not received is informational unverified continuity, not a predecessor mismatch.
 | Start, late join, matching link, missing field, mismatch then valid successor | #2563 rules; one retained mismatch failure, no perpetual poisoning |
 | Tamper plus mismatch; wrong stream after seek; unsolicited root | No recovery advance or implicit identity/epoch switch |
 | Repeated init, rotation, manifest update, then duplicate/regression/gap | Baseline and replay checks survive; gaps remain report-only |
-| Malformed init, untrusted manifest, invalid/mixed key set | Candidate failure leaves installed state unchanged under chosen policy |
+| Malformed init, untrusted manifest, invalid/mixed key set | Caller rejects untrusted manifests before update; layout/key failures leave installed state unchanged |
 | Overlapping keys, reused kid, wrong manifest, expired/below-minimum key | Exact association; deterministic replacement/retention policy |
 | Changed track/timing and trusted new epoch | Reject/defer incompatible update; explicit scope decision, no blind merge |
 | Seek, failed first attempt, replay within new interval | Identity/history retained; failures do not consume initial suppression |
@@ -149,9 +161,12 @@ detection, general chunk-unit support or switching-set coordination is promised.
 ## Minimal Phases
 
 1. Cleanup superseded policy references separately; preserve #22's independent scope.
-2. Agree the open API, overlap, reset/scope, reporting and persisted-state choices.
+2. Agree remaining reset/scope and reporting choices; historical-context caching is deferred.
 3. Implement media-only chaining and retained identity with focused regressions.
 4. Implement the agreed transactional update path and explicit interval reporting.
 5. Review the matrix before integration; defer signed restarts/chunks/switching sets.
 
-This document runs no tests/builds and authorizes no qualification or repins.
+The VSI transactional path in phase 4 is implemented independently of phases 2/3;
+explicit interval reporting remains deferred. Persisted signer-state choices do
+not block this slice and imply no migration requirement for it. Local verification
+is recorded in the current coverage document. No qualification or repins authorized.

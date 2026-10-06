@@ -715,9 +715,10 @@ mod tests {
             }
         }
 
-        pub fn make_signed_cose_sign1_bytes(
+        fn make_signed_cose_sign1_with_kid(
             segment_info_map: &SegmentInfoMap,
             signing_key: &p256::ecdsa::SigningKey,
+            kid: &[u8],
         ) -> Vec<u8> {
             use coset::{iana, HeaderBuilder, TaggedCborSerializable};
             use p256::ecdsa::{signature::Signer, Signature};
@@ -728,7 +729,7 @@ mod tests {
                 .algorithm(iana::Algorithm::ES256)
                 .build();
 
-            let unprotected = HeaderBuilder::new().key_id(TEST_KID.to_vec()).build();
+            let unprotected = HeaderBuilder::new().key_id(kid.to_vec()).build();
 
             let mut sign1 = coset::CoseSign1Builder::new()
                 .protected(protected)
@@ -751,6 +752,22 @@ mod tests {
             sequence_number: u64,
             manifest_id: &str,
             signing_key: &p256::ecdsa::SigningKey,
+        ) -> Vec<u8> {
+            make_signed_vsi_segment_with_ids(
+                sequence_number,
+                manifest_id,
+                signing_key,
+                TEST_KID,
+                u32::try_from(sequence_number).unwrap(),
+            )
+        }
+
+        pub fn make_signed_vsi_segment_with_ids(
+            sequence_number: u64,
+            manifest_id: &str,
+            signing_key: &p256::ecdsa::SigningKey,
+            kid: &[u8],
+            event_id: u32,
         ) -> Vec<u8> {
             fn bmff_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
                 let mut data = Vec::new();
@@ -783,10 +800,10 @@ mod tests {
                     manifest_uri: None,
                 };
                 let mut seg = super::make_vsi_emsg_box_with_timing(
-                    &make_signed_cose_sign1_bytes(&map, signing_key),
+                    &make_signed_cose_sign1_with_kid(&map, signing_key, kid),
                     1000,
                     1000,
-                    sequence_number_u32,
+                    event_id,
                 );
                 seg.extend_from_slice(&trailer);
                 seg
@@ -820,6 +837,393 @@ mod tests {
                 .unwrap();
             (validator, signing_key)
         }
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    fn update_init(track: u32, timescale: u32, duration: u32) -> Vec<u8> {
+        fn boxed(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            [
+                u32::try_from(data.len() + 8)
+                    .unwrap()
+                    .to_be_bytes()
+                    .as_slice(),
+                kind,
+                data,
+            ]
+            .concat()
+        }
+        let tkhd = boxed(
+            b"tkhd",
+            &[vec![0; 12], track.to_be_bytes().to_vec()].concat(),
+        );
+        let mdhd = boxed(
+            b"mdhd",
+            &[vec![0; 12], timescale.to_be_bytes().to_vec(), vec![0; 8]].concat(),
+        );
+        let trak = boxed(b"trak", &[tkhd, boxed(b"mdia", &mdhd)].concat());
+        let trex = boxed(
+            b"trex",
+            &[
+                vec![0; 4],
+                track.to_be_bytes().to_vec(),
+                1u32.to_be_bytes().to_vec(),
+                duration.to_be_bytes().to_vec(),
+                vec![0; 8],
+            ]
+            .concat(),
+        );
+        boxed(b"moov", &[trak, boxed(b"mvex", &trex)].concat())
+    }
+
+    #[test]
+    #[cfg(feature = "rust_native_crypto")]
+    fn vsi_update_preserves_sequence_replay_coverage_and_rotates_all_keys() {
+        use vsi_crypto_helpers::*;
+        for stop in [false, true] {
+            let new_tracker = || {
+                StatusTracker::with_error_behavior(if stop {
+                    ErrorBehavior::StopOnFirstError
+                } else {
+                    ErrorBehavior::ContinueWhenPossible
+                })
+            };
+            let (mut validator, old_key) = setup_vsi_validator();
+            let mut tracker = new_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(5, TEST_MANIFEST_ID, &old_key),
+                    &mut tracker,
+                )
+                .unwrap();
+            let cert = test_ee_cert_der();
+            let (key, cose) = generate_test_key_pair();
+            let mut keys = session_keys_with_cose_key(cose, &key, &cert);
+            let (second_key, mut second_cose) = generate_test_key_pair();
+            if let c2pa_cbor::Value::Map(map) = &mut second_cose {
+                map.insert(cbor_int(2), c2pa_cbor::Value::Bytes(b"second".to_vec()));
+            }
+            keys.keys
+                .extend(session_keys_with_cose_key(second_cose, &second_key, &cert).keys);
+            let init = update_init(1, 1000, 1000);
+            for candidate_init in [Some(init.as_slice()), None, Some(init.as_slice())] {
+                validator
+                    .update_vsi_context(
+                        candidate_init,
+                        &keys,
+                        "urn:c2pa:rotated",
+                        Some(&cert),
+                        &mut tracker,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    validator.previous_segment.as_ref().unwrap().sequence_number,
+                    5
+                );
+                assert!(validator.seen_emsg_ids.contains(&5));
+                assert_eq!(validator.sequence_coverage().missing_ranges, vec![0..=4]);
+                assert_eq!(validator.session_keys.len(), 2);
+            }
+            for (seq, manifest, signing_key, event_id) in [
+                (5, "urn:c2pa:rotated", &key, 50),
+                (4, "urn:c2pa:rotated", &key, 40),
+                (6, "urn:c2pa:rotated", &key, 5),
+                (6, TEST_MANIFEST_ID, &key, 6),
+                (6, TEST_MANIFEST_ID, &old_key, 6),
+            ] {
+                let mut rejected = new_tracker();
+                let _ = validator.validate_verifiable_segment_info(
+                    &make_signed_vsi_segment_with_ids(
+                        seq,
+                        manifest,
+                        signing_key,
+                        TEST_KID,
+                        event_id,
+                    ),
+                    &mut rejected,
+                );
+                assert!(rejected.filter_errors().count() > 0);
+                assert_eq!(
+                    validator.previous_segment.as_ref().unwrap().sequence_number,
+                    5
+                );
+            }
+            let mut rejected = new_tracker();
+            let _ = validator.validate_verifiable_segment_info(
+                &make_signed_vsi_segment(6, "urn:c2pa:rotated", &old_key),
+                &mut rejected,
+            );
+            let failures: Vec<_> = rejected.filter_errors().collect();
+            assert_eq!(failures.len(), 1);
+            assert!(failures[0]
+                .description
+                .contains("signature verification failed"));
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                5
+            );
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(8, "urn:c2pa:rotated", &key),
+                    &mut tracker,
+                )
+                .unwrap();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment_with_ids(
+                        9,
+                        "urn:c2pa:rotated",
+                        &second_key,
+                        b"second",
+                        9,
+                    ),
+                    &mut tracker,
+                )
+                .unwrap();
+            assert_eq!(
+                validator.sequence_coverage().missing_ranges,
+                vec![0..=4, 6..=7]
+            );
+            let (replacement_key, replacement_cose) = generate_test_key_pair();
+            let mut replacement =
+                session_keys_with_cose_key(replacement_cose, &replacement_key, &cert);
+            replacement.keys[0].min_sequence_number = 12;
+            validator
+                .update_vsi_context(
+                    None,
+                    &replacement,
+                    "urn:c2pa:key-only",
+                    Some(&cert),
+                    &mut tracker,
+                )
+                .unwrap();
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                9
+            );
+            assert!(validator.seen_emsg_ids.contains(&5));
+            for (seq, signing_key, kid, expected_failure) in [
+                (
+                    10,
+                    &replacement_key,
+                    TEST_KID,
+                    "below the session key's minSequenceNumber",
+                ),
+                (
+                    12,
+                    &second_key,
+                    b"second".as_slice(),
+                    "no session key matches the kid",
+                ),
+            ] {
+                let mut rejected = new_tracker();
+                let _ = validator.validate_verifiable_segment_info(
+                    &make_signed_vsi_segment_with_ids(
+                        seq,
+                        "urn:c2pa:key-only",
+                        signing_key,
+                        kid,
+                        seq as u32,
+                    ),
+                    &mut rejected,
+                );
+                let failures: Vec<_> = rejected.filter_errors().collect();
+                assert_eq!(failures.len(), 1);
+                assert!(failures[0].description.contains(expected_failure));
+                assert_eq!(
+                    validator.previous_segment.as_ref().unwrap().sequence_number,
+                    9
+                );
+                assert!(!validator.seen_emsg_ids.contains(&(seq as u32)));
+                assert_eq!(
+                    validator.sequence_coverage().missing_ranges,
+                    vec![0..=4, 6..=7]
+                );
+            }
+            let mut after_rotation = new_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(12, "urn:c2pa:key-only", &replacement_key),
+                    &mut after_rotation,
+                )
+                .unwrap();
+            assert_eq!(
+                validator.sequence_coverage().missing_ranges,
+                vec![0..=4, 6..=7, 10..=11]
+            );
+            assert!(after_rotation.has_status(LIVEVIDEO_SEGMENT_GAP));
+            assert!(!after_rotation.has_status(LIVEVIDEO_SEGMENT_LEADING_GAP));
+            assert_eq!(after_rotation.filter_errors().count(), 0);
+            assert_eq!(tracker.filter_errors().count(), 0);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "rust_native_crypto")]
+    fn vsi_update_rejects_candidates_atomically_in_both_tracker_modes() {
+        use vsi_crypto_helpers::*;
+        for stop in [false, true] {
+            let new_tracker = || {
+                StatusTracker::with_error_behavior(if stop {
+                    ErrorBehavior::StopOnFirstError
+                } else {
+                    ErrorBehavior::ContinueWhenPossible
+                })
+            };
+            let (mut validator, old_key) = setup_vsi_validator();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(5, TEST_MANIFEST_ID, &old_key),
+                    &mut StatusTracker::default(),
+                )
+                .unwrap();
+            let cert = test_ee_cert_der();
+            let (key, cose) = generate_test_key_pair();
+            let keys = session_keys_with_cose_key(cose, &key, &cert);
+            let mut mixed = keys.clone();
+            let mut bad = keys.keys[0].clone();
+            if let c2pa_cbor::Value::Map(map) = &mut bad.key {
+                map.insert(
+                    cbor_int(2),
+                    c2pa_cbor::Value::Bytes(b"bad-binding".to_vec()),
+                );
+            }
+            bad.signer_binding = c2pa_cbor::Value::Bytes(vec![]);
+            mixed.keys.push(bad);
+            let mut duplicate = keys.clone();
+            duplicate.keys.push(keys.keys[0].clone());
+            let empty = SessionKeys { keys: vec![] };
+            let invalid_inits = [
+                vec![],
+                update_init(2, 1000, 1000),
+                update_init(1, 2000, 1000),
+                update_init(1, 1000, 2000),
+                update_init(1, 1000, 0),
+                [update_init(1, 1000, 1000), make_mdat_box()].concat(),
+            ];
+            for init in &invalid_inits {
+                assert!(validator
+                    .update_vsi_context(
+                        Some(init),
+                        &keys,
+                        "urn:c2pa:new",
+                        Some(&cert),
+                        &mut new_tracker()
+                    )
+                    .is_err());
+            }
+            for (assertion, manifest, certificate) in [
+                (&mixed, "urn:c2pa:new", Some(cert.as_slice())),
+                (&duplicate, "urn:c2pa:new", Some(cert.as_slice())),
+                (&empty, "urn:c2pa:new", Some(cert.as_slice())),
+                (&keys, "invalid", Some(cert.as_slice())),
+                (&keys, "urn:c2pa:new", None),
+                (&keys, "urn:c2pa:new", Some(b"invalid-cert".as_slice())),
+            ] {
+                assert!(validator
+                    .update_vsi_context(None, assertion, manifest, certificate, &mut new_tracker())
+                    .is_err());
+            }
+            assert_eq!(
+                validator.expected_manifest_id.as_deref(),
+                Some(TEST_MANIFEST_ID)
+            );
+            assert_eq!(validator.session_keys.len(), 1);
+            assert_eq!(validator.init_track_id, Some(1));
+            assert_eq!(validator.init_timescale, Some(1000));
+            assert_eq!(validator.init_default_sample_duration, Some(1000));
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                5
+            );
+            assert_eq!(validator.seen_emsg_ids, [5].into_iter().collect());
+            assert_eq!(validator.sequence_coverage().missing_ranges, vec![0..=4]);
+            let mut tracker = new_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(6, TEST_MANIFEST_ID, &old_key),
+                    &mut tracker,
+                )
+                .unwrap();
+            assert_eq!(tracker.filter_errors().count(), 0);
+
+            let mut fresh = LiveVideoValidator::new();
+            assert!(fresh
+                .update_vsi_context(
+                    Some(&update_init(1, 1000, 1000)),
+                    &keys,
+                    TEST_MANIFEST_ID,
+                    Some(&cert),
+                    &mut tracker
+                )
+                .is_err());
+            validator
+                .register_manifest_box_init(TEST_MANIFEST_ID, &mut tracker)
+                .unwrap();
+            validator.reset_continuity();
+            assert!(validator
+                .update_vsi_context(None, &keys, TEST_MANIFEST_ID, Some(&cert), &mut tracker)
+                .is_err());
+
+            // A manifest-method observation without registered init is also a method
+            // commitment, even with an empty stream ID and after playback reset.
+            let (mut manifest_validator, _) = setup_vsi_validator();
+            manifest_validator
+                .validate_media_segment(
+                    &make_uuid_box(true),
+                    TEST_MANIFEST_ID,
+                    &make_segment(1, ""),
+                    &mut new_tracker(),
+                )
+                .unwrap();
+            manifest_validator.reset_continuity();
+            assert!(manifest_validator
+                .update_vsi_context(
+                    None,
+                    &keys,
+                    TEST_MANIFEST_ID,
+                    Some(&cert),
+                    &mut new_tracker()
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "rust_native_crypto")]
+    fn vsi_update_preserves_reset_suppression_and_ignores_prior_tracker_failures() {
+        use vsi_crypto_helpers::*;
+        let (mut validator, _) = setup_vsi_validator();
+        validator.reset_continuity();
+        let cert = test_ee_cert_der();
+        let (key, cose) = generate_test_key_pair();
+        let keys = session_keys_with_cose_key(cose, &key, &cert);
+        let mut tracker = StatusTracker::default();
+        validator
+            .fail_session_keys("earlier unrelated failure", &mut tracker)
+            .unwrap();
+        assert!(validator
+            .update_vsi_context(
+                Some(&[]),
+                &keys,
+                TEST_MANIFEST_ID,
+                Some(&cert),
+                &mut tracker
+            )
+            .is_err());
+        assert!(validator.suppress_initial_continuity);
+        let prior_failures = tracker.filter_errors().count();
+        validator
+            .update_vsi_context(None, &keys, TEST_MANIFEST_ID, Some(&cert), &mut tracker)
+            .unwrap();
+        assert!(validator.suppress_initial_continuity);
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(8, TEST_MANIFEST_ID, &key),
+                &mut tracker,
+            )
+            .unwrap();
+        assert!(validator.sequence_coverage().missing_ranges.is_empty());
+        assert_eq!(tracker.filter_errors().count(), prior_failures);
     }
 
     // ── validate_session_keys ─────────────────────────────────────────────────

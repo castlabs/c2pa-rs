@@ -225,6 +225,8 @@ pub struct LiveVideoValidator {
     /// [`validate_session_keys`]: LiveVideoValidator::validate_session_keys
     expected_manifest_id: Option<String>,
     manifest_box_init_id: Option<String>,
+    // Retained across playback resets, even without a registered init or nonempty streamId.
+    manifest_box_context: bool,
     init_track_id: Option<u32>,
     init_timescale: Option<u32>,
     init_default_sample_duration: Option<u32>,
@@ -240,6 +242,7 @@ impl LiveVideoValidator {
             session_keys: Vec::new(),
             expected_manifest_id: None,
             manifest_box_init_id: None,
+            manifest_box_context: false,
             init_track_id: None,
             init_timescale: None,
             init_default_sample_duration: None,
@@ -318,6 +321,9 @@ impl LiveVideoValidator {
 
     /// Validates an initialization segment ([§19.7.1]).
     ///
+    /// Clears sequence/key/replay context before validation. For atomic same-stream VSI
+    /// updates that preserve continuity, use [`Self::update_vsi_context`] instead.
+    ///
     /// [§19.7.1]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#_live_video_validation_process
     pub fn validate_init_segment(
         &mut self,
@@ -328,6 +334,7 @@ impl LiveVideoValidator {
         self.session_keys.clear();
         self.expected_manifest_id = None;
         self.manifest_box_init_id = None;
+        self.manifest_box_context = false;
         self.init_track_id = None;
         self.init_timescale = None;
         self.init_default_sample_duration = None;
@@ -409,6 +416,7 @@ impl LiveVideoValidator {
             );
         }
         self.manifest_box_init_id = Some(manifest_id.to_string());
+        self.manifest_box_context = true;
         Ok(())
     }
 
@@ -494,6 +502,7 @@ impl LiveVideoValidator {
             && (predecessor_mismatch || tracker.filter_errors().count() == failures_before)
         {
             self.record_sequence_gap(assertion.sequence_number, None, tracker);
+            self.manifest_box_context = true;
             self.previous_segment = Some(SegmentState {
                 sequence_number: assertion.sequence_number,
                 stream_id: assertion.stream_id.clone(),
@@ -515,6 +524,8 @@ impl LiveVideoValidator {
     ///
     /// `manifest_id` is the c2pa URN label of that same trusted manifest; every subsequent VSI
     /// segment's `manifestId` is checked against it ([§19.4.4]).
+    /// This initial-setup operation clears installed keys first and may install a valid subset
+    /// in aggregate mode. For all-or-nothing updates use [`Self::update_vsi_context`].
     ///
     /// [§19.4]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#verifiable_segment_info
     /// [§19.4.4]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#_manifest_retrieval_from_the_manifestid_field
@@ -601,6 +612,78 @@ impl LiveVideoValidator {
 
         self.session_keys = verified_keys;
         self.expected_manifest_id = Some(manifest_id.to_string());
+        Ok(())
+    }
+
+    /// Atomically replaces the current VSI init/manifest/key context without resetting
+    /// accepted sequence, replay IDs, coverage or playback-interval suppression.
+    ///
+    /// The caller MUST have verified the manifest with `Reader`, including signature,
+    /// trust, assertion integrity and the applicable init hard binding. The assertion,
+    /// manifest ID and end-entity certificate must come from that same verified context.
+    /// These raw arguments do not establish claim trust. The caller also owns logical-stream
+    /// scope: equal track/timing fields alone do not establish stream identity.
+    ///
+    /// Requires an already initialized track and rejects a manifest-box context. `None`
+    /// retains the current init configuration. A supplied init must pass the existing
+    /// single-track layout checks and exactly match track ID, timescale and optional
+    /// default sample duration. Codec/sample-entry equivalence is not checked here.
+    /// All keys must pass the existing shape and signer-binding checks; multiple keys
+    /// are supported within this one manifest. No old manifest/key context is retained.
+    ///
+    /// `Ok(())` guarantees installation, even with an aggregating tracker. Any error
+    /// leaves all validator state unchanged; diagnostics remain in the tracker. Earlier
+    /// tracker failures do not veto this independently validated update.
+    pub fn update_vsi_context(
+        &mut self,
+        init_segment: Option<&[u8]>,
+        assertion: &SessionKeys,
+        manifest_id: &str,
+        ee_cert_der: Option<&[u8]>,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if self.init_track_id.is_none()
+            || self.init_timescale.is_none()
+            || self.manifest_box_context
+        {
+            fail_validation(
+                "VSI update requires an initialized track outside the manifest-box method",
+                LIVEVIDEO_INIT_INVALID,
+                tracker,
+            )?;
+            return Err(Error::BadParam(LIVEVIDEO_INIT_INVALID.into()));
+        }
+
+        let failures_before = tracker.filter_errors().count();
+        let mut candidate = Self::new();
+        candidate.init_track_id = self.init_track_id;
+        candidate.init_timescale = self.init_timescale;
+        candidate.init_default_sample_duration = self.init_default_sample_duration;
+        if let Some(init) = init_segment {
+            candidate.validate_init_segment(init, tracker)?;
+            if candidate.init_track_id != self.init_track_id
+                || candidate.init_timescale != self.init_timescale
+                || candidate.init_default_sample_duration != self.init_default_sample_duration
+            {
+                fail_validation(
+                    "VSI update must retain track ID, timescale and default sample duration",
+                    LIVEVIDEO_INIT_INVALID,
+                    tracker,
+                )?;
+            }
+        }
+        candidate.validate_session_keys(assertion, manifest_id, ee_cert_der, tracker)?;
+        if tracker.filter_errors().count() != failures_before {
+            return Err(Error::BadParam(
+                "VSI context update was not installed".into(),
+            ));
+        }
+
+        self.init_track_id = candidate.init_track_id;
+        self.init_timescale = candidate.init_timescale;
+        self.init_default_sample_duration = candidate.init_default_sample_duration;
+        self.session_keys = candidate.session_keys;
+        self.expected_manifest_id = candidate.expected_manifest_id;
         Ok(())
     }
 

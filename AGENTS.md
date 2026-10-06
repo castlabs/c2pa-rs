@@ -64,8 +64,9 @@ for ContentAuth. Classify the *hunk*, not just its file, before extracting it.
   discontinuities), and [#2561](https://github.com/c2pa-org/specs-core/issues/2561)
   (omission reporting). Keep vendor codes until upstream decides. The specs-core
   session owns replies; no further upstream action is authorized. Do not claim
-  full alignment: current init validation still resets the comparison baseline,
-  unlike #2561's proposal; signed restarts and join/seek status reporting are not
+  full alignment: legacy init validation still resets the comparison baseline;
+  opt-in `update_vsi_context` preserves VSI continuity atomically. Signed restarts
+  and join/seek status reporting are not
   implemented. See the coverage document for reconciliation details. Do not
   require one session key for the whole stream without resolving #2631's
   separate reviewer questions.
@@ -74,8 +75,12 @@ for ContentAuth. Classify the *hunk*, not just its file, before extracting it.
   media chain by omitting `previousManifestId`; init is not a chain member.
   This supersedes the init-rooted design direction, not the current code.
   Read `docs/roadmap/live-video-continuity-reconciliation.md` before implementing
-  update/reset/bootstrap changes. Resolve its explicit API, key-overlap and
-  persisted-state choices; retain vendor codes and distinguish proposals from
+  update/reset/bootstrap changes. The narrowed VSI update replaces one current
+  context, preserves sequence/replay/coverage, and supports multiple keys in that
+  manifest; historical overlap/cache is deferred. Caller Reader trust and init
+  hard-binding verification remain mandatory. Breaking changes are fine; no
+  migration machinery is required. Manifest-box #21/#23 and signing/reset
+  reconciliation are separate held work; retain vendor codes and distinguish proposals from
   adopted standards. Implementation is tracked in mstattma/c2pa-rs#24.
 
 ## Extraction Checklist
