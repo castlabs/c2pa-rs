@@ -22,7 +22,7 @@ use anyhow::{bail, Context, Result};
 use c2pa::{
     assertions::{LiveVideoSegment, SessionKeys},
     format_from_path,
-    live_video::LiveVideoValidator,
+    live_video::{LiveVideoValidator, SequenceCoverage},
     status_tracker::StatusTracker,
     validation_results::validation_codes::{LIVEVIDEO_INIT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID},
     Context as C2paContext, Manifest, Reader,
@@ -121,6 +121,11 @@ pub fn validate_live_video(
         }
     }
 
+    print!(
+        "{}",
+        format_sequence_coverage(live_validator.sequence_coverage())
+    );
+
     let live_video_failures = collect_live_video_failures(&tracker);
 
     if !live_video_failures.is_empty() {
@@ -141,6 +146,33 @@ pub fn validate_live_video(
             live_video_failures.len()
         )
     }
+}
+
+fn format_sequence_coverage(coverage: &SequenceCoverage) -> String {
+    if coverage.total_missing == 0 {
+        return String::new();
+    }
+
+    let ranges = coverage
+        .missing_ranges
+        .iter()
+        .map(|range| format!("{}..={}", range.start(), range.end()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let truncation = if coverage.ranges_truncated {
+        "\n  Range list truncated; additional unobserved ranges are not shown."
+    } else {
+        ""
+    };
+
+    format!(
+        "\nCoverage gaps (informational):\n  \
+         Retained unobserved sequence ranges (inclusive): {ranges}\n  \
+         Total unobserved sequence numbers: {}{truncation}\n  \
+         Unobserved ranges do not prove malicious removal or that segments with those \
+         sequence numbers were produced.\n",
+        coverage.total_missing
+    )
 }
 
 /// Returns a description of the first non-passed signature, trust, or hard-binding status on
@@ -501,6 +533,132 @@ mod tests {
         let segments = collect_segments(&init, Path::new("seg_*.m4s")).unwrap();
 
         assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn sequence_coverage_summary_is_empty_without_gaps() {
+        let coverage = SequenceCoverage {
+            missing_ranges: vec![],
+            total_missing: 0,
+            ranges_truncated: false,
+        };
+
+        assert_eq!(format_sequence_coverage(&coverage), "");
+    }
+
+    #[test]
+    #[allow(deprecated)] // The current VSI signing bridge snapshots thread-local settings.
+    fn trusted_vsi_gap_succeeds_but_tampered_surviving_media_still_fails() {
+        let settings = c2pa::settings::Settings::from_string(
+            include_str!("../tests/fixtures/trust/cawg_test_settings.toml"),
+            "toml",
+        )
+        .unwrap();
+        let context = Arc::new(C2paContext::new().with_settings(settings).unwrap());
+        let signer = c2pa::create_signer::from_keys(
+            include_bytes!("../../sdk/tests/fixtures/certs/es256.pub"),
+            include_bytes!("../../sdk/tests/fixtures/certs/es256.pem"),
+            c2pa::SigningAlg::Es256,
+            None,
+        )
+        .unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../sdk/tests/fixtures/bunny/bunny_595491bps");
+        let dir = tempfile::tempdir().unwrap();
+        let signed = dir.path().join("signed");
+        let seed = dir.path().join("session-key.bin");
+        fs::write(&seed, [0x42; 32]).unwrap();
+        crate::live_video_sign::sign_live_video_vsi(
+            &fixtures,
+            Path::new("BigBuckBunny_2s27[7-9].m4s"),
+            &fixtures.join("BigBuckBunny_2s_init.mp4"),
+            None,
+            r#"{"assertions":[{"label":"c2pa.actions","data":{"actions":[{"action":"c2pa.created","digitalSourceType":"http://c2pa.org/digitalsourcetype/empty"}]}}]}"#,
+            &signed,
+            &seed,
+            signer.as_ref(),
+            None,
+        )
+        .unwrap();
+        let init = signed.join("BigBuckBunny_2s_init.mp4");
+        validate_live_video(&context, &init, Path::new("BigBuckBunny_2s27[7-9].m4s")).unwrap();
+        // Select only 277 and 279: omission must be visible, but not invalidate either segment.
+        let gap_glob = Path::new("BigBuckBunny_2s27[79].m4s");
+        validate_live_video(&context, &init, gap_glob).unwrap();
+        let last_path = signed.join("BigBuckBunny_2s279.m4s");
+        let mut tampered = fs::read(&last_path).unwrap();
+        *tampered.last_mut().unwrap() ^= 1;
+        fs::write(&last_path, tampered).unwrap();
+        assert!(validate_live_video(&context, &init, gap_glob).is_err());
+    }
+
+    #[test]
+    fn sequence_coverage_summary_reports_inclusive_ranges_and_total() {
+        for (missing_ranges, total_missing, expected_ranges) in [
+            (vec![2..=4], 3, "2..=4"),
+            (vec![1..=1, 5..=7], 4, "1..=1, 5..=7"),
+        ] {
+            let coverage = SequenceCoverage {
+                missing_ranges,
+                total_missing,
+                ranges_truncated: false,
+            };
+            let summary = format_sequence_coverage(&coverage);
+
+            assert_eq!(
+                summary,
+                format!(
+                    "\nCoverage gaps (informational):\n  \
+                     Retained unobserved sequence ranges (inclusive): {expected_ranges}\n  \
+                     Total unobserved sequence numbers: {total_missing}\n  \
+                     Unobserved ranges do not prove malicious removal or that segments with \
+                     those sequence numbers were produced.\n"
+                )
+            );
+            assert!(!summary.contains("FAIL"));
+        }
+    }
+
+    #[test]
+    fn sequence_coverage_summary_reports_truncation_and_full_total() {
+        let coverage = SequenceCoverage {
+            missing_ranges: vec![1..=u64::MAX],
+            total_missing: u128::from(u64::MAX) + 1,
+            ranges_truncated: true,
+        };
+        let summary = format_sequence_coverage(&coverage);
+
+        assert!(summary.contains("1..=18446744073709551615"));
+        assert!(summary.contains("Total unobserved sequence numbers: 18446744073709551616"));
+        assert!(
+            summary.contains("Range list truncated; additional unobserved ranges are not shown.")
+        );
+        assert!(!summary.contains("FAIL"));
+    }
+
+    #[test]
+    fn vendor_informational_gap_statuses_are_not_live_video_failures() {
+        use c2pa::{
+            live_video::{LIVEVIDEO_SEGMENT_GAP, LIVEVIDEO_SEGMENT_LEADING_GAP},
+            log_item,
+        };
+
+        let mut tracker = StatusTracker::default();
+        for code in [LIVEVIDEO_SEGMENT_GAP, LIVEVIDEO_SEGMENT_LEADING_GAP] {
+            log_item!("seg", "coverage gap", "func")
+                .validation_status(code)
+                .informational(&mut tracker);
+        }
+        assert!(collect_live_video_failures(&tracker).is_empty());
+
+        log_item!("seg", "invalid segment", "func")
+            .validation_status("livevideo.segment.invalid")
+            .failure(&mut tracker, c2pa::Error::NotFound)
+            .unwrap();
+        assert_eq!(
+            collect_live_video_failures(&tracker),
+            vec![("livevideo.segment.invalid".into(), "invalid segment".into())]
+        );
     }
 
     #[test]

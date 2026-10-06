@@ -178,11 +178,10 @@ impl<'a> Scanner<'a> {
     fn key(&mut self, rule: KeyRule) -> Result<&'a [u8]> {
         let start = self.pos;
         let major = self.data.get(start).map(|byte| byte >> 5);
-        let allowed = match (rule, major) {
-            (_, Some(0 | 1 | 3)) => true,
-            (KeyRule::Nested, Some(2)) => true,
-            _ => false,
-        };
+        let allowed = matches!(
+            (rule, major),
+            (_, Some(0 | 1 | 3)) | (KeyRule::Nested, Some(2))
+        );
         if !allowed {
             return Err(invalid("unsupported map key type"));
         }

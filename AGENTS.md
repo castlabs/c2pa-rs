@@ -44,14 +44,44 @@ for ContentAuth. Classify the *hunk*, not just its file, before extracting it.
   fixes, generic Python native-handle ownership, fragmented BMFF signing and
   ladder writing are separate upstream tracks, not hidden dependencies in a
   VSI PR. Preserve their independent review histories and breaking contracts.
-- Section 19.4.1 describes generated VSI sequence numbers increasing by one
-  for each subsequent segment, with MFHD equality or the REaP indexing
-  alternative. A verifier may receive only some segments. This fork currently
-  marks a non-consecutive received VSI sequence invalid; whether to report a
-  missing-segment coverage gap separately instead is a proposed upstream
-  policy change, not current behavior. Do not change that validation rule or
-  require one session key for the whole stream without resolving section 19.7
-  and #2631's reviewer questions first.
+- Section 19.4.1 describes +1 generation, with MFHD equality or the REaP
+  indexing alternative. Receiver validation requires strictly increasing
+  numbers, not necessarily consecutive observations: specs-core
+  [#2521](https://github.com/c2pa-org/specs-core/pull/2521) adds this rule for VSI
+  in section 19.7.3, with `livevideo.segment.invalid` for equality/regression.
+  This fork reports unobserved ranges as vendor **informational**, never fatal,
+  `com.castlabs.livevideo.segment.gap` / `.leadingGap`; a leading comparison is
+  literal against the key minimum, including 0 -> 1. Do not imply that a signed
+  key minimum proves those segments were produced or maliciously removed.
+  Manifest-box predecessor mismatch still fails, but otherwise-validated
+  metadata becomes the next comparison baseline so later segments can recover.
+  Explicit playback discontinuities preserve coverage history. See
+  `docs/live-video-sequence-coverage.md` and the unresolved omission concern in
+  specs-core [#1025](https://github.com/c2pa-org/specs-core/issues/1025). Published
+  proposals are [#2558](https://github.com/c2pa-org/specs-core/issues/2558) (track
+  scope), [#2559](https://github.com/c2pa-org/specs-core/issues/2559) (chunked CMAF
+  numbering), [#2560](https://github.com/c2pa-org/specs-core/issues/2560) (signed
+  discontinuities), and [#2561](https://github.com/c2pa-org/specs-core/issues/2561)
+  (omission reporting). Keep vendor codes until upstream decides. The specs-core
+  session owns replies; no further upstream action is authorized. Do not claim
+  full alignment: legacy init validation still resets the comparison baseline;
+  opt-in `update_vsi_context` preserves VSI continuity atomically. Signed restarts
+  and join/seek status reporting are not
+  implemented. See the coverage document for reconciliation details. Do not
+  require one session key for the whole stream without resolving #2631's
+  separate reviewer questions.
+- The operator-selected proposal in specs-core
+  [#2563](https://github.com/c2pa-org/specs-core/issues/2563) starts the produced
+  media chain by omitting `previousManifestId`; init is not a chain member.
+  This supersedes the init-rooted design direction, not the current code.
+  Read `docs/roadmap/live-video-continuity-reconciliation.md` before implementing
+  update/reset/bootstrap changes. The narrowed VSI update replaces one current
+  context, preserves sequence/replay/coverage, and supports multiple keys in that
+  manifest; historical overlap/cache is deferred. Caller Reader trust and init
+  hard-binding verification remain mandatory. Breaking changes are fine; no
+  migration machinery is required. Manifest-box #21/#23 and signing/reset
+  reconciliation are separate held work; retain vendor codes and distinguish proposals from
+  adopted standards. Implementation is tracked in mstattma/c2pa-rs#24.
 
 ## Extraction Checklist
 
