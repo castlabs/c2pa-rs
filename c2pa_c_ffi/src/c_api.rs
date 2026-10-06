@@ -2802,11 +2802,17 @@ impl CredentialHolder for CallbackCredentialHolder {
             self.reserve_size,
         )
         .map_err(|e| IdentityBuilderError::CborGenerationError(e.to_string()))?;
+        // Retain the creation-time allocation envelope for legacy callbacks,
+        // while advertising and enforcing only the usable signature capacity.
         let mut signed_bytes = Vec::new();
-        signed_bytes.try_reserve_exact(capacity).map_err(|e| {
-            IdentityBuilderError::SignerError(format!("signature buffer allocation failed: {e}"))
-        })?;
-        signed_bytes.resize(capacity, 0);
+        signed_bytes
+            .try_reserve_exact(self.reserve_size)
+            .map_err(|e| {
+                IdentityBuilderError::SignerError(format!(
+                    "signature buffer allocation failed: {e}"
+                ))
+            })?;
+        signed_bytes.resize(self.reserve_size, 0);
         let signed_size = unsafe {
             (self.callback)(
                 self.context,
@@ -5887,6 +5893,66 @@ verify_after_sign = true
         oversized_return: bool,
         offered: std::sync::atomic::AtomicUsize,
         calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[test]
+    fn credential_callback_retains_allocation_but_enforces_logical_capacity() {
+        struct LegacyCallbackState {
+            reserve_size: usize,
+            return_oversized: bool,
+            offered: std::sync::atomic::AtomicUsize,
+        }
+
+        unsafe extern "C" fn legacy_credential_holder(
+            context: *const (),
+            _data: *const c_uchar,
+            _len: usize,
+            out: *mut c_uchar,
+            capacity: usize,
+        ) -> isize {
+            let state = &*(context as *const LegacyCallbackState);
+            state
+                .offered
+                .store(capacity, std::sync::atomic::Ordering::SeqCst);
+            // Deliberately model a legacy callback that uses its original
+            // reservation rather than signed_len. The retained buffer makes
+            // this write bounded, but the public callback contract forbids it.
+            std::ptr::write_bytes(out, 0xa5, state.reserve_size);
+            if state.return_oversized {
+                state.reserve_size as isize
+            } else {
+                capacity as isize
+            }
+        }
+
+        use c2pa::identity::{builder::IdentityBuilderError, SignerPayload};
+
+        let payload = SignerPayload {
+            referenced_assertions: vec![],
+            sig_type: "INVALID.legacy_callback".into(),
+            roles: vec![],
+        };
+        for return_oversized in [false, true] {
+            let state = LegacyCallbackState {
+                reserve_size: 512,
+                return_oversized,
+                offered: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let holder = CallbackCredentialHolder {
+                context: &state as *const _ as *const (),
+                sig_type: payload.sig_type.clone(),
+                reserve_size: state.reserve_size,
+                callback: legacy_credential_holder,
+            };
+            let result = holder.sign(&payload);
+            let offered = state.offered.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(offered > 0 && offered < state.reserve_size);
+            if return_oversized {
+                assert!(matches!(result, Err(IdentityBuilderError::BoxSizeTooSmall)));
+            } else {
+                assert_eq!(result.unwrap(), vec![0xa5; offered]);
+            }
+        }
     }
 
     unsafe extern "C" fn capacity_credential_holder(
