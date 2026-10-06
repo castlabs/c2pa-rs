@@ -13,11 +13,50 @@ warning. Section 19.7.2 also requires strictly greater numbers for the per-segme
 manifest method, with `livevideo.assertion.invalid` for equality/regression;
 #2521 applies specifically to VSI. The omission concern raised in
 [#1025](https://github.com/c2pa-org/specs-core/issues/1025) therefore remains
-relevant even when every received signature and hash validates. The separate
-specs-core session owns proposing an upstream resolution, obtaining publication
-approval, and handling replies. Add the resulting issue URL here once published
-and reconcile this extension with the upstream decision; neither code below is
-a standard C2PA status.
+relevant even when every received signature and hash validates. The published
+omission-reporting proposal is
+[#2561](https://github.com/c2pa-org/specs-core/issues/2561), with related scope,
+numbering and discontinuity proposals listed below. These are open proposals,
+not adopted specification requirements. Keep both `com.castlabs.*` codes until
+upstream decides; neither code below is a standard C2PA status.
+
+## Upstream Tracking
+
+Published with operator approval on 2026-10-06; the specs-core session
+`ses_f255ab182ffet0auzExaVc9pFa` owns replies and further publication approvals.
+This implementation tracks decisions, not ownership of those discussions.
+
+| Issue | Proposal | Implementation reconciliation |
+|---|---|---|
+| [#2558](https://github.com/c2pa-org/specs-core/issues/2558) | Scope first/previous checks per track or CMAF switching set. | Current state is per validator instance, with a pinned VSI track ID. No switching-set coordination is implemented. |
+| [#2559](https://github.com/c2pa-org/specs-core/issues/2559) | Define the VSI signing unit for chunked CMAF, covered-moof MFHD equality, and normative +1 numbering per track. | Current single-moof/traf profile and integer-range reporting do not implement general chunked-CMAF or REaP chunk-index semantics. Do not present the proposal as an existing guarantee. |
+| [#2560](https://github.com/c2pa-org/specs-core/issues/2560) | Prefer continued numbering; otherwise require a signed declaration for a numbering restart, not unsigned HLS/DASH signals. | No signed-discontinuity declaration is parsed or verified here. `reset_continuity()` is trusted caller control only. |
+| [#2561](https://github.com/c2pa-org/specs-core/issues/2561) | Report gap/leading-gap ranges separately from failures; preserve comparison across ordinary updates; recover after an otherwise-valid manifest-chain mismatch. | Vendor notices and manifest mismatch recovery exist. Update-spanning comparison and explicit join/seek reporting are not fully implemented; see below. |
+
+[#1025 was cross-referenced, not reopened](https://github.com/c2pa-org/specs-core/issues/1025#issuecomment-6007455215).
+The proposed standard names `livevideo.segment.gap` and
+`livevideo.segment.leadingGap` are not replacements for the vendor codes until
+agreed upstream. The upstream issues deliberately do not mention our vendor codes.
+
+In particular, #2561 proposes preserving the comparison baseline across key
+rotation, repeated init segments and manifest updates. This is a desired policy,
+**not current implemented behavior**: `validate_init_segment` still clears the
+predecessor/key/replay state. Preserving accumulated ranges does not close that
+continuity gap. Our reset also suppresses the next leading comparison without
+emitting a separate player-join/seek status. Both differences require follow-up
+design and tests rather than being silently described as compliance.
+
+Leading ranges remain literal: a zero key minimum with epoch-based REaP numbers
+can describe billions of unobserved sequence integers. Ranges are stored as
+intervals, not expanded into individual numbers; they do not prove production
+or malicious removal. JIT-VOD end completeness remains an open question in #2561.
+
+The distinct per-segment-manifest bootstrap question is staged in
+[mstattma/c2pa-rs#21](https://github.com/mstattma/c2pa-rs/issues/21) and
+[draft #23](https://github.com/mstattma/c2pa-rs/pull/23). The isolated VSI failure-code
+correction is [draft #22](https://github.com/mstattma/c2pa-rs/pull/22). These do not
+authorize additional ContentAuth or specs-core publication or functional-branch
+integration.
 
 ## Report-Only Gaps
 

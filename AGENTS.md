@@ -57,11 +57,18 @@ for ContentAuth. Classify the *hunk*, not just its file, before extracting it.
   metadata becomes the next comparison baseline so later segments can recover.
   Explicit playback discontinuities preserve coverage history. See
   `docs/live-video-sequence-coverage.md` and the unresolved omission concern in
-  specs-core [#1025](https://github.com/c2pa-org/specs-core/issues/1025). The
-  specs-core session owns the upstream issue; add its eventual approved issue
-  URL here and reconcile the extension, rather than treating vendor codes as
-  standardized. Do not require one session key for the whole stream without
-  resolving #2631's separate reviewer questions.
+  specs-core [#1025](https://github.com/c2pa-org/specs-core/issues/1025). Published
+  proposals are [#2558](https://github.com/c2pa-org/specs-core/issues/2558) (track
+  scope), [#2559](https://github.com/c2pa-org/specs-core/issues/2559) (chunked CMAF
+  numbering), [#2560](https://github.com/c2pa-org/specs-core/issues/2560) (signed
+  discontinuities), and [#2561](https://github.com/c2pa-org/specs-core/issues/2561)
+  (omission reporting). Keep vendor codes until upstream decides. The specs-core
+  session owns replies; no further upstream action is authorized. Do not claim
+  full alignment: current init validation still resets the comparison baseline,
+  unlike #2561's proposal; signed restarts and join/seek status reporting are not
+  implemented. See the coverage document for reconciliation details. Do not
+  require one session key for the whole stream without resolving #2631's
+  separate reviewer questions.
 
 ## Extraction Checklist
 
