@@ -357,6 +357,9 @@ pub struct Claim {
 
     // Optional context for settings access (set when created from Builder)
     context: Option<Arc<Context>>,
+
+    // Only trusted VSI reservations opt into reproducible, public salts.
+    reservation_salt_nonce: Option<[u8; 16]>,
 }
 
 /// Enum to define how assertions are are stored when output to json
@@ -429,6 +432,22 @@ fn data_hash_exclusions_match_manifest(
 }
 
 impl Claim {
+    #[cfg(feature = "unstable_live_video")]
+    pub(crate) fn set_reservation_salt_nonce(&mut self, nonce: [u8; 16]) {
+        self.reservation_salt_nonce = Some(nonce);
+    }
+
+    fn reservation_salt(&self, domain: &[u8], label: &str) -> Option<Vec<u8>> {
+        self.reservation_salt_nonce.map(|nonce| {
+            let mut input = b"c2pa-trusted-vsi-v3:salt:".to_vec();
+            input.extend_from_slice(&nonce);
+            input.extend_from_slice(domain);
+            input.push(0);
+            input.extend_from_slice(label.as_bytes());
+            crate::crypto::hash::sha256(&input)[..16].to_vec()
+        })
+    }
+
     /// Create a new claim.
     /// vendor: name used to label the claim (unique instance number is automatically calculated)
     /// claim_generator: User agent see c2pa spec for format
@@ -512,6 +531,7 @@ impl Claim {
             gathered_assertions: None,
             context: None,
             spec_version: None,
+            reservation_salt_nonce: None,
         }
     }
 
@@ -614,6 +634,7 @@ impl Claim {
             gathered_assertions: None,
             context: None,
             spec_version: None,
+            reservation_salt_nonce: None,
         })
     }
 
@@ -750,6 +771,7 @@ impl Claim {
                 gathered_assertions: None,
                 context: None,
                 spec_version: None,
+                reservation_salt_nonce: None,
             })
         } else {
             /* Claim V2 fields
@@ -834,6 +856,7 @@ impl Claim {
                 gathered_assertions,
                 spec_version,
                 context: None,
+                reservation_salt_nonce: None,
             })
         }
     }
@@ -1526,7 +1549,27 @@ impl Claim {
         }
 
         // make sure the assertion is valid
-        let assertion = assertion_builder.to_assertion()?;
+        let mut assertion = assertion_builder.to_assertion()?;
+        if self.reservation_salt_nonce.is_some() {
+            // Sort maps, including serde HashMaps, without changing ordinary
+            // SDK encodings or binary resource content.
+            match assertion.decode_data() {
+                AssertionData::Cbor(data) => {
+                    let value = c2pa_cbor::Value::from_tagged_slice(data)?;
+                    assertion =
+                        Assertion::from_data_cbor(&assertion.label(), &c2pa_cbor::to_vec(&value)?);
+                }
+                AssertionData::Json(data) => {
+                    let mut value: serde_json::Value = serde_json::from_str(data)?;
+                    value.sort_all_objects();
+                    assertion = Assertion::from_data_json(
+                        &assertion.label(),
+                        &serde_json::to_vec(&value)?,
+                    )?;
+                }
+                _ => {}
+            }
+        }
         let assertion_label = assertion.label();
 
         // Update label if there are multiple instances of the same claim type.
@@ -1539,7 +1582,9 @@ impl Claim {
             self.compatibility_checks(&assertion)?
         }
 
-        let salt = salt_generator.generate_salt();
+        let salt = self
+            .reservation_salt(b"assertion", &as_label)
+            .or_else(|| salt_generator.generate_salt());
 
         // Get hash of the assertion's contents.
         let hash = Claim::calc_assertion_box_hash(&as_label, &assertion, salt.clone(), self.alg())?;
@@ -1606,7 +1651,9 @@ impl Claim {
 
         // salt box for 1.2 VC redaction support
         let ds = DefaultSalt::default();
-        let salt = ds.generate_salt();
+        let salt = self
+            .reservation_salt(b"databox", &label)
+            .or_else(|| ds.generate_salt());
 
         // assertion JUMBF box hash for 1.2 validation
         let assertion = Assertion::from_data_cbor(&label, &db_cbor);
@@ -1713,7 +1760,9 @@ impl Claim {
 
         // salt box for 1.2 VC redaction support
         let ds = DefaultSalt::default();
-        let salt = ds.generate_salt();
+        let salt = self
+            .reservation_salt(b"credential", &id)
+            .or_else(|| ds.generate_salt());
 
         // assertion JUMBF box hash for 1.2 validation
         let assertion = Assertion::from_data_json(&id, vc_json.as_bytes())?;
@@ -4342,6 +4391,10 @@ impl Claim {
     pub fn data(&self) -> Result<Vec<u8>> {
         match self.original_bytes {
             Some(ref ob) => Ok(ob.clone()),
+            None if self.reservation_salt_nonce.is_some() => {
+                let value = c2pa_cbor::value::to_value(self).map_err(|_| Error::ClaimEncoding)?;
+                c2pa_cbor::to_vec(&value).map_err(|_| Error::ClaimEncoding)
+            }
             None => Ok(c2pa_cbor::ser::to_vec(&self).map_err(|_err| Error::ClaimEncoding)?),
         }
     }
