@@ -1427,15 +1427,17 @@ fn assert_malformed(reader: &Reader, what: &str) {
         ValidationState::Invalid,
         "{what}: {reader}"
     );
-    assert!(
-        reader
-            .validation_results()
-            .and_then(|r| r.active_manifest())
-            .is_some_and(|m| m
-                .failure()
-                .iter()
-                .any(|s| s.code() == crate::validation_status::ASSERTION_BMFFHASH_MALFORMED)),
-        "{what}: expected assertion.bmffHash.malformed, got {reader}"
+    // The malformed binding must be the ONLY failure, so a parse or
+    // signature problem cannot make this pass for the wrong reason.
+    let failures: Vec<String> = reader
+        .validation_results()
+        .and_then(|r| r.active_manifest())
+        .map(|m| m.failure().iter().map(|s| s.code().to_owned()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        failures,
+        vec![crate::validation_status::ASSERTION_BMFFHASH_MALFORMED.to_owned()],
+        "{what}: {reader}"
     );
 }
 
@@ -1477,30 +1479,61 @@ fn initless_map_is_malformed_for_every_fragment_verifier() {
     let mut hash = BmffHash::new("jumbf manifest", "sha256", None);
     hash.set_default_exclusions();
     hash.set_merkle(vec![initless_map()]);
-    let malformed = |r: crate::Result<()>| {
-        matches!(&r, Err(crate::Error::C2PAValidation(code))
-            if code == crate::validation_status::ASSERTION_BMFFHASH_MALFORMED)
+    let assert_malformed = |what: &str, r: crate::Result<()>| {
+        assert!(
+            matches!(&r, Err(crate::Error::C2PAValidation(code))
+                if code == crate::validation_status::ASSERTION_BMFFHASH_MALFORMED),
+            "{what}: {r:?}"
+        );
     };
-    assert!(malformed(hash.verify_stream_segment_at_offset(
-        &mut Cursor::new(&init),
-        &mut Cursor::new(&fragment),
-        123,
-        None,
-    )));
-    assert!(malformed(hash.verify_stream_segment(
-        &mut Cursor::new(&init),
-        &mut Cursor::new(&fragment),
-        None,
-    )));
+    assert_malformed(
+        "verify_stream_segment_at_offset",
+        hash.verify_stream_segment_at_offset(
+            &mut Cursor::new(&init),
+            &mut Cursor::new(&fragment),
+            123,
+            None,
+        ),
+    );
+    assert_malformed(
+        "verify_stream_segment",
+        hash.verify_stream_segment(&mut Cursor::new(&init), &mut Cursor::new(&fragment), None),
+    );
     #[cfg(feature = "file_io")]
     {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("frag.m4s");
         std::fs::write(&path, &fragment).unwrap();
-        assert!(malformed(hash.verify_stream_segments(
-            &mut Cursor::new(&init),
-            &vec![path],
-            None,
-        )));
+        assert_malformed(
+            "verify_stream_segments",
+            hash.verify_stream_segments(&mut Cursor::new(&init), &vec![path], None),
+        );
+    }
+}
+
+#[test]
+fn initless_map_is_malformed_for_whole_file_verification() {
+    // Whole-file path: each leaf starts at a moof, so without initHash the
+    // bytes before the first moof (ftyp, moov) would be covered by nothing.
+    let signed = sign(PER_FRAGMENT_SIDX);
+    let mut hash = binding(&signed);
+    for map in hash.merkle.as_mut().unwrap() {
+        map.init_hash = None;
+    }
+
+    // A one-byte change inside moov must not slip through.
+    let moov = roots(&signed)
+        .into_iter()
+        .find(|b| b.kind == *b"moov")
+        .unwrap();
+    let mut tampered = signed.clone();
+    tampered[moov.payload + 20] ^= 0xff;
+    for data in [&signed, &tampered] {
+        let result = hash.verify_stream_hash(&mut Cursor::new(data), None);
+        assert!(
+            matches!(&result, Err(crate::Error::C2PAValidation(code))
+                if code == crate::validation_status::ASSERTION_BMFFHASH_MALFORMED),
+            "{result:?}"
+        );
     }
 }

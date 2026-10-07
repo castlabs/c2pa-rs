@@ -1641,6 +1641,16 @@ impl BmffHash {
             // is this a fragmented BMFF
             if is_fragmented {
                 for mm in &selected {
+                    // A fragmented map must carry an initHash (C2PA 2.2
+                    // bmff-merkle-map). Without it nothing above covers the
+                    // bytes before the first moof (ftyp, moov), because each
+                    // leaf starts at a moof; reject rather than verify the
+                    // leaves alone. Same rule as the fragment verifiers.
+                    if mm.init_hash.is_none() {
+                        return Err(Error::C2PAValidation(
+                            ASSERTION_BMFFHASH_MALFORMED.to_string(),
+                        ));
+                    }
                     let alg = match &mm.alg {
                         Some(a) => a,
                         None => self
