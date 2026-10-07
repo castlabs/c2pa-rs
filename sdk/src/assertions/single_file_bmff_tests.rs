@@ -1013,3 +1013,527 @@ fn single_file_verifier_honours_legacy_zero_ids_end_to_end() {
         "{err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Verifying one fragment of a single-file asset without the whole file.
+//
+// A byte-range HLS player hands the validator the initialization bytes and
+// one segment at a time. The leaf hashes of a single-file asset cover
+// absolute root-box offsets, so the segment must be verified "at" the offset
+// it was cut from. These tests pin down the cut the specification implies
+// (merkle uuid to merkle uuid, last one through EOF) and show that every
+// other cut, and the right cut at the wrong offset, is rejected.
+// ---------------------------------------------------------------------------
+
+/// The C2PA box usertype (ISO/IEC 23001-7 style uuid), spelled out so the
+/// test stays independent of the SDK's constant.
+const C2PA_BOX_UUID: [u8; 16] = [
+    0xd8, 0xfe, 0xc3, 0xd6, 0x1b, 0x0e, 0x48, 0x3c, 0x92, 0x97, 0x58, 0x28, 0x87, 0x7e, 0xc4, 0x81,
+];
+
+/// Byte ranges of the merkle uuid boxes, in file order.
+fn merkle_uuids(data: &[u8]) -> Vec<B> {
+    roots(data)
+        .into_iter()
+        .filter(|b| {
+            b.kind == *b"uuid"
+                && b.end - b.payload >= 16 + 4 + 7
+                && data[b.payload..b.payload + 16] == C2PA_BOX_UUID
+                && &data[b.payload + 20..b.payload + 27] == b"merkle\0"
+        })
+        .collect()
+}
+
+/// The cut a byte-range playlist must use: init = everything before the
+/// first merkle uuid; segment i = from merkle uuid i to the next one, the last
+/// one through end of file. Returns `(init, [(absolute_offset, bytes)])`.
+fn spec_cut(signed: &[u8]) -> (Vec<u8>, Vec<(u64, Vec<u8>)>) {
+    let uuids = merkle_uuids(signed);
+    assert!(!uuids.is_empty(), "no merkle uuid boxes in signed output");
+    let init = signed[..uuids[0].start].to_vec();
+    let segments = uuids
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let end = uuids.get(i + 1).map_or(signed.len(), |n| n.start);
+            (u.start as u64, signed[u.start..end].to_vec())
+        })
+        .collect();
+    (init, segments)
+}
+
+fn segment_reader(init: &[u8], segment: &[u8], offset: u64) -> Result<Reader> {
+    Reader::from_fragment_at_offset("video/mp4", Cursor::new(init), Cursor::new(segment), offset)
+}
+
+fn assert_segment_valid(init: &[u8], segment: &[u8], offset: u64) {
+    let reader = segment_reader(init, segment, offset).unwrap();
+    assert_ne!(
+        reader.validation_state(),
+        ValidationState::Invalid,
+        "{reader}"
+    );
+    assert!(
+        reader
+            .validation_results()
+            .and_then(|r| r.active_manifest())
+            .is_some_and(|m| m
+                .success()
+                .iter()
+                .any(|s| s.code() == crate::validation_status::ASSERTION_BMFFHASH_MATCH)),
+        "segment at {offset} did not report a BMFF hash match: {reader}"
+    );
+}
+
+/// A rejected segment is reported, not thrown: the reader comes back
+/// `Invalid` with `assertion.bmffHash.mismatch`, like every other hard-binding
+/// failure, so a player can show it. An `Err` here would be a regression.
+fn assert_segment_rejected(init: &[u8], segment: &[u8], offset: u64, why: &str) {
+    let expected = format!("{why}: expected a reported mismatch, got an error");
+    let reader = segment_reader(init, segment, offset).expect(&expected);
+    assert_eq!(
+        reader.validation_state(),
+        ValidationState::Invalid,
+        "{why}: expected rejection, got {reader}"
+    );
+    assert!(
+        reader
+            .validation_results()
+            .and_then(|r| r.active_manifest())
+            .is_some_and(|m| m
+                .failure()
+                .iter()
+                .any(|s| s.code() == crate::validation_status::ASSERTION_BMFFHASH_MISMATCH)),
+        "{why}: expected a BMFF hash mismatch, got {reader}"
+    );
+}
+
+#[test]
+fn single_file_segments_verify_at_their_absolute_offset() {
+    for input in [RELATIVE, ABSOLUTE] {
+        let signed = sign(input);
+        let (init, segments) = spec_cut(&signed);
+        let expected = binding(&signed).merkle.unwrap()[0].count;
+        assert_eq!(segments.len(), expected);
+
+        // Every segment verifies on its own, given only the init bytes and
+        // the offset it was cut from; the whole-file reader is never involved.
+        for (offset, segment) in &segments {
+            assert_segment_valid(&init, segment, *offset);
+        }
+
+        // The init prefix may equally end at the first moof: the merkle uuid
+        // in between is excluded from the hash either way.
+        let first_moof = named(&roots(&signed), b"moof").start;
+        assert!(first_moof > init.len());
+        let (offset, segment) = &segments[0];
+        assert_segment_valid(&signed[..first_moof], segment, *offset);
+    }
+}
+
+#[test]
+fn single_file_segments_reject_wrong_offset_and_cut() {
+    let signed = sign(RELATIVE);
+    let (init, segments) = spec_cut(&signed);
+    let (offset, segment) = &segments[1];
+
+    // The multi-file reader hashes the segment as if it started at byte 0.
+    assert_segment_rejected(&init, segment, 0, "offset 0");
+    assert_segment_rejected(&init, segment, offset + 1, "offset off by one");
+    assert_segment_rejected(
+        &init,
+        segment,
+        offset - 1,
+        "offset off by one the other way",
+    );
+    assert_segment_rejected(&init, segment, u64::MAX, "offset overflow");
+
+    // Dropping the tail (the bytes between the last mdat and the next merkle
+    // uuid belong to this leaf) or the head changes the hash.
+    let short = &segment[..segment.len() - 1];
+    assert_segment_rejected(&init, short, *offset, "segment missing its last byte");
+    let shifted = &segment[1..];
+    assert_segment_rejected(&init, shifted, offset + 1, "segment missing its first byte");
+
+    // A cut from moof to moof carries the NEXT fragment's merkle uuid and so
+    // names the wrong leaf.
+    let moofs: Vec<B> = roots(&signed)
+        .into_iter()
+        .filter(|b| b.kind == *b"moof")
+        .collect();
+    let moof_cut = &signed[moofs[1].start..moofs[2].start];
+    assert_segment_rejected(&init, moof_cut, moofs[1].start as u64, "moof-to-moof cut");
+
+    // A segment that runs on to the next moof carries two merkle uuid boxes,
+    // its own and the next fragment's. The next one names a leaf whose bytes
+    // are not in the segment, so the segment as a whole is rejected.
+    let own_uuid = merkle_uuids(&signed)[1];
+    let to_next_moof = &signed[own_uuid.start..moofs[2].start];
+    assert!(to_next_moof.len() > segment.len());
+    assert_segment_rejected(
+        &init,
+        to_next_moof,
+        own_uuid.start as u64,
+        "segment carrying the next merkle uuid",
+    );
+
+    // The init bytes are hashed at offset 0 and must be the file's prefix.
+    // Cutting them short truncates a box, which is a structural error rather
+    // than a hash mismatch: the reader refuses the init before hashing.
+    assert!(segment_reader(&init[..init.len() - 1], segment, *offset).is_err());
+    assert!(segment_reader(&init[1..], segment, *offset).is_err());
+    // An extra box keeps the structure intact, so this one is a plain
+    // mismatch. (`free` and `skip` would be excluded from the hash by the
+    // assertion's exclusion list and accepted; any other type is hashed.)
+    let mut padded = init.clone();
+    padded.extend_from_slice(&[0, 0, 0, 8, b'w', b'i', b'd', b'e']);
+    assert_segment_rejected(&padded, segment, *offset, "init with an extra box");
+}
+
+#[test]
+fn single_file_segment_offsets_are_mandatory_on_the_old_api() {
+    // The pre-existing multi-file entry point is unchanged: it cannot verify
+    // a segment of a single-file asset, by construction.
+    let signed = sign(RELATIVE);
+    let (init, segments) = spec_cut(&signed);
+    for (_, segment) in &segments {
+        let reader =
+            Reader::from_fragment("video/mp4", Cursor::new(&init), Cursor::new(segment)).unwrap();
+        assert_eq!(reader.validation_state(), ValidationState::Invalid);
+        assert!(reader
+            .validation_results()
+            .and_then(|r| r.active_manifest())
+            .is_some_and(|m| m
+                .failure()
+                .iter()
+                .any(|s| s.code() == crate::validation_status::ASSERTION_BMFFHASH_MISMATCH)));
+    }
+}
+
+#[tokio::test]
+async fn single_file_segments_verify_async() {
+    let signed = sign(RELATIVE);
+    let (init, segments) = spec_cut(&signed);
+    for (offset, segment) in &segments {
+        let reader = Reader::from_fragment_at_offset_async(
+            "video/mp4",
+            Cursor::new(&init),
+            Cursor::new(segment),
+            *offset,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            reader.validation_state(),
+            ValidationState::Invalid,
+            "{reader}"
+        );
+    }
+    let (offset, segment) = &segments[0];
+    let wrong = Reader::from_fragment_at_offset_async(
+        "video/mp4",
+        Cursor::new(&init),
+        Cursor::new(segment),
+        offset + 8,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        wrong.validation_state(),
+        ValidationState::Invalid,
+        "{wrong}"
+    );
+}
+
+#[test]
+fn single_file_segment_direct_hash_api() {
+    // The assertion-level API behaves the same without a Reader.
+    let signed = sign(ABSOLUTE);
+    let hash = binding(&signed);
+    let (init, segments) = spec_cut(&signed);
+    for (offset, segment) in &segments {
+        hash.verify_stream_segment_at_offset(
+            &mut Cursor::new(&init),
+            &mut Cursor::new(segment),
+            *offset,
+            None,
+        )
+        .unwrap();
+        assert!(hash
+            .verify_stream_segment(&mut Cursor::new(&init), &mut Cursor::new(segment), None)
+            .is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-fragment `sidx` (FFmpeg `+dash`, the layout byte-range HLS packagers
+// cut at): each `sidx` is hashed with the previous fragment's leaf, so a
+// segment cut at its `sidx` matches no leaf, while the specification's cut
+// (merkle box to merkle box) verifies at its offset.
+// ---------------------------------------------------------------------------
+
+/// ffmpeg 6.1.1 `+dash` output: a `sidx` before every `moof`, then `mfra`.
+const PER_FRAGMENT_SIDX: &[u8] =
+    include_bytes!("../../tests/fixtures/single_file_fragments_sidx.mp4");
+
+/// The cut a sidx-walking packager writes: init = everything before the first
+/// `sidx`; segment i = from `sidx` i to the end of `mdat` i.
+fn sidx_cut(signed: &[u8]) -> (Vec<u8>, Vec<(u64, Vec<u8>)>) {
+    let r = roots(signed);
+    let sidx: Vec<B> = r.iter().copied().filter(|b| b.kind == *b"sidx").collect();
+    let mdat: Vec<B> = r.iter().copied().filter(|b| b.kind == *b"mdat").collect();
+    assert_eq!(sidx.len(), mdat.len());
+    let init = signed[..sidx[0].start].to_vec();
+    let segments = sidx
+        .iter()
+        .zip(&mdat)
+        .map(|(s, m)| (s.start as u64, signed[s.start..m.end].to_vec()))
+        .collect();
+    (init, segments)
+}
+
+/// Independent check of a per-fragment-sidx output: whole file verifies; one
+/// merkle box right before every moof; every sidx's first reference starts at
+/// its fragment's merkle box and covers through that fragment's mdat; init
+/// and leaf hashes recomputed here match the assertion.
+fn check_per_fragment_sidx_output(signed: &[u8]) {
+    let hash = binding(signed);
+    let map = &hash.merkle().unwrap()[0];
+    let r = roots(signed);
+    let of = |k: &[u8; 4]| -> Vec<B> { r.iter().copied().filter(|b| &b.kind == k).collect() };
+    let (sidx, moof, mdat) = (of(b"sidx"), of(b"moof"), of(b"mdat"));
+    let merkle = merkle_uuids(signed);
+    assert_eq!(map.count, moof.len());
+    assert_eq!(merkle.len(), moof.len());
+    for i in 0..moof.len() {
+        assert_eq!(merkle[i].end, moof[i].start);
+        assert_eq!(sidx[i].end, merkle[i].start);
+        // sidx: version/flags, reference_ID, timescale, earliest_presentation_time
+        // and first_offset (32 bits each in v0, 64 bits in v1), reserved,
+        // reference_count, then the first reference (31-bit size).
+        let p = sidx[i].payload;
+        let (first_offset, first_ref) = if signed[p] == 0 {
+            (u32_at(signed, p + 16) as usize, p + 24)
+        } else {
+            (u64_at(signed, p + 20) as usize, p + 32)
+        };
+        let size = (u32_at(signed, first_ref) & 0x7fff_ffff) as usize;
+        assert_eq!(
+            sidx[i].end + first_offset,
+            merkle[i].start,
+            "sidx {i} target"
+        );
+        assert_eq!(merkle[i].start + size, mdat[i].end, "sidx {i} size");
+    }
+    let leaf = |start: usize, end: usize| -> Vec<u8> {
+        let mut digest = Sha256::new();
+        for b in r.iter().filter(|b| b.start >= start && b.end <= end) {
+            let excluded = [*b"ftyp", *b"mfra", *b"free", *b"skip"].contains(&b.kind)
+                || (b.kind == *b"uuid" && signed[b.payload..b.payload + 16] == C2PA_BOX_UUID);
+            if !excluded {
+                digest.update((b.start as u64).to_be_bytes());
+                digest.update(&signed[b.start..b.end]);
+            }
+        }
+        digest.finalize().to_vec()
+    };
+    assert_eq!(
+        map.init_hash.as_ref().unwrap().as_ref(),
+        leaf(0, moof[0].start)
+    );
+    for i in 0..moof.len() {
+        let end = moof.get(i + 1).map_or(signed.len(), |b| b.start);
+        assert_eq!(
+            map.hashes.0[i].as_ref(),
+            leaf(moof[i].start, end),
+            "leaf {i}"
+        );
+    }
+}
+
+#[test]
+fn single_file_per_fragment_sidx_belongs_to_the_previous_leaf() {
+    let signed = sign(PER_FRAGMENT_SIDX);
+    check_per_fragment_sidx_output(&signed);
+
+    let (spec_init, spec_segments) = spec_cut(&signed);
+    assert_eq!(spec_segments.len(), 3);
+    for (offset, segment) in &spec_segments {
+        assert_segment_valid(&spec_init, segment, *offset);
+    }
+
+    // A segment cut at its sidx carries the previous leaf's sidx and lacks
+    // its own trailing one.
+    let (init, segments) = sidx_cut(&signed);
+    let (offset, segment) = &segments[1];
+    assert_segment_rejected(&init, segment, *offset, "sidx cut");
+}
+
+// ---------------------------------------------------------------------------
+// A fragmented MerkleMap without initHash is malformed (backport of
+// contentauth/c2pa-rs#2609). Before the guard, a fragment that names such a
+// map was accepted without being hashed at all.
+// ---------------------------------------------------------------------------
+
+fn initless_map() -> super::MerkleMap {
+    super::MerkleMap {
+        unique_id: 1,
+        local_id: 1,
+        count: 1,
+        alg: Some("sha256".into()),
+        init_hash: None,
+        hashes: super::VecByteBuf(vec![serde_bytes::ByteBuf::from(vec![0xaau8; 32])]),
+        fixed_block_size: None,
+        variable_block_sizes: None,
+    }
+}
+
+/// A signed initialization segment whose (caller-supplied) BMFF hash
+/// assertion carries a Merkle map without initHash, and an unrelated
+/// fragment whose merkle box names that map.
+fn initless_init_and_fragment() -> (Vec<u8>, Vec<u8>) {
+    let first_sidx = roots(PER_FRAGMENT_SIDX)
+        .into_iter()
+        .find(|b| b.kind == *b"sidx")
+        .unwrap()
+        .start;
+    let mut bmff = BmffHash::new("jumbf manifest", "sha256", None);
+    bmff.set_default_exclusions();
+    bmff.set_merkle(vec![initless_map()]);
+    let settings = Settings::new()
+        .with_value("verify.verify_after_sign", false)
+        .unwrap();
+    let mut builder = Builder::from_context(Context::new().with_settings(settings).unwrap())
+        .with_definition(DEFINITION)
+        .unwrap();
+    builder.add_assertion("c2pa.hash.bmff.v3", &bmff).unwrap();
+    let mut init = Cursor::new(Vec::new());
+    builder
+        .sign(
+            test_signer(SigningAlg::Es256).as_ref(),
+            "video/mp4",
+            &mut Cursor::new(&PER_FRAGMENT_SIDX[..first_sidx]),
+            &mut init,
+        )
+        .unwrap();
+    // Any fragment whose merkle box names uniqueId 1 / localId 1.
+    let fragment = spec_cut(&sign(PER_FRAGMENT_SIDX)).1[0].1.clone();
+    (init.into_inner(), fragment)
+}
+
+fn assert_malformed(reader: &Reader, what: &str) {
+    assert_eq!(
+        reader.validation_state(),
+        ValidationState::Invalid,
+        "{what}: {reader}"
+    );
+    // The malformed binding must be the ONLY failure, so a parse or
+    // signature problem cannot make this pass for the wrong reason.
+    let failures: Vec<String> = reader
+        .validation_results()
+        .and_then(|r| r.active_manifest())
+        .map(|m| m.failure().iter().map(|s| s.code().to_owned()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        failures,
+        vec![crate::validation_status::ASSERTION_BMFFHASH_MALFORMED.to_owned()],
+        "{what}: {reader}"
+    );
+}
+
+#[test]
+fn initless_map_is_malformed_through_the_reader() {
+    let (init, fragment) = initless_init_and_fragment();
+    for offset in [0, init.len() as u64, 12_345] {
+        let reader = Reader::from_fragment_at_offset(
+            "video/mp4",
+            Cursor::new(&init),
+            Cursor::new(&fragment),
+            offset,
+        )
+        .unwrap();
+        assert_malformed(&reader, "from_fragment_at_offset");
+    }
+    let reader =
+        Reader::from_fragment("video/mp4", Cursor::new(&init), Cursor::new(&fragment)).unwrap();
+    assert_malformed(&reader, "from_fragment");
+}
+
+#[tokio::test]
+async fn initless_map_is_malformed_through_the_async_reader() {
+    let (init, fragment) = initless_init_and_fragment();
+    let reader = Reader::from_fragment_at_offset_async(
+        "video/mp4",
+        Cursor::new(&init),
+        Cursor::new(&fragment),
+        init.len() as u64,
+    )
+    .await
+    .unwrap();
+    assert_malformed(&reader, "from_fragment_at_offset_async");
+}
+
+#[test]
+fn initless_map_is_malformed_for_every_fragment_verifier() {
+    let (init, fragment) = initless_init_and_fragment();
+    let mut hash = BmffHash::new("jumbf manifest", "sha256", None);
+    hash.set_default_exclusions();
+    hash.set_merkle(vec![initless_map()]);
+    let assert_malformed = |what: &str, r: crate::Result<()>| {
+        assert!(
+            matches!(&r, Err(crate::Error::C2PAValidation(code))
+                if code == crate::validation_status::ASSERTION_BMFFHASH_MALFORMED),
+            "{what}: {r:?}"
+        );
+    };
+    assert_malformed(
+        "verify_stream_segment_at_offset",
+        hash.verify_stream_segment_at_offset(
+            &mut Cursor::new(&init),
+            &mut Cursor::new(&fragment),
+            123,
+            None,
+        ),
+    );
+    assert_malformed(
+        "verify_stream_segment",
+        hash.verify_stream_segment(&mut Cursor::new(&init), &mut Cursor::new(&fragment), None),
+    );
+    #[cfg(feature = "file_io")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frag.m4s");
+        std::fs::write(&path, &fragment).unwrap();
+        assert_malformed(
+            "verify_stream_segments",
+            hash.verify_stream_segments(&mut Cursor::new(&init), &vec![path], None),
+        );
+    }
+}
+
+#[test]
+fn initless_map_is_malformed_for_whole_file_verification() {
+    // Whole-file path: each leaf starts at a moof, so without initHash the
+    // bytes before the first moof (ftyp, moov) would be covered by nothing.
+    let signed = sign(PER_FRAGMENT_SIDX);
+    let mut hash = binding(&signed);
+    for map in hash.merkle.as_mut().unwrap() {
+        map.init_hash = None;
+    }
+
+    // A one-byte change inside moov must not slip through.
+    let moov = roots(&signed)
+        .into_iter()
+        .find(|b| b.kind == *b"moov")
+        .unwrap();
+    let mut tampered = signed.clone();
+    tampered[moov.payload + 20] ^= 0xff;
+    for data in [&signed, &tampered] {
+        let result = hash.verify_stream_hash(&mut Cursor::new(data), None);
+        assert!(
+            matches!(&result, Err(crate::Error::C2PAValidation(code))
+                if code == crate::validation_status::ASSERTION_BMFFHASH_MALFORMED),
+            "{result:?}"
+        );
+    }
+}

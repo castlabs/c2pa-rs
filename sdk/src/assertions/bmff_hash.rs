@@ -55,8 +55,8 @@ use crate::{
     cbor_types::UriT,
     utils::{
         hash_utils::{
-            concat_and_hash, hash_stream_by_alg, hash_stream_by_alg_with_progress, vec_compare,
-            verify_stream_by_alg, HashRange, Hasher,
+            concat_and_hash, hash_stream_by_alg, hash_stream_by_alg_at_offset,
+            hash_stream_by_alg_with_progress, vec_compare, verify_stream_by_alg, HashRange, Hasher,
         },
         io_utils::stream_len,
         merkle::{C2PAMerkleTree, MerkleNode},
@@ -1641,6 +1641,16 @@ impl BmffHash {
             // is this a fragmented BMFF
             if is_fragmented {
                 for mm in &selected {
+                    // A fragmented map must carry an initHash (C2PA 2.2
+                    // bmff-merkle-map). Without it nothing above covers the
+                    // bytes before the first moof (ftyp, moov), because each
+                    // leaf starts at a moof; reject rather than verify the
+                    // leaves alone. Same rule as the fragment verifiers.
+                    if mm.init_hash.is_none() {
+                        return Err(Error::C2PAValidation(
+                            ASSERTION_BMFFHASH_MALFORMED.to_string(),
+                        ));
+                    }
                     let alg = match &mm.alg {
                         Some(a) => a,
                         None => self
@@ -1971,6 +1981,13 @@ impl BmffHash {
                             {
                                 return Err(Error::HashMismatch("Fragment not valid".to_string()));
                             }
+                        } else {
+                            // A fragmented BMFF MerkleMap must carry an initHash; a
+                            // missing required field is a malformed assertion
+                            // (backport of contentauth/c2pa-rs#2609).
+                            return Err(Error::C2PAValidation(
+                                ASSERTION_BMFFHASH_MALFORMED.to_string(),
+                            ));
                         }
                     } else {
                         return Err(Error::HashMismatch("Fragment had no MerkleMap".to_string()));
@@ -1993,15 +2010,71 @@ impl BmffHash {
         fragment_stream: &mut dyn CAIRead,
         alg: Option<&str>,
     ) -> crate::Result<()> {
-        self.verify_stream_segment_with_progress(init_stream, fragment_stream, alg, &mut |_, _| {
-            Ok(())
-        })
+        self.verify_stream_segment_with_progress(
+            init_stream,
+            fragment_stream,
+            0,
+            alg,
+            &mut |_, _| Ok(()),
+        )
+    }
+
+    /// Verify one fragment that was cut out of a single-file fragmented BMFF
+    /// asset (C2PA 2.2 A.5.4.1.2, "single flat MP4 file") without the whole
+    /// file.
+    ///
+    /// Such an asset is signed with absolute root-box offsets, so a fragment
+    /// handed over on its own (for example one byte-range segment of an HLS
+    /// playlist) only hashes correctly when the verifier knows where the
+    /// fragment sat in the file. `fragment_base_offset` is that position: the
+    /// absolute byte offset of `fragment_stream`'s first byte within the
+    /// asset.
+    ///
+    /// The check succeeds when the two streams reproduce exactly the root
+    /// boxes the signer hashed for this leaf, at the same absolute offsets.
+    /// Boxes the assertion's exclusion list removes may be present or
+    /// absent. With the default exclusions that means:
+    ///
+    /// * `init_stream` is every byte before the first `merkle` uuid box, or
+    ///   equivalently before the first `moof` (the uuid box is excluded from
+    ///   the hash either way).
+    /// * `fragment_stream` starts at a `merkle` uuid box and ends right
+    ///   before the next one, or at end of file for the last fragment. The
+    ///   bytes between two `moof` boxes belong to the earlier leaf, so a
+    ///   trailing `sidx` written ahead of the next fragment stays with this
+    ///   fragment.
+    ///
+    /// A fragment cut anywhere else (for example at a `sidx`), or one that
+    /// stops short of the next `merkle` uuid box, then fails with a hash
+    /// mismatch, as does the right fragment at the wrong offset. A caller
+    /// whose segments are cut elsewhere must regroup the bytes into leaves
+    /// first.
+    ///
+    /// The offset is supplied by the caller, so this proves the bytes belong
+    /// to the leaf they name, not that the caller fetched them from where it
+    /// says: a player must take the offset from its own request. Passing `0`
+    /// is the multi-file behaviour of [`BmffHash::verify_stream_segment`].
+    pub fn verify_stream_segment_at_offset(
+        &self,
+        init_stream: &mut dyn CAIRead,
+        fragment_stream: &mut dyn CAIRead,
+        fragment_base_offset: u64,
+        alg: Option<&str>,
+    ) -> crate::Result<()> {
+        self.verify_stream_segment_with_progress(
+            init_stream,
+            fragment_stream,
+            fragment_base_offset,
+            alg,
+            &mut |_, _| Ok(()),
+        )
     }
 
     pub(crate) fn verify_stream_segment_with_progress<F>(
         &self,
         init_stream: &mut dyn CAIRead,
         fragment_stream: &mut dyn CAIRead,
+        fragment_base_offset: u64,
         alg: Option<&str>,
         progress: &mut F,
     ) -> crate::Result<()>
@@ -2080,17 +2153,25 @@ impl BmffHash {
                         Self::progress_tick(&mut step, progress)?;
 
                         // hash the entire fragment minus exclusions
-                        let hash = hash_stream_by_alg(
+                        let hash = hash_stream_by_alg_at_offset(
                             alg,
                             fragment_stream,
                             Some(fragment_exclusions),
                             true,
+                            fragment_base_offset,
                         )?;
 
                         // check MerkleMap for the hash
                         if !mm.check_merkle_tree(alg, &hash, bmff_mm.location, &bmff_mm.hashes) {
                             return Err(Error::HashMismatch("Fragment not valid".to_string()));
                         }
+                    } else {
+                        // A fragmented BMFF MerkleMap must carry an initHash; a
+                        // missing required field is a malformed assertion
+                        // (backport of contentauth/c2pa-rs#2609).
+                        return Err(Error::C2PAValidation(
+                            ASSERTION_BMFFHASH_MALFORMED.to_string(),
+                        ));
                     }
                 } else {
                     return Err(Error::HashMismatch("Fragment had no MerkleMap".to_string()));
