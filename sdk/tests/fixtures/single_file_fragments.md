@@ -7,7 +7,15 @@ ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=32x32:rate=2 -t 3 
 ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=32x32:rate=2 -t 3 -c:v libx264 -threads 1 -g 2 -bf 0 -movflags +empty_moov+frag_keyframe -y single_file_fragments_absolute.mp4
 ```
 
-Both contain an initialization prefix, three H.264 moof/mdat fragments, and an
+`single_file_fragments_sidx.mp4` (sha256 `8d95ae1959740b8fd02d30ad9e4eb04da7dc26869c14605677c084ce9b03ccff`)
+adds a per-fragment `sidx` before every `moof` (version 1 boxes), the layout
+byte-range HLS packagers cut at:
+
+```sh
+ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=32x32:rate=2 -t 3 -c:v libx264 -threads 1 -g 2 -bf 0 -movflags +empty_moov+frag_keyframe+default_base_moof+dash -y single_file_fragments_sidx.mp4
+```
+
+The first two contain an initialization prefix, three H.264 moof/mdat fragments, and an
 mfra with three tfra entries. The first uses default-base-is-moof and a global
 sidx; the second uses explicit absolute tfhd bases. FFmpeg 6.1.1's global_sidx
 pass does not relocate absolute tfhd bases correctly, so it is intentionally
