@@ -30,6 +30,7 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ### Fixed
 
+* Reject a fragment that matches a fragmented BMFF Merkle map without `initHash` as `assertion.bmffHash.malformed` in the new offset-aware fragment entry points too. The guard itself is contentauth/c2pa-rs#2609, already on this line for both fragment verifiers; castlabs/c2pa-rs#18 adds regression tests through `Reader::from_fragment`, `from_fragment_at_offset` and its async form, and every fragment verifier.
 * Preserve each TFRA entry's fragment target when inserting, resizing, or removing BMFF metadata. Offset adjustment now rejects unsupported TFRA versions instead of interpreting them as version 0. Previously corrupted TFRA tables are not repaired.
 * Generate fragment Merkle bindings when embedding manifests in supported single-track, single-file fragmented MP4 assets. Unsupported addressing, multiplexed layouts, and detached fragment signing fail explicitly; existing Merkle-bound files require an update manifest instead of ordinary re-signing.
 * Verify single-file fragmented BMFF assets against the Merkle maps named by their UUID boxes rather than unrelated rendition maps.
