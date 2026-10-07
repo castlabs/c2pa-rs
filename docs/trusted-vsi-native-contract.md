@@ -1,12 +1,22 @@
 # Trusted VSI Native Contract
 
-Status: current native implementation contract. This replaces the unshipped
+Status: current native implementation contract. Python consumers additionally
+require the exact SDK version `0.92.0-dev` and capability mask 63 alongside
+contract revision 3; a compatible SDK version change still requires coordinated
+Python gate updates. This replaces the unshipped
 scaffold contracts; complete-buffer live-video APIs are unchanged. Library version
 is `0.92.0-dev`. C declarations below are the binding contract for the concurrent
 Python and signer-adapter work. No commit/publication is implied. A matching
-version string and capability mask do NOT establish ABI/build identity. Explicit
-revision-probe coordination is separate step3 work, not implemented here; no new
-revision API is implied by this contract.
+version string and capability mask do NOT establish ABI/build identity.
+`c2pa_live_video_trusted_vsi_contract_revision()` is a safe, no-argument probe
+returning `uint32_t` contract revision **3**. Consumers require exactly revision
+3 and capability mask 63 before using this trusted ABI. This is a compatibility
+gate, not build authentication: the exact source SHA and artifact hash/evidence
+are still needed. Contract revision is independent of the SDK/library version
+and persisted-state format version, even though the latter also currently equals
+3. It does not guarantee state recovery across builds or settings. The probe is
+absent when `unstable_live_video` is disabled; no existing signature or V1 layout
+changes.
 
 ## Configuration And Modes
 
@@ -107,6 +117,7 @@ are as in generated c2pa.h. Parameters below are in exact ABI order.
 
 ```c
 uint64_t c2pa_live_video_trusted_vsi_capabilities(void);
+uint32_t c2pa_live_video_trusted_vsi_contract_revision(void);
 C2paLiveVideoTrustedVsiSession *c2pa_live_video_trusted_vsi_session_create_callback_v1(
     C2paContext *context, const char *manifest_json, C2paSigningAlg algorithm,
     const unsigned char *public_cose_key, size_t public_cose_key_len,

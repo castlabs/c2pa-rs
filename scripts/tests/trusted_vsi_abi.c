@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include "c2pa.h"
 
+typedef uint32_t (*trusted_revision_fn)(void);
 typedef int64_t (*trusted_sign_fn)(
     struct C2paLiveVideoTrustedVsiSession *, const unsigned char *, uintptr_t, uint32_t,
     const unsigned char **);
@@ -28,6 +29,7 @@ typedef int (*trusted_preflight_fn)(
 #define ABI(fn, type) \
   _Static_assert(_Generic(&fn, type: 1, default: 0), #fn " ABI must match exactly")
 
+ABI(c2pa_live_video_trusted_vsi_contract_revision, trusted_revision_fn);
 ABI(c2pa_live_video_trusted_vsi_session_sign_sig_structure, trusted_sign_fn);
 ABI(c2pa_live_video_trusted_vsi_session_create_callback_v1, trusted_create_fn);
 ABI(c2pa_live_video_trusted_vsi_session_reserve_media_emsg, trusted_reserve_media_fn);

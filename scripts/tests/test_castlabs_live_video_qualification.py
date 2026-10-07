@@ -1,3 +1,4 @@
+import ctypes
 import gzip
 import importlib.util
 import io
@@ -29,6 +30,8 @@ def _valid_header_bytes() -> bytes:
     declarations = "\n".join(
         "C2PA_API extern " + qualification.TRUSTED_SIGN_PROTOTYPE
         if symbol == "c2pa_live_video_trusted_vsi_session_sign_sig_structure"
+        else "C2PA_API extern " + qualification.TRUSTED_REVISION_PROTOTYPE
+        if symbol == "c2pa_live_video_trusted_vsi_contract_revision"
         else f"C2PA_API extern int {symbol}(void);"
         for symbol in qualification.REQUIRED_SYMBOLS
     )
@@ -508,8 +511,9 @@ Symbol {
             (ROOT / relative).read_text(encoding="utf-8")
             for relative in ("c2pa_c_ffi/src/c_api.rs", "c2pa_c_ffi/src/live_video.rs")
         )
-        self.assertEqual(len(qualification.REQUIRED_SYMBOLS), 28)
+        self.assertEqual(len(qualification.REQUIRED_SYMBOLS), 29)
         self.assertEqual(qualification.TRUSTED_VSI_CAPABILITIES, 63)
+        self.assertEqual(qualification.TRUSTED_VSI_CONTRACT_REVISION, 3)
         self.assertEqual(
             len(set(qualification.REQUIRED_SYMBOLS)),
             len(qualification.REQUIRED_SYMBOLS),
@@ -584,13 +588,80 @@ Symbol {
     def test_trusted_capabilities_must_be_fully_wired(self):
         for value, ok in ((63, True), (0, False), (31, False)):
             function = MagicMock(return_value=value)
-            handle = Namespace(c2pa_live_video_trusted_vsi_capabilities=function)
+            revision = MagicMock(return_value=3)
+            handle = Namespace(
+                c2pa_live_video_trusted_vsi_capabilities=function,
+                c2pa_live_video_trusted_vsi_contract_revision=revision,
+            )
             with self.subTest(value=value), patch("ctypes.CDLL", return_value=handle):
                 if ok:
                     qualification.verify_trusted_capabilities(Path("library"))
                 else:
                     with self.assertRaisesRegex(RuntimeError, "expected 63"):
                         qualification.verify_trusted_capabilities(Path("library"))
+            self.assertEqual(function.argtypes, [])
+            self.assertIs(function.restype, ctypes.c_uint64)
+            self.assertEqual(revision.argtypes, [])
+            self.assertIs(revision.restype, ctypes.c_uint32)
+            revision.assert_called_once_with()
+            function.assert_called_once_with()
+
+    def test_trusted_contract_revision_must_be_exactly_three(self):
+        for value in (0, 1, 2, 4):
+            revision = MagicMock(return_value=value)
+            capabilities = MagicMock(return_value=63)
+            handle = Namespace(
+                c2pa_live_video_trusted_vsi_capabilities=capabilities,
+                c2pa_live_video_trusted_vsi_contract_revision=revision,
+            )
+            with self.subTest(value=value), patch("ctypes.CDLL", return_value=handle):
+                with self.assertRaisesRegex(RuntimeError, "expected 3"):
+                    qualification.verify_trusted_capabilities(Path("library"))
+            capabilities.assert_not_called()
+
+    def test_trusted_contract_revision_export_is_required(self):
+        handle = Namespace(
+            c2pa_live_video_trusted_vsi_capabilities=MagicMock(return_value=63)
+        )
+        with patch("ctypes.CDLL", return_value=handle):
+            with self.assertRaisesRegex(RuntimeError, "missing.*revision export"):
+                qualification.verify_trusted_capabilities(Path("library"))
+        symbol = "c2pa_live_video_trusted_vsi_contract_revision"
+        for target in qualification.SUPPORTED_TARGETS:
+            text = "\n".join(
+                f"Export {{\n  Name: {name}\n}}"
+                if "windows" in target
+                else f"1: 0000000000001000 24 FUNC GLOBAL DEFAULT 12 {name}"
+                for name in qualification.REQUIRED_SYMBOLS
+                if name != symbol
+            )
+            with self.subTest(target=target), patch.object(
+                qualification, "_llvm_readobj", return_value=Path("llvm-readobj")
+            ), patch.object(
+                qualification.subprocess, "run", return_value=Namespace(stdout=text)
+            ):
+                with self.assertRaisesRegex(RuntimeError, symbol):
+                    qualification.verify_symbols(Path("library"), target)
+
+    def test_trusted_revision_header_requires_exact_noarg_uint32_prototype(self):
+        version = qualification.workspace_version(ROOT / "Cargo.toml")
+        prototype = qualification.TRUSTED_REVISION_PROTOTYPE
+        for replacement in (
+            "",
+            "// " + prototype,
+            "/* " + prototype + " */",
+            prototype.replace("uint32_t", "uint64_t"),
+            prototype.replace("uint32_t", "int32_t"),
+            prototype.replace("(void)", "()"),
+            prototype.replace("(void)", "(uint32_t revision)"),
+        ):
+            with self.subTest(replacement=replacement), self.assertRaises(ValueError):
+                qualification._validate_header_bytes(
+                    _valid_header_bytes().replace(
+                        ("C2PA_API extern " + prototype).encode(), replacement.encode()
+                    ),
+                    version,
+                )
 
     def test_verify_header_runs_c11_abi_compilation(self):
         with tempfile.TemporaryDirectory() as directory:

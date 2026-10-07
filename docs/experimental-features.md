@@ -120,7 +120,14 @@ expert Sig_structure (2), signer-composed EMSG (4), versioned state
 export/import (8), signing-context V1 (16), and full `u32` handling (32).
 Existing complete-buffer VSI signing is unchanged.
 Current native version is `0.92.0-dev`; version plus capability mask is not an
-ABI/build identity. Explicit revision-probe coordination is separate step3 work.
+ABI/build identity. The safe no-argument C probe
+`uint32_t c2pa_live_video_trusted_vsi_contract_revision(void)` returns 3;
+consumers require exactly contract revision 3 and mask 63. Contract revision is
+independent of SDK/library and persisted-state versions, even though state
+version is also currently 3. It is a compatibility gate, not build authentication
+or a cross-build state-recovery guarantee: exact source SHA and artifact
+hashes/evidence remain necessary. The probe is absent with the feature disabled;
+existing public signatures and V1 layouts are unchanged.
 
 A session is pinned at creation (`options_json`) to one mode:
 

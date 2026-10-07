@@ -111,6 +111,7 @@ REQUIRED_SYMBOLS = (
     "c2pa_live_video_vsi_signer_sign_media_segment_at",
     "c2pa_live_video_moof_sequence_number",
     "c2pa_live_video_trusted_vsi_capabilities",
+    "c2pa_live_video_trusted_vsi_contract_revision",
     "c2pa_live_video_trusted_vsi_session_create_callback_v1",
     "c2pa_live_video_trusted_vsi_session_reserve_init_uuid",
     "c2pa_live_video_trusted_vsi_session_reserved_manifest_id",
@@ -132,6 +133,9 @@ REMOVED_SYMBOLS = (
 )
 # Prehashed trusted VSI capability bits that a qualified build must report.
 TRUSTED_VSI_CAPABILITIES = 63
+# Native compatibility contract, independent of SDK and persisted-state versions.
+TRUSTED_VSI_CONTRACT_REVISION = 3
+TRUSTED_REVISION_PROTOTYPE = "uint32_t c2pa_live_video_trusted_vsi_contract_revision(void);"
 TRUSTED_SIGN_PROTOTYPE = """int64_t c2pa_live_video_trusted_vsi_session_sign_sig_structure(
     struct C2paLiveVideoTrustedVsiSession *session,
     const unsigned char *data,
@@ -393,11 +397,26 @@ def verify_symbols(library: Path, target: str) -> None:
 
 
 def verify_trusted_capabilities(library: Path) -> None:
-    """Loads a host-native library and checks the trusted VSI capability mask."""
+    """Loads a host-native library and checks trusted VSI revision and capabilities."""
     import ctypes
 
     handle = ctypes.CDLL(str(library.resolve()))
-    function = handle.c2pa_live_video_trusted_vsi_capabilities
+    try:
+        revision_function = handle.c2pa_live_video_trusted_vsi_contract_revision
+    except AttributeError as error:
+        raise RuntimeError("missing trusted VSI contract revision export") from error
+    revision_function.argtypes = []
+    revision_function.restype = ctypes.c_uint32
+    revision = int(revision_function())
+    if revision != TRUSTED_VSI_CONTRACT_REVISION:
+        raise RuntimeError(
+            f"trusted VSI contract revision is {revision}, "
+            f"expected {TRUSTED_VSI_CONTRACT_REVISION}"
+        )
+    try:
+        function = handle.c2pa_live_video_trusted_vsi_capabilities
+    except AttributeError as error:
+        raise RuntimeError("missing trusted VSI capabilities export") from error
     function.argtypes = []
     function.restype = ctypes.c_uint64
     capabilities = int(function())
@@ -407,6 +426,7 @@ def verify_trusted_capabilities(library: Path) -> None:
             f"expected {TRUSTED_VSI_CAPABILITIES}"
         )
     print(f"verified trusted VSI capabilities {capabilities}")
+    print(f"verified trusted VSI contract revision {revision}")
 
 
 def workspace_version(manifest: Path = Path("Cargo.toml")) -> str:
@@ -467,6 +487,17 @@ def _validate_header_bytes(data: bytes, expected_version: str) -> None:
         raise ValueError(
             "generated c2pa.h has an incorrect trusted Sig_structure prototype"
         )
+    revision_prototype = re.search(
+        r"\buint32_t\s+c2pa_live_video_trusted_vsi_contract_revision\s*"
+        r"\([^;{}]*\)\s*;",
+        _strip_c_comments(text),
+    )
+    if revision_prototype is None or re.sub(
+        r"\s+", "", revision_prototype.group()
+    ) != re.sub(r"\s+", "", TRUSTED_REVISION_PROTOTYPE):
+        raise ValueError(
+            "generated c2pa.h has an incorrect trusted contract revision prototype"
+        )
 
 
 def verify_header(header: Path, compiler: str | None = None) -> None:
@@ -489,7 +520,7 @@ def verify_header(header: Path, compiler: str | None = None) -> None:
         check=True,
     )
     print(f"verified {len(REQUIRED_SYMBOLS)} required generated header declarations")
-    print("verified exact trusted Sig_structure prototype and C11 ABI assertions")
+    print("verified exact trusted Sig_structure/revision prototypes and C11 ABI assertions")
 
 
 def verify_c2patool_help(executable: Path) -> None:

@@ -320,6 +320,15 @@ pub extern "C" fn c2pa_live_video_trusted_vsi_capabilities() -> u64 {
     c2pa::live_video::TrustedVsiCapabilities::current().bits()
 }
 
+/// Returns trusted VSI native contract revision 3.
+///
+/// This compatibility revision is independent of the SDK version and persisted
+/// state format version. It does not authenticate the library's build identity.
+#[no_mangle]
+pub extern "C" fn c2pa_live_video_trusted_vsi_contract_revision() -> u32 {
+    3
+}
+
 /// Creates a callback-backed prehashed trusted VSI session.
 ///
 /// `public_cose_key` is a public COSE_Key whose algorithm and non-empty `kid`
@@ -1497,6 +1506,12 @@ mod tests {
     #[test]
     fn ffi_trusted_vsi_capabilities_are_fully_wired() {
         assert_eq!(c2pa_live_video_trusted_vsi_capabilities(), 63);
+    }
+
+    #[test]
+    fn ffi_trusted_vsi_contract_revision_is_three() {
+        let probe: extern "C" fn() -> u32 = c2pa_live_video_trusted_vsi_contract_revision;
+        assert_eq!(probe(), 3);
     }
 
     #[test]

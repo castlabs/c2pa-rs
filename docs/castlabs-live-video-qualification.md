@@ -32,7 +32,8 @@ The SDK, C FFI, and feature-enabled `c2patool` test commands are hard gates on b
 
 Qualification also requires every functional trusted-VSI export listed in
 [`trusted-vsi-native-contract.md`](trusted-vsi-native-contract.md), including the
-exact `c2pa_live_video_trusted_vsi_session_sign_sig_structure` prototype, and
+exact `c2pa_live_video_trusted_vsi_session_sign_sig_structure` and
+`uint32_t c2pa_live_video_trusted_vsi_contract_revision(void)` prototypes, and
 rejects the removed expert EMSG skeleton and `recover` symbols in both native
 exports and generated header declarations. `verify-header` compiles
 `scripts/tests/trusted_vsi_abi.c` as C11 with warnings as errors against that
@@ -40,7 +41,13 @@ generated header (`cc` on Linux, `clang` on Windows, or explicit `--compiler`).
 Its static assertions check the exact trusted function types and the V1
 context/status layouts (including the `blocked` status byte).
 `verify-trusted-capabilities` loads the host release library and requires the
-trusted capability mask to equal 63.
+trusted capability mask to equal 63 and contract revision to equal exactly 3.
+The no-argument revision probe is safe to call without a session or callback and
+is absent in feature-off builds. This compatibility gate is independent of the
+SDK/library version and persisted-state format version (currently also 3); it is
+not build authentication or a cross-build state-recovery guarantee. Exact source
+SHA and artifact hashes/evidence remain required. Debug libraries can be checked
+locally with the same command; qualification's release profile is unchanged.
 
 Each platform first generates `cargo-commands.json` from the qualification helper. CI runs the corresponding commands directly, without `eval`; structural tests parse every workflow Cargo run line and require its normalized command list to equal the generated manifest exactly. Evidence consumes and hashes that manifest rather than reconstructing an independent command list.
 
