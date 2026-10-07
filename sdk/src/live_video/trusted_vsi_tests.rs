@@ -154,13 +154,23 @@ fn session_with(
     min_sequence_number: u64,
     opts: TrustedVsiSessionOptions,
 ) -> Harness {
+    session_with_manifest(context, key, min_sequence_number, opts, MANIFEST)
+}
+
+fn session_with_manifest(
+    context: &Arc<Context>,
+    key: &SessionKeyMaterial,
+    min_sequence_number: u64,
+    opts: TrustedVsiSessionOptions,
+    manifest: &str,
+) -> Harness {
     let observations: Observations = Arc::default();
     let corrupt = Arc::new(AtomicBool::new(false));
     let (observed, corrupting, signing_key) =
         (Arc::clone(&observations), Arc::clone(&corrupt), key.clone());
     let session = TrustedVsiPrehashedSession::from_shared_context_with_callback(
         context,
-        MANIFEST,
+        manifest,
         config(key, min_sequence_number),
         opts,
         move |context, tbs| {
@@ -388,19 +398,40 @@ fn expert_mode_end_to_end_for_both_algorithms() {
     }
 }
 
-fn opaque_sig_structure(protected: &[u8], payload: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x84, 0x6a];
-    out.extend_from_slice(b"Signature1");
-    for bytes in [protected, &[][..], payload] {
-        assert!(bytes.len() < 256);
-        if bytes.len() < 24 {
-            out.push(0x40 | bytes.len() as u8);
-        } else {
-            out.extend_from_slice(&[0x58, bytes.len() as u8]);
-        }
-        out.extend_from_slice(bytes);
-    }
-    out
+fn raw_sig_structure(protected: &[u8], payload: &[u8]) -> Vec<u8> {
+    c2pa_cbor::to_vec(&Value::Array(vec![
+        Value::Text("Signature1".into()),
+        Value::Bytes(protected.to_vec()),
+        Value::Bytes(vec![]),
+        Value::Bytes(payload.to_vec()),
+    ]))
+    .unwrap()
+}
+
+fn expert_tbs(key: &SessionKeyMaterial, manifest_id: &str, sequence: u32, iat: i64) -> Vec<u8> {
+    build_vsi_cose_sign1_unsigned(
+        &SegmentInfoMap {
+            sequence_number: u64::from(sequence),
+            bmff_hash: hash_template_value(TrustedVsiInputKind::MediaHash, &[0; 32]).unwrap(),
+            manifest_id: manifest_id.into(),
+            manifest_uri: None,
+        },
+        key.algorithm(),
+        KID,
+        iat,
+    )
+    .unwrap()
+    .tbs_data(b"")
+}
+
+fn native_payload(tbs: &[u8]) -> Vec<u8> {
+    let Value::Array(fields) = c2pa_cbor::from_slice(tbs).unwrap() else {
+        panic!()
+    };
+    let Value::Bytes(payload) = &fields[3] else {
+        panic!()
+    };
+    payload.clone()
 }
 
 fn committed_expert(key: &SessionKeyMaterial, sequence_max: Option<u32>) -> Harness {
@@ -417,13 +448,13 @@ fn committed_expert(key: &SessionKeyMaterial, sequence_max: Option<u32>) -> Harn
 }
 
 #[test]
-fn expert_signs_opaque_payloads_any_order_and_uint32_max_without_counters() {
+fn expert_signs_vsi_payloads_any_order_and_uint32_max_without_counters() {
     let key = ed25519();
     let mut harness = committed_expert(&key, None);
-    let protected = [0xa1, 0x01, 0x27];
-    let tbs = opaque_sig_structure(&protected, b"not a SegmentInfoMap");
+    let id = harness.session.reserved_manifest_id().unwrap().to_string();
     let session_key = key.cose_key(KID);
     for sequence in [500, 10, 500, u32::MAX, 11] {
+        let tbs = expert_tbs(&key, &id, sequence, IAT);
         let signature = harness.session.sign_sig_structure(&tbs, sequence).unwrap();
         verify_raw_session_signature(SigningAlg::Ed25519, &session_key, &tbs, &signature).unwrap();
     }
@@ -431,7 +462,10 @@ fn expert_signs_opaque_payloads_any_order_and_uint32_max_without_counters() {
     let media: Vec<_> = observed.iter().skip(1).collect();
     assert_eq!(media.len(), 5);
     for (context, bytes) in &media {
-        assert_eq!(bytes, &tbs);
+        assert_eq!(
+            bytes,
+            &expert_tbs(&key, &id, context.sequence_number().unwrap(), IAT)
+        );
         assert_eq!(context.event_id(), None);
         assert!(!context.exhaust_after_sign());
     }
@@ -443,30 +477,36 @@ fn expert_rejections_happen_before_key_use() {
     let key = es256();
     let mut harness = committed_expert(&key, Some(20));
     let before = harness.observations.lock().unwrap().len();
-    let good = opaque_sig_structure(&[0xa1, 0x01, 0x26], b"payload");
+    let good = expert_tbs(
+        &key,
+        harness.session.reserved_manifest_id().unwrap(),
+        10,
+        IAT,
+    );
     let mut tagged = vec![0xd2];
     tagged.extend_from_slice(&good);
     let mut trailing = good.clone();
     trailing.push(0x00);
     let mut rejected = vec![
-        (good.clone(), 9),                                           // below min
-        (good.clone(), 21),                                          // above max
-        (tagged, 10),                                                // tagged
-        (trailing, 10),                                              // trailing bytes
-        (opaque_sig_structure(&[0xa1, 0x01, 0x27], b"p"), 10),       // wrong alg
-        (opaque_sig_structure(&[0xa1, 0x02, 0x41, 0x00], b"p"), 10), // missing alg
-        (opaque_sig_structure(&[0xa1, 0x01, 0x38, 0x06], b"p"), 10), // non-minimal -7
-        (
-            opaque_sig_structure(&[0xa2, 0x01, 0x26, 0x01, 0x26], b"p"),
-            10,
-        ), // duplicate
-        (opaque_sig_structure(&[0xbf, 0x01, 0x26, 0xff], b"p"), 10), // indefinite
-        (opaque_sig_structure(&[0xa1, 0x01, 0x26, 0x00], b"p"), 10), // trailing protected
-        (opaque_sig_structure(&[0xa1, 0x41, 0x01, 0x26], b"p"), 10), // bytes label
-        (vec![0x85, 0x6a], 10),                                      // five elements
+        (good.clone(), 9),                                              // below min
+        (good.clone(), 21),                                             // above max
+        (tagged, 10),                                                   // tagged
+        (trailing, 10),                                                 // trailing bytes
+        (raw_sig_structure(&[0xa1, 0x01, 0x27], b"p"), 10),             // wrong alg
+        (raw_sig_structure(&[0xa1, 0x02, 0x41, 0x00], b"p"), 10),       // missing alg
+        (raw_sig_structure(&[0xa1, 0x01, 0x38, 0x06], b"p"), 10),       // non-minimal -7
+        (raw_sig_structure(&[0xa2, 0x01, 0x26, 0x01, 0x26], b"p"), 10), // duplicate
+        (raw_sig_structure(&[0xbf, 0x01, 0x26, 0xff], b"p"), 10),       // indefinite
+        (raw_sig_structure(&[0xa1, 0x01, 0x26, 0x00], b"p"), 10),       // trailing protected
+        (raw_sig_structure(&[0xa1, 0x41, 0x01, 0x26], b"p"), 10),       // bytes label
+        (vec![0x85, 0x6a], 10),                                         // five elements
     ];
     let mut with_aad = good.clone();
-    let aad_at = 1 + 11 + 4;
+    let mut scan = Scanner::new(&good);
+    scan.head().unwrap();
+    scan.value(1).unwrap();
+    scan.bytes().unwrap();
+    let aad_at = scan.position();
     with_aad[aad_at] = 0x41;
     with_aad.insert(aad_at + 1, 0x00);
     rejected.push((with_aad, 10));
@@ -505,12 +545,12 @@ fn expert_rejections_happen_before_key_use() {
         0x00, 0xc1, 0x00,
     ];
     // Keys: 1, 2, 4, "iat", "xtra" (bytewise ordered); nested map has int and bytes keys.
-    let rich_tbs = opaque_sig_structure(&rich, b"p");
+    let rich_tbs = raw_sig_structure(&rich, &native_payload(&good));
     harness
         .session
         .preflight(TrustedVsiOperation::ExpertSign, &rich_tbs, 10, 0, 0, 0, "")
         .unwrap();
-    harness.session.sign_sig_structure(&rich_tbs, 20).unwrap();
+    harness.session.sign_sig_structure(&rich_tbs, 10).unwrap();
 }
 
 #[test]
@@ -518,7 +558,12 @@ fn expert_failure_after_callback_blocks_and_prestate_retries() {
     let key = ed25519();
     let mut harness = committed_expert(&key, None);
     let prestate = harness.session.export_state().unwrap();
-    let tbs = opaque_sig_structure(&[0xa1, 0x01, 0x27], b"payload");
+    let tbs = expert_tbs(
+        &key,
+        harness.session.reserved_manifest_id().unwrap(),
+        10,
+        IAT,
+    );
     harness.corrupt.store(true, Ordering::SeqCst);
     assert!(harness.session.sign_sig_structure(&tbs, 10).is_err());
     assert!(harness.session.status().unwrap().blocked());
@@ -542,6 +587,298 @@ fn expert_failure_after_callback_blocks_and_prestate_retries() {
 }
 
 #[test]
+fn expert_rejects_foreign_certificate_signer_binding_for_both_algorithms() {
+    struct BindingSigner(SessionKeyMaterial, Arc<Mutex<Vec<u8>>>);
+    impl VsiSessionSigner for BindingSigner {
+        fn sign(&self, purpose: VsiSigningPurpose, tbs: &[u8]) -> Result<Vec<u8>> {
+            assert_eq!(purpose, VsiSigningPurpose::SignerBinding);
+            *self.1.lock().unwrap() = tbs.to_vec();
+            Ok(self.0.sign(tbs))
+        }
+    }
+    for key in [ed25519(), es256()] {
+        let mut harness = committed_expert(&key, None);
+        let foreign_cert = test_context().signer().unwrap().certs().unwrap().remove(0);
+        assert_ne!(foreign_cert, harness.session.claim_certificate_der);
+        let captured = Arc::new(Mutex::new(vec![]));
+        build_signer_binding(
+            &foreign_cert,
+            key.algorithm(),
+            &BindingSigner(key.clone(), captured.clone()),
+            &key.cose_key(KID),
+        )
+        .unwrap();
+        let attack = captured.lock().unwrap().clone();
+        let before = harness.session.export_state().unwrap();
+        let calls = harness.observations.lock().unwrap().len();
+        assert!(harness.session.sign_sig_structure(&attack, 10).is_err());
+        // Adding an otherwise valid VSI protected header cannot turn the
+        // detached certificate bstr into a media segment payload either.
+        let genuine = expert_tbs(
+            &key,
+            harness.session.reserved_manifest_id().unwrap(),
+            10,
+            IAT,
+        );
+        let Value::Array(fields) = c2pa_cbor::from_slice(&genuine).unwrap() else {
+            panic!()
+        };
+        let Value::Bytes(protected) = &fields[1] else {
+            panic!()
+        };
+        let attack_with_iat = raw_sig_structure(protected, &native_payload(&attack));
+        assert!(harness
+            .session
+            .sign_sig_structure(&attack_with_iat, 10)
+            .is_err());
+        assert!(validate_trusted_vsi_input(
+            TrustedVsiInputKind::SigStructure,
+            key.algorithm(),
+            &attack_with_iat
+        )
+        .is_err());
+        assert_eq!(harness.session.export_state().unwrap(), before);
+        assert_eq!(harness.observations.lock().unwrap().len(), calls);
+    }
+}
+
+#[test]
+fn expert_enforces_signed_fields_shapes_duplicates_and_inclusive_iat() {
+    for key in [ed25519(), es256()] {
+        let mut harness = committed_expert(&key, None);
+        let id = harness.session.reserved_manifest_id().unwrap().to_string();
+        let good = expert_tbs(&key, &id, 10, IAT);
+        let Value::Array(fields) = c2pa_cbor::from_slice(&good).unwrap() else {
+            panic!()
+        };
+        let Value::Bytes(protected) = &fields[1] else {
+            panic!()
+        };
+        let payload = native_payload(&good);
+        let mut oversized_iat = vec![
+            0xa2,
+            0x01,
+            protected_alg_encoding(key.algorithm()).unwrap(),
+            0x63,
+            b'i',
+            b'a',
+            b't',
+            0x1b,
+        ];
+        oversized_iat.extend_from_slice(&(1u64 << 63).to_be_bytes());
+        let negative_iat = expert_tbs(&key, &id, 10, -1);
+        validate_trusted_vsi_input(
+            TrustedVsiInputKind::SigStructure,
+            key.algorithm(),
+            &negative_iat,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_sig_structure(key.algorithm(), &negative_iat)
+                .unwrap()
+                .2,
+            -1
+        );
+        let float_iat_header = [
+            0xa2,
+            0x01,
+            protected_alg_encoding(key.algorithm()).unwrap(),
+            0x63,
+            b'i',
+            b'a',
+            b't',
+            0xf9,
+            0xbc,
+            0x00,
+        ]; // canonical f16 -1.0
+        trusted_cbor::validate_single_value(&float_iat_header, MAX_SMALL_CBOR_LEN).unwrap();
+        let float_iat = raw_sig_structure(&float_iat_header, &payload);
+        assert!(validate_sig_structure(key.algorithm(), &float_iat)
+            .unwrap_err()
+            .to_string()
+            .contains("untagged integer NumericDate"));
+        let sequence_key = b"\x6esequenceNumber";
+        let sequence_at = payload
+            .windows(sequence_key.len())
+            .position(|bytes| bytes == sequence_key)
+            .unwrap()
+            + sequence_key.len();
+        assert_eq!(payload[sequence_at], 10);
+        let mut float_sequence_payload = payload.clone();
+        float_sequence_payload.splice(sequence_at..sequence_at + 1, [0xf9, 0x49, 0x00]); // canonical f16 10.0
+        Scanner::well_formed(&float_sequence_payload)
+            .map(KeyRule::Nested)
+            .unwrap();
+        let float_sequence = raw_sig_structure(protected, &float_sequence_payload);
+        assert!(validate_sig_structure(key.algorithm(), &float_sequence)
+            .unwrap_err()
+            .to_string()
+            .contains("untagged uint32"));
+        let mut rejected = vec![
+            (good.clone(), 11),
+            (raw_sig_structure(&oversized_iat, &payload), 10),
+            (negative_iat, 10),
+            (float_iat, 10),
+            (float_sequence, 10),
+            (expert_tbs(&key, "urn:c2pa:foreign", 10, IAT), 10),
+            (expert_tbs(&key, &id, 10, 1_577_836_799), 10),
+            (expert_tbs(&key, &id, 10, 2_577_836_801), 10),
+            (
+                raw_sig_structure(
+                    &[0xa1, 0x01, protected_alg_encoding(key.algorithm()).unwrap()],
+                    &payload,
+                ),
+                10,
+            ),
+            (
+                raw_sig_structure(protected, &[payload.as_slice(), &[0]].concat()),
+                10,
+            ),
+            (
+                raw_sig_structure(protected, &[&[0xc1], payload.as_slice()].concat()),
+                10,
+            ),
+        ];
+        let mut duplicate = payload.clone();
+        duplicate[0] += 1;
+        duplicate.extend(c2pa_cbor::to_vec(&Value::Text("sequenceNumber".into())).unwrap());
+        duplicate.push(10);
+        rejected.push((raw_sig_structure(protected, &duplicate), 10));
+        let bmff_hash = c2pa_cbor::to_vec(
+            &hash_template_value(TrustedVsiInputKind::MediaHash, &[0; 32]).unwrap(),
+        )
+        .unwrap();
+        let at = payload
+            .windows(bmff_hash.len())
+            .position(|bytes| bytes == bmff_hash)
+            .unwrap();
+        let mut duplicate_hash = bmff_hash.clone();
+        duplicate_hash[0] += 1;
+        duplicate_hash.extend(c2pa_cbor::to_vec(&Value::Text("hash".into())).unwrap());
+        duplicate_hash.extend(c2pa_cbor::to_vec(&Value::Bytes(vec![0; 32])).unwrap());
+        let duplicate_nested = [
+            &payload[..at],
+            &duplicate_hash,
+            &payload[at + bmff_hash.len()..],
+        ]
+        .concat();
+        rejected.push((raw_sig_structure(protected, &duplicate_nested), 10));
+        for changed in ["name", "alg", "exclusions"] {
+            let Value::Map(mut fields) = Value::from_tagged_slice(&payload).unwrap() else {
+                panic!()
+            };
+            let Value::Map(hash) = fields.get_mut(&Value::Text("bmffHash".into())).unwrap() else {
+                panic!()
+            };
+            if changed == "exclusions" {
+                let Value::Array(exclusions) =
+                    hash.get_mut(&Value::Text("exclusions".into())).unwrap()
+                else {
+                    panic!()
+                };
+                let Value::Map(exclusion) = &mut exclusions[0] else {
+                    panic!()
+                };
+                exclusion.insert(Value::Text("xpath".into()), Value::Text("/mdat".into()));
+            } else {
+                hash.insert(
+                    Value::Text(changed.into()),
+                    Value::Text(
+                        if changed == "alg" {
+                            "sha384"
+                        } else {
+                            "other segment"
+                        }
+                        .into(),
+                    ),
+                );
+            }
+            assert_eq!(
+                hash.get(&Value::Text("hash".into())),
+                Some(&Value::Bytes(vec![0; 32]))
+            );
+            let near_miss =
+                raw_sig_structure(protected, &c2pa_cbor::to_vec(&Value::Map(fields)).unwrap());
+            assert!(validate_sig_structure(key.algorithm(), &near_miss)
+                .unwrap_err()
+                .to_string()
+                .contains("supported native media template"));
+            rejected.push((near_miss, 10));
+        }
+        for (field, value) in [
+            ("sequenceNumber", Value::Integer(-1)),
+            ("sequenceNumber", Value::Integer(i64::from(u32::MAX) + 1)),
+            (
+                "sequenceNumber",
+                Value::Tag(1, Box::new(Value::Integer(10))),
+            ),
+            ("manifestId", Value::Bytes(id.as_bytes().to_vec())),
+            ("bmffHash", Value::Array(vec![])),
+            ("manifestUri", Value::Null),
+            ("extra", Value::Bool(true)),
+        ] {
+            let Value::Map(mut map) = c2pa_cbor::from_slice(&payload).unwrap() else {
+                panic!()
+            };
+            map.insert(Value::Text(field.into()), value);
+            rejected.push((
+                raw_sig_structure(protected, &c2pa_cbor::to_vec(&Value::Map(map)).unwrap()),
+                10,
+            ));
+        }
+        for value in [
+            Value::Text(IAT.to_string()),
+            Value::Tag(1, Box::new(Value::Integer(IAT.into()))),
+        ] {
+            let Value::Map(mut map) = c2pa_cbor::from_slice(protected).unwrap() else {
+                panic!()
+            };
+            map.insert(Value::Text("iat".into()), value);
+            let value = Value::Map(map);
+            let header = trusted_cbor::encode_deterministic(&value).unwrap();
+            rejected.push((raw_sig_structure(&header, &payload), 10));
+        }
+        let before = harness.session.export_state().unwrap();
+        let calls = harness.observations.lock().unwrap().len();
+        for (tbs, sequence) in rejected {
+            assert!(harness
+                .session
+                .preflight(TrustedVsiOperation::ExpertSign, &tbs, sequence, 0, 0, 0, "")
+                .is_err());
+            assert!(harness.session.sign_sig_structure(&tbs, sequence).is_err());
+            assert_eq!(harness.session.export_state().unwrap(), before);
+        }
+        assert_eq!(harness.observations.lock().unwrap().len(), calls);
+        for iat in [1_577_836_800, IAT, 2_577_836_800] {
+            let tbs = expert_tbs(&key, &id, 10, iat);
+            harness.session.sign_sig_structure(&tbs, 10).unwrap();
+            assert_eq!(
+                &harness.observations.lock().unwrap().last().unwrap().1,
+                &tbs
+            );
+        }
+        let Value::Map(mut fields) = c2pa_cbor::from_slice(&payload).unwrap() else {
+            panic!()
+        };
+        fields.insert(
+            Value::Text("manifestUri".into()),
+            Value::Map(BTreeMap::from([
+                (
+                    Value::Text("url".into()),
+                    Value::Text("https://example.test/manifest".into()),
+                ),
+                (Value::Text("alg".into()), Value::Text("sha256".into())),
+                (Value::Text("hash".into()), Value::Bytes(vec![1; 32])),
+            ])),
+        );
+        let with_uri =
+            raw_sig_structure(protected, &c2pa_cbor::to_vec(&Value::Map(fields)).unwrap());
+        harness.session.sign_sig_structure(&with_uri, 10).unwrap();
+        assert_eq!(harness.session.export_state().unwrap(), before);
+    }
+}
+
+#[test]
 fn mode_is_pinned() {
     let key = ed25519();
     let mut expert = committed_expert(&key, None);
@@ -557,7 +894,12 @@ fn mode_is_pinned() {
     );
     establish_init(&mut composed);
     composed.session.commit_init_uuid().unwrap();
-    let tbs = opaque_sig_structure(&[0xa1, 0x01, 0x27], b"payload");
+    let tbs = expert_tbs(
+        &key,
+        composed.session.reserved_manifest_id().unwrap(),
+        10,
+        IAT,
+    );
     assert!(composed.session.sign_sig_structure(&tbs, 10).is_err());
     assert_eq!(composed.observations.lock().unwrap().len(), 1);
 }
@@ -763,7 +1105,272 @@ fn init_reservation_is_frozen_replayable_and_restorable() {
     );
     let fresh_reservation = fresh.session.reserve_init_uuid("mp4").unwrap();
     assert_eq!(fresh_reservation.manifest_id(), reservation.manifest_id());
-    assert_eq!(fresh_reservation.bytes().len(), reservation.bytes().len());
+    assert_eq!(fresh_reservation.bytes(), reservation.bytes());
+}
+
+#[test]
+fn import_and_finalize_bind_entire_reservation_not_editable_identity_digest() {
+    for key in [ed25519(), es256()] {
+        let base = Arc::new(EphemeralSigner::new("trusted-vsi-content.local").unwrap());
+        let counted = da_context(&base, &[("com.example.slot", 64), ("com.example.slot", 96)]);
+        let opts = options(TrustedVsiMode::ExpertSigStructure, None);
+        let mut definition: serde_json::Value = serde_json::from_str(MANIFEST).unwrap();
+        definition["title"] = "expected title".into();
+        definition["assertions"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"label":"com.example.static","data":{"value":"expected"}}));
+        definition["claim_generator_info"] =
+            serde_json::json!([{"name":"trusted test","version":"1","custom":"expected"}]);
+        let expected_manifest = definition.to_string();
+        for changed in ["title", "static", "generator"] {
+            let mut foreign = definition.clone();
+            match changed {
+                "title" => foreign["title"] = "foreign! title".into(),
+                "static" => foreign["assertions"][1]["data"]["value"] = "foreign!".into(),
+                _ => foreign["claim_generator_info"][0]["custom"] = "foreign!".into(),
+            }
+            let mut source = session_with_manifest(
+                &counted.context,
+                &key,
+                1,
+                opts.clone(),
+                &foreign.to_string(),
+            );
+            source.session.reserve_init_uuid("mp4").unwrap();
+            let reserved = source.session.export_state().unwrap();
+            establish_init(&mut source);
+            let finalized = source.session.export_state().unwrap();
+            source.session.commit_init_uuid().unwrap();
+            let committed = source.session.export_state().unwrap();
+            let mut genuine_signed =
+                session_with_manifest(&counted.context, &key, 1, opts.clone(), &expected_manifest);
+            establish_init(&mut genuine_signed);
+            let mut signed_swap: serde_json::Value =
+                serde_json::from_slice(&genuine_signed.session.export_state().unwrap()).unwrap();
+            let foreign_signed: serde_json::Value = serde_json::from_slice(&finalized).unwrap();
+            signed_swap["state"]["signed_uuid"] = foreign_signed["state"]["signed_uuid"].clone();
+            signed_swap["state"]["init_hash_input"] =
+                foreign_signed["state"]["init_hash_input"].clone();
+            let signed_swap = serde_json::to_vec(&signed_swap).unwrap();
+            for record in [&reserved, &finalized, &committed, &signed_swap] {
+                let mut target = session_with_manifest(
+                    &counted.context,
+                    &key,
+                    1,
+                    opts.clone(),
+                    &expected_manifest,
+                );
+                let before = target.session.export_state().unwrap();
+                let calls = (
+                    counted.content_calls.load(Ordering::SeqCst),
+                    counted.sign_calls.load(Ordering::SeqCst),
+                );
+                let mut forged: serde_json::Value = serde_json::from_slice(record).unwrap();
+                forged["identity"] = serde_json::from_slice::<serde_json::Value>(&before).unwrap()
+                    ["identity"]
+                    .clone();
+                assert!(
+                    target
+                        .session
+                        .import_state(&serde_json::to_vec(&forged).unwrap())
+                        .is_err(),
+                    "{changed}"
+                );
+                assert_eq!(target.session.export_state().unwrap(), before);
+                assert!(target.observations.lock().unwrap().is_empty());
+                assert_eq!(
+                    (
+                        counted.content_calls.load(Ordering::SeqCst),
+                        counted.sign_calls.load(Ordering::SeqCst)
+                    ),
+                    calls
+                );
+            }
+            // Defense at the signing boundary even for an internally corrupted
+            // reservation, not just the public import path.
+            let mut target =
+                session_with_manifest(&counted.context, &key, 1, opts.clone(), &expected_manifest);
+            let forged: StateRecord = serde_json::from_slice(&reserved).unwrap();
+            target.session.state = forged.state;
+            let before = target.session.export_state().unwrap();
+            let calls = counted.sign_calls.load(Ordering::SeqCst);
+            assert!(target
+                .session
+                .finalize_init_uuid(
+                    &trusted_vsi_hash_template(TrustedVsiInputKind::InitHash).unwrap()
+                )
+                .is_err());
+            assert_eq!(target.session.export_state().unwrap(), before);
+            assert_eq!(counted.sign_calls.load(Ordering::SeqCst), calls);
+            assert!(target.observations.lock().unwrap().is_empty());
+        }
+        let mut genuine =
+            session_with_manifest(&counted.context, &key, 1, opts.clone(), &expected_manifest);
+        let reservation = genuine.session.reserve_init_uuid("mp4").unwrap();
+        let record = genuine.session.export_state().unwrap();
+        let mut repeated =
+            session_with_manifest(&counted.context, &key, 1, opts.clone(), &expected_manifest);
+        assert_eq!(
+            repeated.session.reserve_init_uuid("mp4").unwrap(),
+            reservation
+        );
+        let mut recovered =
+            session_with_manifest(&counted.context, &key, 1, opts.clone(), &expected_manifest);
+        recovered.session.import_state(&record).unwrap();
+        assert_eq!(
+            recovered.session.reserve_init_uuid("mp4").unwrap(),
+            reservation
+        );
+        let hash = trusted_vsi_hash_template(TrustedVsiInputKind::InitHash).unwrap();
+        assert_eq!(
+            genuine.session.finalize_init_uuid(&hash).unwrap(),
+            recovered.session.finalize_init_uuid(&hash).unwrap()
+        );
+        let finalized = genuine.session.export_state().unwrap();
+        let mut restored =
+            session_with_manifest(&counted.context, &key, 1, opts, &expected_manifest);
+        restored.session.import_state(&finalized).unwrap();
+        // Version 2's random-salt state is not reinterpreted as version 3.
+        let mut old: serde_json::Value = serde_json::from_slice(&record).unwrap();
+        old["version"] = 2.into();
+        let mut fresh = session_with_manifest(
+            &counted.context,
+            &key,
+            1,
+            options(TrustedVsiMode::ExpertSigStructure, None),
+            &expected_manifest,
+        );
+        assert!(fresh
+            .session
+            .import_state(&serde_json::to_vec(&old).unwrap())
+            .is_err());
+    }
+}
+
+#[test]
+fn reservation_reconstruction_rejects_injected_resources_and_databoxes() {
+    let key = ed25519();
+    let context = test_context();
+    let opts = options(TrustedVsiMode::ExpertSigStructure, None);
+    let mut genuine = session_with(&context, &key, 1, opts.clone());
+    genuine.session.reserve_init_uuid("mp4").unwrap();
+    for databox in [false, true] {
+        let mut forged: StateRecord =
+            serde_json::from_slice(&genuine.session.export_state().unwrap()).unwrap();
+        let mut store = Store::from_jumbf_with_context(
+            forged.state.reserved_jumbf.as_ref().unwrap(),
+            &mut StatusTracker::default(),
+            &context,
+        )
+        .unwrap();
+        let claim = store.provenance_claim_mut().unwrap();
+        claim.set_reservation_salt_nonce(genuine.session.reservation_nonce_bytes().unwrap());
+        claim.clear_data();
+        let unchanged = store
+            .to_jumbf_internal(genuine.session.claim_signer_reserve_size)
+            .unwrap();
+        assert_eq!(
+            forged.state.reserved_jumbf.as_deref(),
+            Some(unchanged.as_slice())
+        );
+        let unchanged_uuid =
+            Store::get_composed_manifest(&unchanged, INIT_FORMAT, &context).unwrap();
+        assert_eq!(
+            forged.state.reserved_uuid.as_deref(),
+            Some(unchanged_uuid.as_slice())
+        );
+        forged.state.reserved_jumbf = Some(unchanged);
+        forged.state.reserved_uuid = Some(unchanged_uuid);
+        let mut control = session_with(&context, &key, 1, opts.clone());
+        control
+            .session
+            .import_state(&serde_json::to_vec(&forged).unwrap())
+            .unwrap();
+        assert!(control.observations.lock().unwrap().is_empty());
+        let claim = store.provenance_claim_mut().unwrap();
+        if databox {
+            claim
+                .add_databox(
+                    "application/octet-stream",
+                    b"foreign resource".to_vec(),
+                    None,
+                )
+                .unwrap();
+            // A loaded claim retains the original order, which has no databox
+            // store. Include the injected box so the negative artifact is real.
+            claim.set_box_order(vec![
+                crate::jumbf::labels::ASSERTIONS,
+                crate::jumbf::labels::CLAIM,
+                crate::jumbf::labels::SIGNATURE,
+                crate::jumbf::labels::DATABOXES,
+            ]);
+        } else {
+            claim
+                .add_assertion(&crate::assertions::EmbeddedData::new(
+                    "c2pa.thumbnail.claim",
+                    "image/jpeg",
+                    b"foreign resource".to_vec(),
+                ))
+                .unwrap();
+        }
+        claim.clear_data();
+        let jumbf = store
+            .to_jumbf_internal(genuine.session.claim_signer_reserve_size)
+            .unwrap();
+        assert_ne!(
+            forged.state.reserved_jumbf.as_deref(),
+            Some(jumbf.as_slice())
+        );
+        forged.state.reserved_uuid =
+            Some(Store::get_composed_manifest(&jumbf, INIT_FORMAT, &context).unwrap());
+        forged.state.reserved_jumbf = Some(jumbf);
+        let mut fresh = session_with(&context, &key, 1, opts.clone());
+        let before = fresh.session.export_state().unwrap();
+        assert!(fresh
+            .session
+            .import_state(&serde_json::to_vec(&forged).unwrap())
+            .is_err());
+        assert_eq!(fresh.session.export_state().unwrap(), before);
+        assert!(fresh.observations.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn private_reservation_salting_covers_resource_conversion_and_leaves_defaults_random() {
+    for version in [1, 2] {
+        let context = test_context();
+        let label = if version == 1 {
+            "urn:uuid:00112233-4455-4677-8899-aabbccddeeff"
+        } else {
+            "urn:c2pa:00112233-4455-4677-8899-aabbccddeeff"
+        };
+        let definition = serde_json::json!({"claim_version":version,"label":label,"instance_id":"fixed","claim_generator_info":[{"name":"resource-test","icon":{"format":"image/png","identifier":"icon"}}],"assertions":[{"label":"com.example.static","data":{"v":1}}]}).to_string();
+        let build = || {
+            let mut builder = Builder::from_shared_context(&context)
+                .with_definition(&definition)
+                .unwrap();
+            builder.resources.add("icon", b"resource bytes").unwrap();
+            builder
+        };
+        let expected = build()
+            .to_trusted_reservation_store([7; 16])
+            .unwrap()
+            .to_jumbf_internal(1024)
+            .unwrap();
+        assert_eq!(
+            build()
+                .to_trusted_reservation_store([7; 16])
+                .unwrap()
+                .to_jumbf_internal(1024)
+                .unwrap(),
+            expected
+        );
+        assert_ne!(
+            build().to_store().unwrap().to_jumbf_internal(1024).unwrap(),
+            build().to_store().unwrap().to_jumbf_internal(1024).unwrap()
+        );
+    }
 }
 
 #[test]
@@ -851,6 +1458,11 @@ fn dynamic_assertions_keep_order_refresh_and_reservation() {
         ) -> Result<DynamicAssertionContent> {
             let view = claim.assertions().map(|a| (a.url(), a.hash())).collect();
             self.1 .0.lock().unwrap().push((label.to_string(), view));
+            if self.0 == b'b' {
+                let mut content = r#"{"id":"b"}"#.to_string();
+                content.push_str(&" ".repeat(64 - content.len()));
+                return Ok(DynamicAssertionContent::Json(content));
+            }
             let mut content = vec![self.0; 64];
             content[..6].copy_from_slice(&[0xa1, 0x62, b'i', b'd', 0x78, 58]);
             Ok(DynamicAssertionContent::Cbor(content))
@@ -939,6 +1551,18 @@ fn dynamic_assertions_keep_order_refresh_and_reservation() {
         "second DA must see the refreshed first hash"
     );
     assert!(!calls[1].1.iter().any(|(url, _)| url.ends_with("__1")));
+    drop(calls);
+    let record = harness.session.export_state().unwrap();
+    let mut restored = session_with(
+        &context,
+        &key,
+        1,
+        options(TrustedVsiMode::ExpertSigStructure, None),
+    );
+    restored.session.import_state(&record).unwrap();
+    assert!(restored.observations.lock().unwrap().is_empty());
+    assert_eq!(recording.0.lock().unwrap().len(), 2);
+    assert_eq!(restored.session.export_state().unwrap(), record);
 }
 
 #[test]
@@ -1415,10 +2039,15 @@ fn import_rejects_composed_counters_inconsistent_with_history() {
 /// order `{1: -8, "a": 0, 1000: 0}` is rejected.
 #[test]
 fn expert_protected_header_uses_rfc8949_bytewise_order() {
-    let bytewise = [0xa3, 0x01, 0x27, 0x19, 0x03, 0xe8, 0x00, 0x61, b'a', 0x00];
-    let length_first = [0xa3, 0x01, 0x27, 0x61, b'a', 0x00, 0x19, 0x03, 0xe8, 0x00];
-    let accepted = opaque_sig_structure(&bytewise, b"p");
-    let rejected = opaque_sig_structure(&length_first, b"p");
+    let bytewise = [
+        0xa4, 0x01, 0x27, 0x19, 0x03, 0xe8, 0x00, 0x61, b'a', 0x00, 0x63, b'i', b'a', b't', 0x00,
+    ];
+    let length_first = [
+        0xa4, 0x01, 0x27, 0x61, b'a', 0x00, 0x19, 0x03, 0xe8, 0x00, 0x63, b'i', b'a', b't', 0x00,
+    ];
+    let payload = native_payload(&expert_tbs(&ed25519(), "urn:c2pa:test", 1, IAT));
+    let accepted = raw_sig_structure(&bytewise, &payload);
+    let rejected = raw_sig_structure(&length_first, &payload);
     validate_trusted_vsi_input(
         TrustedVsiInputKind::SigStructure,
         SigningAlg::Ed25519,
@@ -1576,7 +2205,7 @@ fn import_rejects_mismatched_dynamic_assertion_declarations() {
     harness.session.reserve_init_uuid("mp4").unwrap();
     let mut value: serde_json::Value =
         serde_json::from_slice(&harness.session.export_state().unwrap()).unwrap();
-    assert_eq!(value["version"], 2);
+    assert_eq!(value["version"], 3);
     assert_eq!(
         value["identity"]["dynamic_assertions"],
         serde_json::json!([{"label": "com.example.functional", "reserve_size": 64}])

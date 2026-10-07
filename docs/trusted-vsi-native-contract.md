@@ -1,10 +1,12 @@
 # Trusted VSI Native Contract
 
-Status: implementation contract, published before functional bodies. Source base:
-`e0f980ec` on `feat/trusted-vsi-functional`. This replaces the unshipped scaffold
-contracts; complete-buffer live-video APIs are unchanged. Library version stays
-`0.91.0-dev`. C declarations below are the binding contract for the concurrent
-Python and signer-adapter work. No commit/publication is implied.
+Status: current native implementation contract. This replaces the unshipped
+scaffold contracts; complete-buffer live-video APIs are unchanged. Library version
+is `0.92.0-dev`. C declarations below are the binding contract for the concurrent
+Python and signer-adapter work. No commit/publication is implied. A matching
+version string and capability mask do NOT establish ABI/build identity. Explicit
+revision-probe coordination is separate step3 work, not implemented here; no new
+revision API is implied by this contract.
 
 ## Configuration And Modes
 
@@ -28,6 +30,20 @@ domain-separates deterministic manifest/instance IDs and assertion salts for
 crash replay; it is NEVER a private-key seed. `signing_time_unix_seconds` is the
 pinned initialization iat, within the configured key validity interval.
 min_sequence_number must fit uint32 and be <= sequence_max.
+
+Trusted reservations alone derive 16-byte salts from SHA-256 over the public
+nonce, a versioned salt domain, artifact kind, and instance-qualified label.
+Their static CBOR/JSON and claim maps are serialized in stable map order so
+serde HashMap iteration cannot change the reconstructed reservation. Binary
+resources are not re-encoded. Ordinary SDK salt and serialization defaults are
+unchanged. Resource references must resolve through the existing Builder path;
+missing resource bytes remain errors, not import-time comparison exemptions.
+
+Legacy `trust.trust_anchors` and `trust.user_anchors` configure the `Manifest`
+trust purpose. They do not supply
+CAWG identity or other purpose anchors, and a missing purpose-specific anchor is
+not permission to fall back to the Manifest set. These fixes do not weaken that
+purpose isolation or change trust defaults.
 
 ## Rust Surface
 
@@ -141,6 +157,15 @@ call. Context is retained by Arc, not consumed. Host owns callback/user_data and
 keeps them alive until session destruction. Handle operations are externally
 serialized; callback buffers must not escape, and callback must not unwind.
 
+A nonempty byte-output allocation or pointer-tracking failure returns -1 with a
+NULL output and retains the allocation/tracking error. This is output-delivery
+failure, not necessarily signer failure: successful native finalization is not
+rolled back or blocked. Init/media finalize retries with the identical hash replay
+the cached signed artifact without another signer call. Reservation retries also
+replay the existing reservation. Expert signatures have no native cache; their
+provider/coordinator still owns exact signature replay and operation-ID binding.
+Reserve-media callback metadata remains cleared when byte delivery fails.
+
 ## Planned Python Mapping
 
 ```python
@@ -208,11 +233,22 @@ state/counters, input bindings, and base64 exact reserved/signed artifacts,
 including the unsigned JUMBF that preserves real manifest IDs, salts and slots.
 It contains no Rust heap snapshot, callback, Context, access secret or private
 key. Import validates artifacts/identity/state consistency before mutation.
-Current format: `{"format": "c2pa.trusted-vsi.state", "version": 2, "identity",
-"state"}`. Version 2 adds `identity.claim_signer_reserve_size` and
-`identity.dynamic_assertions: [{"label", "reserve_size"}]` (registration order)
-and `state.last_media.{signing_time_unix_seconds, timescale, event_duration}`.
-Version 1 (unreleased) is rejected; there is no migration. Import also requires
+Current format: `{"format": "c2pa.trusted-vsi.state", "version": 3, "identity",
+"state"}`. Versions 1 and 2 (unreleased) are rejected; there is no migration or
+silent reinterpretation of their random-salt reservations. Identity retains
+`claim_signer_reserve_size`, ordered `dynamic_assertions: [{"label", "reserve_size"}]`,
+and recorded media timing. Import and init-finalize preflight reconstruct the
+entire unsigned reservation from the pinned base manifest JSON, nonce, config,
+Context and signer/DA declarations, without signing or requesting DA content.
+The expected manifest ID, JUMBF and composed UUID must match byte-for-byte,
+including static assertions, claim metadata, resources/databoxes, native
+placeholders and every DA slot. The editable identity hash is not the content
+binding. Reserved JUMBF is checked even in finalized/committed records. Signed
+init imports additionally reconstruct the finalized store allowing only native
+binding writes, declared DA content and the verified signature, and require full
+equality, preventing changes outside those finalize slots. This does not prove
+the provider provenance of the allowed finalize inputs.
+Import also requires
 the reserved store's DA placeholder slots (every assertion after the native
 session-keys and bmff-hash assertions) to match those declarations exactly in
 count, label, order and reserve size.
@@ -220,28 +256,73 @@ The coordinator must authenticate and atomically persist these records; they are
 not an attacker-controlled interchange format. Expert records contain no per-media
 history and do not consume previous EMSG artifacts.
 
+Recovery requires the original reservation-producing SDK/generator version and
+Context builder settings. Generator version metadata and settings-dependent
+serialization affect the reconstructed bytes; identity checks do not separately
+capture every Context setting. The full rebuild is the content-binding check,
+and changed builds/settings that produce different bytes are rejected fail-closed.
+There is no blanket recovery guarantee across SDK versions or configuration
+changes. During upgrades, retain the original pinned build/settings for pending
+or otherwise recoverable epochs. A newly authorized epoch may use the new build
+without inherently requiring physical key rotation, stream termination or a
+sequence reset; continuous/24-hour epoch lifecycle management is separate work,
+not implemented by this contract. Never weaken reconstruction by trusting an
+editable record version or generator/settings metadata as evidence of origin.
+
+Bounded threat residual: compromise of the private claim-signing key for the
+same pinned certificate, together with an existing valid signerBinding, allows
+an attacker to produce validly signed DA content and init-hash content externally
+while retaining the pinned static reservation. Finalized reconstruction cannot
+recompute DA content without invoking the content callbacks; it checks the allowed
+slots and signature integrity, not whether the authorized provider produced that
+content. Ordinary signature integrity cannot establish provider provenance or
+block this compromised-claim-key case. An authenticated, atomically persisted
+coordinator record remains necessary; native reconstruction does not replace it.
+
 ## Canonical Inputs And Preflight
 
 Expert input: one untagged, definite four-element CBOR array
-`["Signature1", protected_bstr, empty_bstr, opaque_payload_bstr]`.
+`["Signature1", protected_bstr, empty_bstr, vsi_payload_bstr]`.
 Protected bytes are one canonical map with integer/text COSE labels and exactly
-one integer alg (-8 Ed25519, -7 ES256) matching the pinned key. Other headers are
+one integer alg (-8 Ed25519, -7 ES256) matching the pinned key and a required
+integer `"iat"` NumericDate fitting int64. Other headers are
 allowed in the bounded structural domain: integers, bytes, UTF-8 text, arrays,
 maps, bool/null, tagged VALUES, and preferred-width floats (canonical half NaN).
 Nested map keys are integer/bytes/text; outer protected keys are integer/text.
 Reject indefinite lengths, nonminimal integers/lengths/floats, duplicate keys,
 non-deterministic key order, malformed UTF-8, trailing
 bytes, excessive nesting/items and unsupported simple/key forms. Max total expert
-input 1 MiB, protected/hash CBOR 64 KiB, nesting 32, aggregate container items 4096.
+input 1 MiB, protected/hash CBOR 64 KiB, nesting 32, aggregate container items 4096
+per decoded CBOR value.
 Key order is RFC 8949 §4.2.1 core deterministic encoding (referenced by COSE,
 RFC 9052): keys strictly increasing in BYTEWISE lexicographic order of their
 complete encodings. It is NOT the obsolete RFC 7049 §3.9 length-first rule. For
 example `{1: -7, 1000: 0, "a": 0}` (`a3 01 26 19 03e8 00 61 61 00`) is accepted,
 while the length-first order `{1: -7, "a": 0, 1000: 0}` is rejected. Native
 templates and all native deterministic encoding use the same bytewise order.
-The opaque payload is NOT recursively decoded or required to be SegmentInfoMap.
-No sequence or iat is inferred from it. Sign original input bytes unchanged;
-verify the returned raw 64-byte signature against those same bytes.
+The payload MUST be a bounded untagged segment-info map with exactly the supported
+fields/types: `sequenceNumber` (uint32), `manifestId` (nonempty text), `bmffHash`
+(untagged native SHA-256 media-template map with a 32-byte hash), and optional
+`manifestUri` (untagged hashed-URI map with text `url`, byte-string `hash`, optional
+text `alg`, and no extra fields). Duplicates, tags around signed fields, unknown
+fields, trailing bytes and type coercions are rejected. Payload map field order
+is NOT required to be deterministic: native serde struct serialization remains
+interoperable. Definite/minimal encoding and nesting/item bounds still apply.
+Session signing/preflight requires signed `sequenceNumber` to equal the supplied
+u32, signed `manifestId` to equal the pinned init, and protected `iat` to lie
+within the inclusive key validity interval. Static validation checks shape/types
+but cannot check a session identity or validity interval. A detached signerBinding
+certificate bstr is not a VSI map and cannot be signed under purpose `Vsi`.
+Sign original input bytes unchanged; verify the returned raw 64-byte signature
+against those same bytes. Repeated/out-of-order expert sequences remain supported
+without media counters.
+
+The exact native media bmffHash template is an intentional trusted-expert profile
+limit, not a claim that every otherwise legal C2PA bmff-hash variant is supported.
+Only the 32-byte digest may vary: `alg`, `name` and exclusions must remain those
+of the native SHA-256 media template. Alternative algorithms/names/exclusions,
+Merkle forms and URL/extensions are rejected, not accepted opportunistically.
+Payload map field-order flexibility does not relax this profile restriction.
 
 Hash inputs are canonical untagged bmff-hash maps (v3, SHA-256), exactly matching
 the native hash template except for the 32-byte `hash` value. Templates contain
@@ -253,7 +334,9 @@ bytes with the reserved box installed; native finalize validates shape, not medi
 bytes it has never received. Only MP4/video/mp4 format is supported here.
 
 Pure static validation and session preflight perform no signing callbacks, key
-use/provisioning, reservation generation or state mutation. Bounded temporary
+use/provisioning, new session identifiers or state mutation. Init-finalize preflight
+reconstructs the expected reserved bytes but does not create a new reservation.
+Bounded temporary
 parsing allocation is permitted. Constructor validates configuration/public key
 and reads the Context claim signer's public certificate, claim reserve size and
 DA declarations (labels and reserve sizes, never content), but does not sign.

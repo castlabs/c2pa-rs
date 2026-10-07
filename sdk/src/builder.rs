@@ -1650,6 +1650,10 @@ impl Builder {
 
     // Convert a Manifest into a Claim
     fn to_claim(&self) -> Result<Claim> {
+        self.to_claim_with_salt_nonce(None)
+    }
+
+    fn to_claim_with_salt_nonce(&self, salt_nonce: Option<[u8; 16]>) -> Result<Claim> {
         // utility function to add created or gathered assertions
         fn add_assertion(
             claim: &mut Claim,
@@ -1714,6 +1718,13 @@ impl Builder {
             ),
         }
         .with_context(self.context.clone());
+
+        #[cfg(feature = "unstable_live_video")]
+        if let Some(nonce) = salt_nonce {
+            claim.set_reservation_salt_nonce(nonce);
+        }
+        #[cfg(not(feature = "unstable_live_video"))]
+        let _ = salt_nonce;
 
         // add claim generator info to claim and resolve icons
         for info in &claim_generator_info {
@@ -2218,6 +2229,11 @@ impl Builder {
     pub(crate) fn to_store(&self) -> Result<Store> {
         let claim = self.to_claim()?;
         self.to_store_with_claim(claim)
+    }
+
+    #[cfg(feature = "unstable_live_video")]
+    pub(crate) fn to_trusted_reservation_store(&self, nonce: [u8; 16]) -> Result<Store> {
+        self.to_store_with_claim(self.to_claim_with_salt_nonce(Some(nonce))?)
     }
 
     /// Converts the `Builder` into a [`Store`] with the specified [`Claim`], usually obtained

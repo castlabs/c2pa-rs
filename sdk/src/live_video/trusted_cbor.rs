@@ -48,6 +48,7 @@ pub(super) struct Scanner<'a> {
     data: &'a [u8],
     pos: usize,
     items: usize,
+    ordered_maps: bool,
 }
 
 impl<'a> Scanner<'a> {
@@ -56,6 +57,15 @@ impl<'a> Scanner<'a> {
             data,
             pos: 0,
             items: 0,
+            ordered_maps: true,
+        }
+    }
+
+    /// Native serde struct maps preserve field order, not deterministic key order.
+    pub(super) fn well_formed(data: &'a [u8]) -> Self {
+        Self {
+            ordered_maps: false,
+            ..Self::new(data)
         }
     }
 
@@ -190,9 +200,12 @@ impl<'a> Scanner<'a> {
 
     fn map_entries(&mut self, count: u64, depth: usize, rule: KeyRule) -> Result<()> {
         let mut previous: Option<&[u8]> = None;
+        let mut seen = std::collections::HashSet::new();
         for _ in 0..count {
             let key = self.key(rule)?;
-            if previous.is_some_and(|previous| previous >= key) {
+            if !seen.insert(key)
+                || (self.ordered_maps && previous.is_some_and(|previous| previous >= key))
+            {
                 return Err(invalid(
                     "map keys are duplicated or not in deterministic order",
                 ));
@@ -213,9 +226,12 @@ impl<'a> Scanner<'a> {
         }
         let mut entries = Vec::new();
         let mut previous: Option<&[u8]> = None;
+        let mut seen = std::collections::HashSet::new();
         for _ in 0..count {
             let key = self.key(rule)?;
-            if previous.is_some_and(|previous| previous >= key) {
+            if !seen.insert(key)
+                || (self.ordered_maps && previous.is_some_and(|previous| previous >= key))
+            {
                 return Err(invalid(
                     "map keys are duplicated or not in deterministic order",
                 ));
@@ -455,6 +471,23 @@ mod tests {
         bad(&[0xa2, 0x61, b'a', 0x00, 0x19, 0x03, 0xe8, 0x00]);
         bad(&[0xa1, 0x80, 0x00]); // array key
         bad(&[0xa1, 0xc1, 0x00, 0x00]); // tagged key
+    }
+
+    #[test]
+    fn well_formed_payload_maps_allow_field_order_but_not_duplicates() {
+        let native_order = [0xa2, 0x61, b'b', 0x01, 0x61, b'a', 0x00];
+        let mut scanner = Scanner::well_formed(&native_order);
+        scanner.map(KeyRule::Nested).unwrap();
+        assert!(scanner.at_end());
+        assert!(Scanner::new(&native_order).map(KeyRule::Nested).is_err());
+        let duplicate = [0xa2, 0x61, b'a', 0x01, 0x61, b'a', 0x00];
+        assert!(Scanner::well_formed(&duplicate)
+            .map(KeyRule::Nested)
+            .is_err());
+        let nested_duplicate = [0xa1, 0x61, b'a', 0xa2, 0x01, 0x00, 0x01, 0x00];
+        assert!(Scanner::well_formed(&nested_duplicate)
+            .map(KeyRule::Nested)
+            .is_err());
     }
 
     /// RFC 8949 §4.2.1 core deterministic encoding (the rule COSE, RFC 9052,

@@ -119,16 +119,26 @@ Rust, C ABI, state, and canonical-input contract is
 expert Sig_structure (2), signer-composed EMSG (4), versioned state
 export/import (8), signing-context V1 (16), and full `u32` handling (32).
 Existing complete-buffer VSI signing is unchanged.
+Current native version is `0.92.0-dev`; version plus capability mask is not an
+ABI/build identity. Explicit revision-probe coordination is separate step3 work.
 
 A session is pinned at creation (`options_json`) to one mode:
 
 - `expert_sig_structure`: `sign_sig_structure(sig_structure, sequence_number)`
-  validates one canonical untagged `["Signature1", protected, h'', payload]`
-  item whose protected algorithm matches the session key, signs the exact bytes
+  validates one untagged `["Signature1", protected, h'', payload]` item with a
+  canonical protected header and a bounded, typed VSI segment-info payload.
+  Its signed sequence and manifest ID must match the supplied sequence and
+  pinned session; protected integer `iat` must be within inclusive key validity.
+  The protected algorithm must match the session key. It signs the exact bytes
   unchanged, verifies the raw 64-byte result, and returns only the signature.
   The processor-supplied sequence is passed unchanged to the callback; there is
   no native counter, event ID, or exhaustion, and `exhaust_after_sign` stays
-  false even at `UINT32_MAX`. The payload is never decoded.
+  false even at `UINT32_MAX`. Payload map field order is not constrained to
+  canonical order, preserving native serde-generated inputs. Detached certificate
+  signerBinding payloads are rejected under media purpose before any callback.
+  The exact native SHA-256 media bmffHash template is an intentional profile
+  limit: only its 32-byte digest may vary, not its algorithm, name or exclusions.
+  This is not support for every otherwise legal C2PA bmff-hash variant.
 - `signer_composed_emsg`: `reserve_media_emsg_at` returns a complete placeholder
   EMSG (pinning sequence, event ID, `iat`, timescale, duration) without signing;
   `finalize_media_emsg` accepts the canonical media bmff-hash map and returns
@@ -142,4 +152,27 @@ in original order, and verifies the result. A failure after an external signing
 call begins blocks the session; retry by importing the pre-operation
 `export_state` record (versioned JSON, no keys) into a new session. Static
 `validate_trusted_vsi_input`, `trusted_vsi_hash_template`, and session
-`preflight` never invoke callbacks, use keys, or mutate state.
+`preflight` never invoke signing/content callbacks, use keys, or mutate state.
+State version 3 uses trusted-reservation-only nonce-derived public salts and
+stable static-map serialization. Import and init-finalize preflight reconstruct
+the entire reservation from pinned inputs and require byte equality, including
+metadata, resources, native placeholders and DA slots; old random-salt state
+versions are rejected. Ordinary SDK salting/serialization defaults are unchanged.
+Recovery requires the original reservation-producing SDK/generator version and
+Context builder settings; identity fields do not capture every Context setting,
+and full reconstruction rejects changed bytes fail-closed. Retain original pinned
+build/settings for pending/recoverable epochs during an upgrade, without trusting
+editable record metadata as proof of origin. Recovery across versions/settings is
+not guaranteed. A newly authorized epoch may use the new build without inherently
+requiring physical key rotation, stream end or sequence reset; continuous epoch
+lifecycle management remains separate, unimplemented work.
+Finalized reconstruction cannot establish provider provenance for DA/init-hash
+content: a compromised private claim key for the same certificate, plus an
+existing valid signerBinding, can produce valid signatures externally. DA content
+cannot be recomputed without content callbacks. Signature integrity alone does
+not block that bounded residual, so authenticated coordinator records remain
+necessary; see the native contract's threat limits.
+C byte delivery failure returns -1/NULL without rolling back successful native
+signing: identical init/media finalization retries replay cached bytes. See the
+native contract for provider-owned expert retries and Manifest-only legacy trust
+anchors; no cross-purpose trust fallback is introduced.

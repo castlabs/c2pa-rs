@@ -19,7 +19,7 @@
 //! Two modes are pinned at construction:
 //!
 //! * `ExpertSigStructure`: the processor composes the exact COSE
-//!   Sig_structure; this session validates its canonical framing, signs the
+//!   Sig_structure; this session validates its framing and VSI fields, signs the
 //!   original bytes unchanged, and returns only the raw signature.
 //! * `SignerComposedEmsg`: this session reserves and finalizes complete EMSG
 //!   boxes around processor-supplied canonical bmff-hash maps.
@@ -58,10 +58,9 @@ use crate::{
 };
 
 const STATE_FORMAT: &str = "c2pa.trusted-vsi.state";
-/// Version 2 pins the Context signer's dynamic-assertion declarations and
-/// claim reserve size in the session identity. Version 1 records lack them and
-/// are rejected (unreleased; no migration).
-const STATE_VERSION: u32 = 2;
+/// Version 3 reconstructs the entire reservation with nonce-derived salts.
+/// Earlier unreleased records used random salts and are rejected, not reinterpreted.
+const STATE_VERSION: u32 = 3;
 const MAX_STATE_LEN: usize = 64 * 1024 * 1024;
 /// Header of a C2PA manifest UUID box: size, type, extended type,
 /// version/flags, `"manifest\0"`, and the Merkle offset.
@@ -167,8 +166,8 @@ pub struct TrustedVsiSessionOptions {
     /// Mode pinned for every operation and import.
     pub mode: TrustedVsiMode,
     /// 32 lowercase hex characters of coordinator-retained public randomness.
-    /// Domain-separates deterministic manifest and instance identifiers. It is
-    /// never used as key material.
+    /// Domain-separates deterministic manifest/instance identifiers and trusted
+    /// reservation salts. It is never used as key material.
     pub reservation_nonce: String,
     /// Pinned initialization time, which must lie within the key validity.
     pub signing_time_unix_seconds: i64,
@@ -590,7 +589,7 @@ fn protected_alg_encoding(algorithm: SigningAlg) -> Result<u8> {
     }
 }
 
-fn validate_protected_header(protected: &[u8], algorithm: SigningAlg) -> Result<()> {
+fn validate_protected_header(protected: &[u8], algorithm: SigningAlg) -> Result<i64> {
     if protected.len() > MAX_SMALL_CBOR_LEN {
         return Err(invalid("protected header exceeds 64 KiB"));
     }
@@ -609,12 +608,25 @@ fn validate_protected_header(protected: &[u8], algorithm: SigningAlg) -> Result<
             "protected alg must be the integer matching the pinned session key algorithm",
         ));
     }
-    Ok(())
+    let iat = entries
+        .iter()
+        .find(|(key, _)| *key == b"\x63iat")
+        .ok_or_else(|| invalid("protected header must contain integer iat"))?;
+    let mut integer = Scanner::new(iat.1);
+    let (major, _, value) = integer.head()?;
+    let magnitude = i64::try_from(value).map_err(|_| invalid("protected iat is outside int64"))?;
+    match major {
+        0 => Ok(magnitude),
+        1 => Ok(-1 - magnitude),
+        _ => Err(invalid(
+            "protected iat must be an untagged integer NumericDate",
+        )),
+    }
 }
 
 /// Validates an expert Sig_structure: one untagged definite four-element
-/// array `["Signature1", protected, h'', payload]`. The payload is opaque.
-fn validate_sig_structure(algorithm: SigningAlg, data: &[u8]) -> Result<()> {
+/// array `["Signature1", protected, h'', payload]` with a bounded VSI map.
+fn validate_sig_structure(algorithm: SigningAlg, data: &[u8]) -> Result<(u32, String, i64)> {
     if data.len() > MAX_SIG_STRUCTURE_LEN {
         return Err(invalid("Sig_structure exceeds 1 MiB"));
     }
@@ -632,18 +644,82 @@ fn validate_sig_structure(algorithm: SigningAlg, data: &[u8]) -> Result<()> {
     if context != expected_context.as_slice() {
         return Err(invalid("Sig_structure context must be \"Signature1\""));
     }
-    validate_protected_header(scanner.bytes()?, algorithm)?;
+    let iat = validate_protected_header(scanner.bytes()?, algorithm)?;
     if !scanner.bytes()?.is_empty() {
         return Err(invalid("external AAD must be empty"));
     }
-    scanner.bytes()?; // opaque payload; intentionally not decoded
+    let payload = scanner.bytes()?;
     if !scanner.at_end() {
         return Err(invalid(format!(
             "Sig_structure has trailing bytes after offset {}",
             scanner.position()
         )));
     }
-    Ok(())
+    let mut payload_scanner = Scanner::well_formed(payload);
+    let entries = payload_scanner.map(KeyRule::Nested)?;
+    if !payload_scanner.at_end() {
+        return Err(invalid("VSI payload has trailing bytes"));
+    }
+    use c2pa_cbor::Value;
+    let signed_sequence = entries
+        .iter()
+        .find(|(key, _)| *key == b"\x6esequenceNumber")
+        .ok_or_else(|| invalid("VSI sequenceNumber is required"))?;
+    let (major, _, sequence) = Scanner::new(signed_sequence.1).head()?;
+    if major != 0 || sequence > u64::from(u32::MAX) {
+        return Err(invalid("VSI sequenceNumber must be an untagged uint32"));
+    }
+    let Value::Map(mut fields) = Value::from_tagged_slice(payload)
+        .map_err(|e| invalid(format!("invalid VSI payload: {e}")))?
+    else {
+        return Err(invalid("VSI payload must be an untagged segment-info map"));
+    };
+    let mut take = |key: &str| fields.remove(&Value::Text(key.into()));
+    let sequence = match take("sequenceNumber") {
+        Some(Value::Integer(value)) => {
+            u32::try_from(value).map_err(|_| invalid("VSI sequenceNumber must be uint32"))?
+        }
+        _ => return Err(invalid("VSI sequenceNumber must be an unsigned integer")),
+    };
+    let manifest_id = match take("manifestId") {
+        Some(Value::Text(value)) if !value.is_empty() => value,
+        _ => return Err(invalid("VSI manifestId must be nonempty text")),
+    };
+    let bmff_hash = take("bmffHash").ok_or_else(|| invalid("VSI bmffHash is required"))?;
+    let hash = match &bmff_hash {
+        Value::Map(map) => match map.get(&Value::Text("hash".into())) {
+            Some(Value::Bytes(bytes)) if bytes.len() == 32 => bytes,
+            _ => return Err(invalid("VSI bmffHash requires a 32-byte hash")),
+        },
+        _ => return Err(invalid("VSI bmffHash must be an untagged map")),
+    };
+    if bmff_hash != hash_template_value(TrustedVsiInputKind::MediaHash, hash)? {
+        return Err(invalid(
+            "VSI bmffHash must match the supported native media template",
+        ));
+    }
+    if let Some(uri) = take("manifestUri") {
+        let Value::Map(mut uri) = uri else {
+            return Err(invalid("VSI manifestUri must be a hashed-URI map"));
+        };
+        if !matches!(uri.remove(&Value::Text("url".into())), Some(Value::Text(_)))
+            || !matches!(
+                uri.remove(&Value::Text("hash".into())),
+                Some(Value::Bytes(_))
+            )
+            || !matches!(
+                uri.remove(&Value::Text("alg".into())),
+                None | Some(Value::Text(_))
+            )
+            || !uri.is_empty()
+        {
+            return Err(invalid("VSI manifestUri has unsupported fields or types"));
+        }
+    }
+    if !fields.is_empty() {
+        return Err(invalid("VSI payload contains unsupported fields"));
+    }
+    Ok((sequence, manifest_id, iat))
 }
 
 fn hash_template_struct(kind: TrustedVsiInputKind, hash: &[u8]) -> Result<BmffHash> {
@@ -721,7 +797,7 @@ pub fn validate_trusted_vsi_input(
     data: &[u8],
 ) -> Result<()> {
     match kind {
-        TrustedVsiInputKind::SigStructure => validate_sig_structure(algorithm, data),
+        TrustedVsiInputKind::SigStructure => validate_sig_structure(algorithm, data).map(|_| ()),
         _ => parse_hash_input(kind, data).map(|_| ()),
     }
 }
@@ -917,6 +993,13 @@ impl TrustedVsiPrehashedSession {
             .to_string())
     }
 
+    fn reservation_nonce_bytes(&self) -> Result<[u8; 16]> {
+        hex::decode(&self.options.reservation_nonce)
+            .map_err(|_| invalid("invalid reservation nonce"))?
+            .try_into()
+            .map_err(|_| invalid("invalid reservation nonce length"))
+    }
+
     fn not_blocked(&self) -> Result<()> {
         if self.state.blocked {
             return Err(invalid(
@@ -974,6 +1057,16 @@ impl TrustedVsiPrehashedSession {
             return self.init_reservation();
         }
 
+        let (manifest_id, jumbf, uuid) = self.reconstruct_init_reservation()?;
+        self.state.phase = Phase::InitReserved;
+        self.state.manifest_id = Some(manifest_id);
+        self.state.reserved_jumbf = Some(jumbf);
+        self.state.reserved_uuid = Some(uuid);
+        self.init_reservation()
+    }
+
+    // Rebuild from pinned inputs, never from fields in an imported record.
+    fn reconstruct_init_reservation(&self) -> Result<(String, Vec<u8>, Vec<u8>)> {
         let mut definition: serde_json::Value = serde_json::from_str(&self.base_manifest_json)
             .map_err(|e| invalid(format!("invalid manifest JSON: {e}")))?;
         let object = definition
@@ -998,7 +1091,8 @@ impl TrustedVsiPrehashedSession {
             SessionKeys::LABEL,
             &self.session_keys(build_signer_binding_placeholder(self.config.algorithm)?),
         )?;
-        let mut store = builder.to_store()?;
+        let nonce = self.reservation_nonce_bytes()?;
+        let mut store = builder.to_trusted_reservation_store(nonce)?;
         let pc = store.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
         pc.add_assertion(&hash_template_struct(
             TrustedVsiInputKind::InitHash,
@@ -1017,11 +1111,7 @@ impl TrustedVsiPrehashedSession {
         let jumbf = store.to_jumbf_internal(self.claim_signer_reserve_size)?;
         let uuid = Store::get_composed_manifest(&jumbf, INIT_FORMAT, &self.context)?;
 
-        self.state.phase = Phase::InitReserved;
-        self.state.manifest_id = Some(manifest_id);
-        self.state.reserved_jumbf = Some(jumbf);
-        self.state.reserved_uuid = Some(uuid);
-        self.init_reservation()
+        Ok((manifest_id, jumbf, uuid))
     }
 
     fn session_keys(&self, signer_binding: c2pa_cbor::Value) -> SessionKeys {
@@ -1077,6 +1167,7 @@ impl TrustedVsiPrehashedSession {
                     .reserved_jumbf
                     .as_deref()
                     .ok_or_else(|| invalid("no initialization UUID is reserved"))?;
+                self.check_reserved_content(&self.state)?;
                 let store = Store::from_jumbf_with_context(
                     jumbf,
                     &mut StatusTracker::default(),
@@ -1112,6 +1203,7 @@ impl TrustedVsiPrehashedSession {
         )?;
         {
             let pc = store.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
+            pc.set_reservation_salt_nonce(self.reservation_nonce_bytes()?);
             pc.update_bmff_hash(hash_template_struct(TrustedVsiInputKind::InitHash, &hash)?)?;
         }
 
@@ -1213,13 +1305,24 @@ impl TrustedVsiPrehashedSession {
                 self.min_sequence_number, self.sequence_max
             )));
         }
-        validate_sig_structure(self.config.algorithm, sig_structure)
+        let (signed_sequence, manifest_id, iat) =
+            validate_sig_structure(self.config.algorithm, sig_structure)?;
+        if signed_sequence != sequence_number || manifest_id != self.reserved_manifest_id()? {
+            return Err(invalid(
+                "signed VSI sequenceNumber or manifestId does not match the request/session",
+            ));
+        }
+        ensure_key_valid_at(
+            &DateT(self.config.created_at.clone()),
+            self.config.validity_period_secs,
+            iat,
+        )
     }
 
     /// Signs exact caller-composed Sig_structure bytes and returns only the
     /// verified raw signature. The processor-supplied sequence is passed to
-    /// the callback unchanged; the payload is never decoded and no counter,
-    /// event, or exhaustion state is kept.
+    /// the callback unchanged after checking the signed VSI sequence, manifest
+    /// identity and protected iat. No counter, event, or exhaustion state is kept.
     pub fn sign_sig_structure(
         &mut self,
         sig_structure: &[u8],
@@ -1486,8 +1589,9 @@ impl TrustedVsiPrehashedSession {
     // ── preflight, status, persistence ──────────────────────────────────────
 
     /// Checks whether an operation would be accepted in the current state
-    /// with the supplied inputs. Performs no callbacks, key use, reservation
-    /// generation, or state mutation. Unused numeric inputs are ignored.
+    /// with the supplied inputs. Performs no signing/content callbacks, key
+    /// use or state mutation. Init finalization reconstructs the pinned
+    /// reservation for full equality. Unused numeric inputs are ignored.
     #[allow(clippy::too_many_arguments)]
     pub fn preflight(
         &self,
@@ -1621,6 +1725,7 @@ impl TrustedVsiPrehashedSession {
             &state.reserved_jumbf,
             &state.reserved_uuid,
         ) {
+            self.check_reserved_content(state)?;
             if Store::get_composed_manifest(jumbf, INIT_FORMAT, &self.context)? != *uuid {
                 return Err(invalid(
                     "reserved UUID does not match the reserved manifest store",
@@ -1651,6 +1756,19 @@ impl TrustedVsiPrehashedSession {
 }
 
 impl TrustedVsiPrehashedSession {
+    fn check_reserved_content(&self, state: &SessionState) -> Result<()> {
+        let (manifest_id, jumbf, uuid) = self.reconstruct_init_reservation()?;
+        if state.manifest_id.as_deref() != Some(manifest_id.as_str())
+            || state.reserved_jumbf.as_deref() != Some(jumbf.as_slice())
+            || state.reserved_uuid.as_deref() != Some(uuid.as_slice())
+        {
+            return Err(invalid(
+                "reserved content does not match the pinned manifest and reservation inputs",
+            ));
+        }
+        Ok(())
+    }
+
     /// Requires the Context signer to still declare exactly the DA set and
     /// claim reserve size pinned at construction.
     fn check_claim_signer_declarations(&self) -> Result<()> {
@@ -1753,7 +1871,7 @@ impl TrustedVsiPrehashedSession {
             .verify_store_strict(None, &self.context)
             .map_err(|e| reject(&format!("claim verification failed: {e}")))?;
 
-        let reserved_store = Store::from_jumbf_with_context(
+        let mut reserved_store = Store::from_jumbf_with_context(
             reserved_jumbf,
             &mut StatusTracker::default(),
             &self.context,
@@ -1824,6 +1942,46 @@ impl TrustedVsiPrehashedSession {
             &mut tracker,
         )? {
             return Err(reject("signerBinding does not verify"));
+        }
+
+        // Rebuild the signed store allowing only the actual finalize writes:
+        // native bindings, declared DA content, and the verified claim signature.
+        // Everything else (including metadata, resources and salts) stays pinned.
+        let expected = reserved_store
+            .provenance_claim_mut()
+            .ok_or(Error::ClaimEncoding)?;
+        expected.set_reservation_salt_nonce(self.reservation_nonce_bytes()?);
+        expected.update_bmff_hash(hash_template_struct(
+            TrustedVsiInputKind::InitHash,
+            &expected_hash,
+        )?)?;
+        expected.replace_assertion(keys.to_assertion()?)?;
+        for (assertion, declaration) in claim
+            .claim_assertion_store()
+            .iter()
+            .rev()
+            .take(self.dynamic_assertions.len())
+            .rev()
+            .zip(&self.dynamic_assertions)
+        {
+            if assertion.assertion().data().len() != declaration.reserve_size
+                || !matches!(
+                    assertion.assertion().decode_data(),
+                    crate::assertion::AssertionData::Cbor(_)
+                        | crate::assertion::AssertionData::Json(_)
+                )
+            {
+                return Err(reject("signed DA content does not fill its declared slot"));
+            }
+            expected
+                .replace_assertion_instance(assertion.assertion().clone(), assertion.instance())?;
+        }
+        expected.clear_data();
+        expected.set_signature_val(claim.signature_val().clone());
+        if reserved_store.to_jumbf_internal(self.claim_signer_reserve_size)? != signed_jumbf {
+            return Err(reject(
+                "signed content differs from the pinned reservation outside finalize slots",
+            ));
         }
         Ok(())
     }

@@ -271,8 +271,25 @@ unsafe fn write_trusted_vsi_bytes(output: *mut *const c_uchar, bytes: Vec<u8>) -
             return -1;
         }
     };
-    *output = to_c_bytes(bytes);
+    #[cfg(test)]
+    let allocated = if len > 0 && FAIL_TRUSTED_OUTPUT.with(|fail| fail.replace(false)) {
+        CimplError::other("injected trusted VSI output allocation failure").set_last();
+        std::ptr::null()
+    } else {
+        to_c_bytes(bytes)
+    };
+    #[cfg(not(test))]
+    let allocated = to_c_bytes(bytes);
+    *output = allocated;
+    if (*output).is_null() && len > 0 {
+        return -1;
+    }
     len
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_TRUSTED_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Accepts `(NULL, 0)` as empty input; otherwise requires a readable buffer.
@@ -469,8 +486,9 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_session_commit_init_uuid(
 
 /// Signs an exact caller-composed COSE Sig_structure without reconstruction.
 ///
-/// `sequence_number` is trusted processor metadata passed unchanged to the
-/// callback; no counter is kept and the payload is not decoded. Returns the
+/// The signed VSI sequence must match `sequence_number`, manifestId must match
+/// the session, and protected integer iat must be within key validity.
+/// Original bytes are signed unchanged; no counter is kept. Returns the
 /// 64-byte signature length or -1; bytes are released with `c2pa_free()`.
 ///
 /// # Safety
@@ -672,7 +690,8 @@ pub unsafe extern "C" fn c2pa_live_video_trusted_vsi_hash_template(
 }
 
 /// Checks whether `operation` would be accepted now with the supplied inputs.
-/// No callback, key use, reservation generation, or mutation. `(NULL, 0)` data
+/// No signing/content callback, key use, or mutation. Init finalization checks
+/// the reconstructed reservation. `(NULL, 0)` data
 /// and a NULL `format` are accepted as empty. Returns 0 or -1.
 ///
 /// # Safety
@@ -1417,13 +1436,45 @@ mod tests {
         );
     }
 
-    /// `["Signature1", << {1: -7} >>, h'', 'test']`
     fn es256_sig_structure() -> Vec<u8> {
-        let mut data = vec![0x84, 0x6a];
-        data.extend_from_slice(b"Signature1");
-        data.extend_from_slice(&[0x43, 0xa1, 0x01, 0x26, 0x40, 0x44]);
-        data.extend_from_slice(b"test");
-        data
+        es256_vsi_tbs("urn:c2pa:static-test", 1)
+    }
+
+    fn es256_vsi_tbs(manifest_id: &str, sequence: u32) -> Vec<u8> {
+        use c2pa_cbor::Value;
+        let hash =
+            c2pa::live_video::trusted_vsi_hash_template(TrustedVsiInputKind::MediaHash).unwrap();
+        let payload = Value::Map(std::collections::BTreeMap::from([
+            (
+                Value::Text("sequenceNumber".into()),
+                Value::Integer(sequence.into()),
+            ),
+            (
+                Value::Text("manifestId".into()),
+                Value::Text(manifest_id.into()),
+            ),
+            (
+                Value::Text("bmffHash".into()),
+                c2pa_cbor::from_slice(&hash).unwrap(),
+            ),
+        ]));
+        c2pa_cbor::to_vec(&Value::Array(vec![
+            Value::Text("Signature1".into()),
+            Value::Bytes(vec![
+                0xa2, 0x01, 0x26, 0x63, b'i', b'a', b't', 0x1a, 0x65, 0x53, 0xf1, 0x00,
+            ]),
+            Value::Bytes(vec![]),
+            Value::Bytes(c2pa_cbor::to_vec(&payload).unwrap()),
+        ]))
+        .unwrap()
+    }
+
+    unsafe fn trusted_manifest_id(session: *const C2paLiveVideoTrustedVsiSession) -> String {
+        let ptr = unsafe { c2pa_live_video_trusted_vsi_session_reserved_manifest_id(session) };
+        assert!(!ptr.is_null());
+        let id = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_string();
+        assert_eq!(unsafe { c2pa_free(ptr.cast()) }, 0);
+        id
     }
 
     unsafe fn trusted_status(
@@ -1446,6 +1497,203 @@ mod tests {
     #[test]
     fn ffi_trusted_vsi_capabilities_are_fully_wired() {
         assert_eq!(c2pa_live_video_trusted_vsi_capabilities(), 63);
+    }
+
+    #[test]
+    fn ffi_trusted_vsi_output_failures_preserve_native_success_and_cached_replay() {
+        unsafe {
+            let context = test_context();
+            let mut state = trusted_state(TrustedMode::Valid);
+            let session = trusted_session(context, "signer_composed_emsg", &mut state);
+            assert!(!session.is_null());
+            let mut output = std::ptr::dangling();
+            FAIL_TRUSTED_OUTPUT.with(|fail| fail.set(true));
+            assert_eq!(write_trusted_vsi_bytes(&mut output, Vec::new()), 0);
+            assert!(output.is_null());
+            assert!(FAIL_TRUSTED_OUTPUT.with(|fail| fail.get()));
+            assert_eq!(
+                c2pa_live_video_trusted_vsi_session_reserve_init_uuid(
+                    session,
+                    c"mp4".as_ptr(),
+                    &mut output
+                ),
+                -1
+            );
+            assert!(output.is_null());
+            assert!(CimplError::last_message()
+                .unwrap()
+                .contains("injected trusted VSI output allocation failure"));
+            assert!(trusted_status(session).init_uuid_pending);
+            assert!(state.observations.is_empty());
+            let len = c2pa_live_video_trusted_vsi_session_reserve_init_uuid(
+                session,
+                c"mp4".as_ptr(),
+                &mut output,
+            );
+            let reserved = take_bytes(output, len);
+            let hash = trusted_template(C2PA_LIVE_VIDEO_TRUSTED_VSI_INPUT_INIT_HASH);
+            FAIL_TRUSTED_OUTPUT.with(|fail| fail.set(true));
+            assert_eq!(
+                c2pa_live_video_trusted_vsi_session_finalize_init_uuid(
+                    session,
+                    hash.as_ptr(),
+                    hash.len(),
+                    &mut output
+                ),
+                -1
+            );
+            assert!(output.is_null());
+            assert_eq!(state.observations.len(), 1);
+            assert!(!trusted_status(session).blocked);
+            let finalized_state = trusted_export(session);
+            let len = c2pa_live_video_trusted_vsi_session_finalize_init_uuid(
+                session,
+                hash.as_ptr(),
+                hash.len(),
+                &mut output,
+            );
+            let signed = take_bytes(output, len);
+            assert_eq!(signed.len(), reserved.len());
+            assert_eq!(state.observations.len(), 1); // cached, not re-signed
+            let recovery = trusted_session(context, "signer_composed_emsg", &mut state);
+            assert_eq!(
+                c2pa_live_video_trusted_vsi_session_import_state(
+                    recovery,
+                    finalized_state.as_ptr(),
+                    finalized_state.len()
+                ),
+                0
+            );
+            let len = c2pa_live_video_trusted_vsi_session_finalize_init_uuid(
+                recovery,
+                hash.as_ptr(),
+                hash.len(),
+                &mut output,
+            );
+            assert_eq!(take_bytes(output, len), signed);
+            assert_eq!(state.observations.len(), 1);
+            assert_eq!(c2pa_free(recovery.cast()), 0);
+            assert_eq!(
+                c2pa_live_video_trusted_vsi_session_commit_init_uuid(session),
+                0
+            );
+            let mut metadata = C2paLiveVideoTrustedVsiSigningContextV1 {
+                purpose: 1,
+                sequence_number: 99,
+                has_sequence_number: true,
+                event_id: 99,
+                has_event_id: true,
+                exhaust_after_sign: true,
+            };
+            FAIL_TRUSTED_OUTPUT.with(|fail| fail.set(true));
+            assert_eq!(
+                c2pa_live_video_trusted_vsi_session_reserve_media_emsg(
+                    session,
+                    1,
+                    1_700_000_000,
+                    90_000,
+                    180_000,
+                    &mut output,
+                    &mut metadata
+                ),
+                -1
+            );
+            assert!(output.is_null());
+            assert_eq!(metadata, C2paLiveVideoTrustedVsiSigningContextV1::empty());
+            assert!(trusted_status(session).media_emsg_pending);
+            let len = c2pa_live_video_trusted_vsi_session_reserve_media_emsg(
+                session,
+                1,
+                1_700_000_000,
+                90_000,
+                180_000,
+                &mut output,
+                &mut metadata,
+            );
+            let reserved = take_bytes(output, len);
+            assert_eq!(metadata.event_id, 1);
+            let hash = trusted_template(C2PA_LIVE_VIDEO_TRUSTED_VSI_INPUT_MEDIA_HASH);
+            FAIL_TRUSTED_OUTPUT.with(|fail| fail.set(true));
+            assert_eq!(
+                c2pa_live_video_trusted_vsi_session_finalize_media_emsg(
+                    session,
+                    hash.as_ptr(),
+                    hash.len(),
+                    &mut output
+                ),
+                -1
+            );
+            assert!(output.is_null());
+            let status = trusted_status(session);
+            assert!(!status.blocked && !status.media_emsg_pending);
+            assert_eq!((status.next_sequence_number, status.next_event_id), (2, 2));
+            assert_eq!(state.observations.len(), 2);
+            let len = c2pa_live_video_trusted_vsi_session_finalize_media_emsg(
+                session,
+                hash.as_ptr(),
+                hash.len(),
+                &mut output,
+            );
+            assert_eq!(take_bytes(output, len).len(), reserved.len());
+            assert_eq!(state.observations.len(), 2);
+            FAIL_TRUSTED_OUTPUT.with(|fail| fail.set(true));
+            assert_eq!(
+                c2pa_live_video_trusted_vsi_session_export_state(session, &mut output),
+                -1
+            );
+            assert!(output.is_null());
+            FAIL_TRUSTED_OUTPUT.with(|fail| fail.set(true));
+            assert_eq!(
+                c2pa_live_video_trusted_vsi_hash_template(
+                    C2PA_LIVE_VIDEO_TRUSTED_VSI_INPUT_MEDIA_HASH,
+                    &mut output
+                ),
+                -1
+            );
+            assert!(output.is_null());
+            assert_eq!(c2pa_free(session.cast()), 0);
+            assert_eq!(c2pa_free(context.cast()), 0);
+        }
+    }
+
+    #[test]
+    fn ffi_trusted_vsi_expert_output_failure_is_not_a_signer_failure() {
+        unsafe {
+            let context = test_context();
+            let mut state = trusted_state(TrustedMode::Valid);
+            let session = trusted_session(context, "expert_sig_structure", &mut state);
+            trusted_establish_init(session);
+            let tbs = es256_vsi_tbs(&trusted_manifest_id(session), 1);
+            let before = trusted_export(session);
+            let mut output = std::ptr::dangling();
+            FAIL_TRUSTED_OUTPUT.with(|fail| fail.set(true));
+            assert_eq!(
+                c2pa_live_video_trusted_vsi_session_sign_sig_structure(
+                    session,
+                    tbs.as_ptr(),
+                    tbs.len(),
+                    1,
+                    &mut output
+                ),
+                -1
+            );
+            assert!(output.is_null());
+            assert_eq!(state.observations.len(), 2); // signature succeeded
+            assert!(!trusted_status(session).blocked);
+            assert_eq!(trusted_export(session), before);
+            // Expert mode has no native signature cache; the provider owns retry.
+            let len = c2pa_live_video_trusted_vsi_session_sign_sig_structure(
+                session,
+                tbs.as_ptr(),
+                tbs.len(),
+                1,
+                &mut output,
+            );
+            assert_eq!(take_bytes(output, len).len(), 64);
+            assert_eq!(state.observations.len(), 3);
+            assert_eq!(c2pa_free(session.cast()), 0);
+            assert_eq!(c2pa_free(context.cast()), 0);
+        }
     }
 
     #[test]
@@ -1708,6 +1956,7 @@ mod tests {
 
             trusted_establish_init(session);
             assert_eq!(state.observations.len(), 1);
+            let manifest_id = trusted_manifest_id(session);
             assert_eq!(
                 state.observations[0],
                 C2paLiveVideoTrustedVsiSigningContextV1::empty()
@@ -1715,6 +1964,27 @@ mod tests {
             let status = trusted_status(session);
             assert!(status.init_uuid_committed && !status.blocked);
             assert!(!status.has_next_sequence_number && !status.has_next_event_id);
+
+            let before = trusted_export(session);
+            for invalid in [
+                es256_vsi_tbs(&manifest_id, 6), // signed/supplied sequence mismatch
+                es256_vsi_tbs("urn:c2pa:foreign", 5),
+            ] {
+                let mut output = std::ptr::dangling();
+                assert_eq!(
+                    c2pa_live_video_trusted_vsi_session_sign_sig_structure(
+                        session,
+                        invalid.as_ptr(),
+                        invalid.len(),
+                        5,
+                        &mut output,
+                    ),
+                    -1
+                );
+                assert!(output.is_null());
+                assert_eq!(state.observations.len(), 1);
+                assert_eq!(trusted_export(session), before);
+            }
 
             // Composed-mode operations are rejected in expert mode.
             let mut output = std::ptr::null();
@@ -1733,6 +2003,7 @@ mod tests {
             );
 
             for sequence in [5, 2, u32::MAX] {
+                let data = es256_vsi_tbs(&manifest_id, sequence);
                 output = std::ptr::null();
                 let len = c2pa_live_video_trusted_vsi_session_sign_sig_structure(
                     session,
@@ -1757,6 +2028,7 @@ mod tests {
             assert!(!trusted_status(session).exhausted);
 
             let pre_state = trusted_export(session);
+            let data = es256_vsi_tbs(&manifest_id, 6);
             state.mode = TrustedMode::Error;
             output = std::ptr::dangling();
             assert_eq!(
