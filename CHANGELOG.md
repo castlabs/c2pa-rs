@@ -15,6 +15,7 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ### Fixed
 
+* Reject a fragment that matches a fragmented BMFF Merkle map without `initHash` as `assertion.bmffHash.malformed` (backport of contentauth/c2pa-rs#2609). Both fragment verifiers, and so `Reader::from_fragment`, `with_fragment` and the new offset-aware entry points, previously skipped hashing such a fragment and reported a match.
 * Preserve each legacy TFRA entry's fragment target when inserting, resizing, or removing BMFF metadata. Offset adjustment rejects unsupported TFRA versions and out-of-bounds tables; previously corrupted tables are not repaired, so regenerate affected assets from the unsigned master. This focused backport does not change the single-file fragmented Merkle writer/relocator or correct other legacy offset tables (STCO, CO64, TFHD, ILOC, SAIO).
 
 ## [0.80.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.79.5...c2pa-v0.80.0)

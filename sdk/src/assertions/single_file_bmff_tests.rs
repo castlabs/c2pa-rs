@@ -1368,3 +1368,139 @@ fn single_file_per_fragment_sidx_belongs_to_the_previous_leaf() {
     let (offset, segment) = &segments[1];
     assert_segment_rejected(&init, segment, *offset, "sidx cut");
 }
+
+// ---------------------------------------------------------------------------
+// A fragmented MerkleMap without initHash is malformed (backport of
+// contentauth/c2pa-rs#2609). Before the guard, a fragment that names such a
+// map was accepted without being hashed at all.
+// ---------------------------------------------------------------------------
+
+fn initless_map() -> super::MerkleMap {
+    super::MerkleMap {
+        unique_id: 1,
+        local_id: 1,
+        count: 1,
+        alg: Some("sha256".into()),
+        init_hash: None,
+        hashes: super::VecByteBuf(vec![serde_bytes::ByteBuf::from(vec![0xaau8; 32])]),
+        fixed_block_size: None,
+        variable_block_sizes: None,
+    }
+}
+
+/// A signed initialization segment whose (caller-supplied) BMFF hash
+/// assertion carries a Merkle map without initHash, and an unrelated
+/// fragment whose merkle box names that map.
+fn initless_init_and_fragment() -> (Vec<u8>, Vec<u8>) {
+    let first_sidx = roots(PER_FRAGMENT_SIDX)
+        .into_iter()
+        .find(|b| b.kind == *b"sidx")
+        .unwrap()
+        .start;
+    let mut bmff = BmffHash::new("jumbf manifest", "sha256", None);
+    bmff.set_default_exclusions();
+    bmff.set_merkle(vec![initless_map()]);
+    let settings = Settings::new()
+        .with_value("verify.verify_after_sign", false)
+        .unwrap();
+    let mut builder = Builder::from_context(Context::new().with_settings(settings).unwrap())
+        .with_definition(DEFINITION)
+        .unwrap();
+    builder.add_assertion("c2pa.hash.bmff.v3", &bmff).unwrap();
+    let mut init = Cursor::new(Vec::new());
+    builder
+        .sign(
+            test_signer(SigningAlg::Es256).as_ref(),
+            "video/mp4",
+            &mut Cursor::new(&PER_FRAGMENT_SIDX[..first_sidx]),
+            &mut init,
+        )
+        .unwrap();
+    // Any fragment whose merkle box names uniqueId 1 / localId 1.
+    let fragment = spec_cut(&sign(PER_FRAGMENT_SIDX)).1[0].1.clone();
+    (init.into_inner(), fragment)
+}
+
+fn assert_malformed(reader: &Reader, what: &str) {
+    assert_eq!(
+        reader.validation_state(),
+        ValidationState::Invalid,
+        "{what}: {reader}"
+    );
+    assert!(
+        reader
+            .validation_results()
+            .and_then(|r| r.active_manifest())
+            .is_some_and(|m| m
+                .failure()
+                .iter()
+                .any(|s| s.code() == crate::validation_status::ASSERTION_BMFFHASH_MALFORMED)),
+        "{what}: expected assertion.bmffHash.malformed, got {reader}"
+    );
+}
+
+#[test]
+fn initless_map_is_malformed_through_the_reader() {
+    let (init, fragment) = initless_init_and_fragment();
+    for offset in [0, init.len() as u64, 12_345] {
+        let reader = Reader::from_fragment_at_offset(
+            "video/mp4",
+            Cursor::new(&init),
+            Cursor::new(&fragment),
+            offset,
+        )
+        .unwrap();
+        assert_malformed(&reader, "from_fragment_at_offset");
+    }
+    let reader =
+        Reader::from_fragment("video/mp4", Cursor::new(&init), Cursor::new(&fragment)).unwrap();
+    assert_malformed(&reader, "from_fragment");
+}
+
+#[tokio::test]
+async fn initless_map_is_malformed_through_the_async_reader() {
+    let (init, fragment) = initless_init_and_fragment();
+    let reader = Reader::from_fragment_at_offset_async(
+        "video/mp4",
+        Cursor::new(&init),
+        Cursor::new(&fragment),
+        init.len() as u64,
+    )
+    .await
+    .unwrap();
+    assert_malformed(&reader, "from_fragment_at_offset_async");
+}
+
+#[test]
+fn initless_map_is_malformed_for_every_fragment_verifier() {
+    let (init, fragment) = initless_init_and_fragment();
+    let mut hash = BmffHash::new("jumbf manifest", "sha256", None);
+    hash.set_default_exclusions();
+    hash.set_merkle(vec![initless_map()]);
+    let malformed = |r: crate::Result<()>| {
+        matches!(&r, Err(crate::Error::C2PAValidation(code))
+            if code == crate::validation_status::ASSERTION_BMFFHASH_MALFORMED)
+    };
+    assert!(malformed(hash.verify_stream_segment_at_offset(
+        &mut Cursor::new(&init),
+        &mut Cursor::new(&fragment),
+        123,
+        None,
+    )));
+    assert!(malformed(hash.verify_stream_segment(
+        &mut Cursor::new(&init),
+        &mut Cursor::new(&fragment),
+        None,
+    )));
+    #[cfg(feature = "file_io")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frag.m4s");
+        std::fs::write(&path, &fragment).unwrap();
+        assert!(malformed(hash.verify_stream_segments(
+            &mut Cursor::new(&init),
+            &vec![path],
+            None,
+        )));
+    }
+}
