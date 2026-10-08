@@ -26,8 +26,7 @@ use crate::{
 
 /// Serialize the `signer_binding` field as COSE_Sign1_Tagged (CBOR tag 18 + content).
 ///
-/// The c2pa_cbor encoder recognizes `__cbor_tag_18__` in `serialize_newtype_struct`
-/// and writes the proper CBOR tag 18 prefix before the inner value.
+/// Use the CBOR crate's tag wrapper rather than a serializer-private marker.
 fn serialize_cose_sign1_tagged<S>(
     value: &c2pa_cbor::Value,
     serializer: S,
@@ -35,21 +34,36 @@ fn serialize_cose_sign1_tagged<S>(
 where
     S: serde::Serializer,
 {
-    serializer.serialize_newtype_struct("__cbor_tag_18__", value)
+    use c2pa_cbor::Value;
+
+    let value = match value {
+        Value::Tag(18, inner) => inner.as_ref(),
+        value => value,
+    };
+    if !matches!(value, Value::Array(items) if matches!(items.as_slice(),
+        [Value::Bytes(_), Value::Map(_), Value::Null | Value::Bytes(_), Value::Bytes(_)]
+    )) {
+        return Err(serde::ser::Error::custom(
+            "signerBinding must be a COSE_Sign1 array with at most one tag 18",
+        ));
+    }
+    c2pa_cbor::tags::Tagged::new(Some(18), value).serialize(serializer)
 }
 
 /// Deserialize the `signer_binding` field.
 ///
-/// The c2pa_cbor decoder transparently strips CBOR tags, so whether the wire
-/// format contains tag 18 (spec-compliant) or a raw bstr (legacy), the inner
-/// value is returned as-is.
+/// Keep the inner representation for tag 18; retain legacy untagged values.
+/// Other tags are not stripped and will fail signer-binding validation.
 fn deserialize_cose_sign1_tagged<'de, D>(
     deserializer: D,
 ) -> std::result::Result<c2pa_cbor::Value, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    c2pa_cbor::Value::deserialize(deserializer)
+    match c2pa_cbor::Value::deserialize(deserializer)? {
+        c2pa_cbor::Value::Tag(18, value) => Ok(*value),
+        value => Ok(value),
+    }
 }
 
 /// A single session key used to verify VSI signatures ([§18.25]).
@@ -68,6 +82,7 @@ pub struct SessionKey {
     /// COSE_Sign1_Tagged binding this key to the signer's certificate.
     ///
     /// Stored internally as the inner COSE_Sign1 content (without tag 18).
+    /// Serialization also accepts one existing tag 18 wrapper without duplicating it.
     /// The CBOR tag 18 is added/stripped transparently during serialization/deserialization.
     #[serde(
         serialize_with = "serialize_cose_sign1_tagged",
@@ -121,7 +136,12 @@ mod tests {
             min_sequence_number: 0,
             created_at: DateT("2026-01-01T00:00:00Z".to_string()),
             validity_period: 3600,
-            signer_binding: c2pa_cbor::Value::Bytes(vec![]),
+            signer_binding: c2pa_cbor::Value::Array(vec![
+                c2pa_cbor::Value::Bytes(vec![]),
+                c2pa_cbor::Value::Map(Default::default()),
+                c2pa_cbor::Value::Null,
+                c2pa_cbor::Value::Bytes(vec![0; 64]),
+            ]),
         }
     }
 
@@ -129,6 +149,76 @@ mod tests {
     fn label_matches_spec() {
         assert_eq!(SessionKeys::LABEL, labels::SESSION_KEYS);
         assert_eq!(SessionKeys::LABEL, "c2pa.session-keys");
+    }
+
+    #[test]
+    fn signer_binding_wire_has_exactly_one_cose_tag() {
+        use c2pa_cbor::Value;
+        use coset::TaggedCborSerializable;
+
+        let original = SessionKeys {
+            keys: vec![SessionKey {
+                signer_binding: Value::Array(vec![
+                    Value::Bytes(vec![]),
+                    Value::Map(Default::default()),
+                    Value::Null,
+                    Value::Bytes(vec![0; 64]),
+                ]),
+                ..minimal_session_key()
+            }],
+        };
+        let bytes = c2pa_cbor::to_vec(&original).unwrap();
+        let mut pretagged = original.clone();
+        pretagged.keys[0].signer_binding =
+            Value::Tag(18, Box::new(original.keys[0].signer_binding.clone()));
+        assert_eq!(c2pa_cbor::to_vec(&pretagged).unwrap(), bytes);
+        let Value::Map(root) = c2pa_cbor::from_slice(&bytes).unwrap() else {
+            panic!("session keys must be a map");
+        };
+        let Value::Array(keys) = &root[&Value::Text("keys".into())] else {
+            panic!("keys must be an array");
+        };
+        let Value::Map(key) = &keys[0] else {
+            panic!("session key must be a map");
+        };
+        let binding = &key[&Value::Text("signerBinding".into())];
+        assert!(matches!(binding, Value::Tag(18, inner) if matches!(**inner, Value::Array(_))));
+        coset::CoseSign1::from_tagged_slice(&c2pa_cbor::to_vec(binding).unwrap()).unwrap();
+        assert!(matches!(
+            key[&Value::Text("createdAt".into())],
+            Value::Tag(0, _)
+        ));
+        let restored: SessionKeys = c2pa_cbor::from_slice(&bytes).unwrap();
+        assert_eq!(restored, original);
+        assert_eq!(c2pa_cbor::to_vec(&restored).unwrap(), bytes);
+    }
+
+    #[test]
+    fn signer_binding_serialization_rejects_invalid_shapes_and_tags() {
+        use c2pa_cbor::Value;
+
+        let key = minimal_session_key();
+        let inner = key.signer_binding.clone();
+        for invalid in [
+            Value::Tag(17, Box::new(inner.clone())),
+            Value::Tag(18, Box::new(Value::Tag(18, Box::new(inner)))),
+            Value::Null,
+            Value::Bytes(vec![0xd2, 0x84]),
+            Value::Array(vec![]),
+            Value::Array(vec![Value::Null; 4]),
+            Value::Array(vec![
+                Value::Bytes(vec![]),
+                Value::Map(Default::default()),
+                Value::Tag(18, Box::new(Value::Null)),
+                Value::Bytes(vec![0; 64]),
+            ]),
+        ] {
+            let invalid_key = SessionKey {
+                signer_binding: invalid,
+                ..key.clone()
+            };
+            assert!(c2pa_cbor::to_vec(&invalid_key).is_err());
+        }
     }
 
     #[test]

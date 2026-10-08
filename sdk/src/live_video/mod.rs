@@ -40,24 +40,33 @@ pub(crate) mod cose_key;
 mod segment_manifest_validation;
 mod session_key_validation;
 mod signing;
+mod trusted_cbor;
+mod trusted_vsi;
 pub mod verifiable_segment_info;
 mod vsi_signing;
 
 pub use ed25519_dalek::SigningKey as Ed25519SessionKey;
 pub use signing::LiveVideoSigner;
+pub use trusted_vsi::{
+    trusted_vsi_compute_hash, trusted_vsi_hash_template, validate_trusted_vsi_input,
+    TrustedVsiCapabilities, TrustedVsiExhaustionReason, TrustedVsiInitUuidReservation,
+    TrustedVsiInputKind, TrustedVsiMediaEmsgReservation, TrustedVsiMode, TrustedVsiOperation,
+    TrustedVsiPrehashedSession, TrustedVsiSessionOptions, TrustedVsiSigningPurpose,
+    TrustedVsiStatus, VsiSigningContextV1,
+};
 pub use vsi_signing::{
     moof_sequence_number, LiveVideoVsiSigner, VsiSessionConfig, VsiSessionSigner, VsiSigningPurpose,
 };
 
 use self::cose_key::kid_from_cose_key;
 use crate::{
-    assertions::{LiveVideoSegment, SessionKey, SessionKeys},
+    assertions::{ContinuityMethod, LiveVideoSegment, SessionKey, SessionKeys},
     error::{Error, Result},
     log_item,
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
-        LIVEVIDEO_INIT_INVALID, LIVEVIDEO_MANIFEST_INVALID, LIVEVIDEO_SEGMENT_INVALID,
-        LIVEVIDEO_SESSIONKEY_INVALID,
+        LIVEVIDEO_CONTINUITY_METHOD_INVALID, LIVEVIDEO_INIT_INVALID, LIVEVIDEO_MANIFEST_INVALID,
+        LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
     },
 };
 
@@ -166,6 +175,36 @@ struct SegmentState {
     manifest_id: String,
 }
 
+/// Vendor informational status for an unobserved range between authenticated segments.
+///
+/// This is not a standard C2PA failure code. Reconcile it with the specification discussion
+/// in [#1025](https://github.com/c2pa-org/specs-core/issues/1025) and the strictly increasing
+/// VSI validation rule in [#2521](https://github.com/c2pa-org/specs-core/pull/2521).
+pub const LIVEVIDEO_SEGMENT_GAP: &str = "com.castlabs.livevideo.segment.gap";
+
+/// Vendor informational status for a first authenticated VSI sequence above its key minimum.
+///
+/// A key minimum is an eligibility bound, not proof that every eligible segment was produced.
+/// Like [`LIVEVIDEO_SEGMENT_GAP`], this reports incomplete observation, not malicious intent.
+pub const LIVEVIDEO_SEGMENT_LEADING_GAP: &str = "com.castlabs.livevideo.segment.leadingGap";
+
+const MAX_SEQUENCE_COVERAGE_RANGES: usize = 1024;
+
+/// Unobserved sequence ranges across this validator's observation intervals.
+///
+/// This is coverage information, not a segment-validity verdict or proof of complete production.
+/// Repeated traversals after an explicit discontinuity are counted as separate observations.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SequenceCoverage {
+    /// Inclusive unobserved ranges, retaining at most the first 1024 observations.
+    pub missing_ranges: Vec<std::ops::RangeInclusive<u64>>,
+    /// Total unobserved sequence numbers, including ranges omitted from `missing_ranges`.
+    /// Saturates at `u128::MAX` over arbitrarily many explicitly reset observation intervals.
+    pub total_missing: u128,
+    /// Whether some range detail was omitted because the retention limit was reached.
+    pub ranges_truncated: bool,
+}
+
 /// Validates a sequence of live video segments against C2PA section 19 rules.
 ///
 /// Supports section [19.3] (per-segment C2PA Manifest Box) and section [19.4] (Verifiable
@@ -186,10 +225,14 @@ pub struct LiveVideoValidator {
     /// [`validate_session_keys`]: LiveVideoValidator::validate_session_keys
     expected_manifest_id: Option<String>,
     manifest_box_init_id: Option<String>,
+    // Retained across playback resets, even without a registered init or nonempty streamId.
+    manifest_box_context: bool,
     init_track_id: Option<u32>,
     init_timescale: Option<u32>,
     init_default_sample_duration: Option<u32>,
     seen_emsg_ids: std::collections::HashSet<u32>,
+    sequence_coverage: SequenceCoverage,
+    suppress_initial_continuity: bool,
 }
 
 impl LiveVideoValidator {
@@ -199,14 +242,87 @@ impl LiveVideoValidator {
             session_keys: Vec::new(),
             expected_manifest_id: None,
             manifest_box_init_id: None,
+            manifest_box_context: false,
             init_track_id: None,
             init_timescale: None,
             init_default_sample_duration: None,
             seen_emsg_ids: std::collections::HashSet::new(),
+            sequence_coverage: SequenceCoverage::default(),
+            suppress_initial_continuity: false,
+        }
+    }
+
+    /// Returns report-only coverage accumulated from authenticated segment observations.
+    ///
+    /// A gap does not invalidate a VSI segment. A manifest-box predecessor mismatch still
+    /// fails that segment, even when its otherwise-validated metadata allows recovery.
+    /// Neither a new initialization segment nor [`Self::reset_continuity`] erases this history.
+    /// Callers remain responsible for bounding the lifetime of their [`StatusTracker`].
+    pub fn sequence_coverage(&self) -> &SequenceCoverage {
+        &self.sequence_coverage
+    }
+
+    /// Starts a caller-requested observation interval, for example after a seek or live join.
+    ///
+    /// Clears only the predecessor and per-interval EMSG replay history, allowing previously
+    /// observed media to be traversed again. Suppresses the leading-gap/init-predecessor
+    /// comparison until the next otherwise-validated observation (failed attempts do not consume
+    /// it). A manifest predecessor field must still be present. Trusted keys, key minima,
+    /// manifest/track binding, signature/hash checks and
+    /// recorded coverage/failures remain intact. Only trusted playback control should call
+    /// this: a stream-supplied discontinuity must not silently reset these comparisons.
+    pub fn reset_continuity(&mut self) {
+        self.previous_segment = None;
+        self.seen_emsg_ids.clear();
+        self.suppress_initial_continuity = true;
+    }
+
+    fn record_sequence_gap(
+        &mut self,
+        sequence_number: u64,
+        key_minimum: Option<u64>,
+        tracker: &mut StatusTracker,
+    ) {
+        let expected = if let Some(previous) = &self.previous_segment {
+            previous
+                .sequence_number
+                .checked_add(1)
+                .map(|value| (value, LIVEVIDEO_SEGMENT_GAP))
+        } else if !self.suppress_initial_continuity {
+            key_minimum.map(|value| (value, LIVEVIDEO_SEGMENT_LEADING_GAP))
+        } else {
+            None
+        };
+        self.suppress_initial_continuity = false;
+        if let Some((expected, code)) = expected.filter(|(expected, _)| sequence_number > *expected)
+        {
+            let end = sequence_number - 1;
+            self.sequence_coverage.total_missing = self
+                .sequence_coverage
+                .total_missing
+                .saturating_add(u128::from(sequence_number - expected));
+            if self.sequence_coverage.missing_ranges.len() < MAX_SEQUENCE_COVERAGE_RANGES {
+                self.sequence_coverage.missing_ranges.push(expected..=end);
+            } else {
+                self.sequence_coverage.ranges_truncated = true;
+            }
+            log_item!(
+                "live_video",
+                format!(
+                    "Unobserved sequence range {expected}..={end} (expected {expected}, received \
+                     {sequence_number}); this does not prove production or malicious removal"
+                ),
+                "LiveVideoValidator"
+            )
+            .validation_status(code)
+            .informational(tracker);
         }
     }
 
     /// Validates an initialization segment ([§19.7.1]).
+    ///
+    /// Clears sequence/key/replay context before validation. For atomic same-stream VSI
+    /// updates that preserve continuity, use [`Self::update_vsi_context`] instead.
     ///
     /// [§19.7.1]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#_live_video_validation_process
     pub fn validate_init_segment(
@@ -218,10 +334,12 @@ impl LiveVideoValidator {
         self.session_keys.clear();
         self.expected_manifest_id = None;
         self.manifest_box_init_id = None;
+        self.manifest_box_context = false;
         self.init_track_id = None;
         self.init_timescale = None;
         self.init_default_sample_duration = None;
         self.seen_emsg_ids.clear();
+        self.suppress_initial_continuity = false;
 
         if segment_manifest_validation::segment_contains_box_type(segment_data, MDAT_BOX_TYPE) {
             fail_validation(
@@ -298,10 +416,20 @@ impl LiveVideoValidator {
             );
         }
         self.manifest_box_init_id = Some(manifest_id.to_string());
+        self.manifest_box_context = true;
         Ok(())
     }
 
     /// Validates a media segment using the per-segment C2PA Manifest Box method ([§19.3]).
+    ///
+    /// The caller must first verify the segment manifest's signature, trust, hard binding and
+    /// assertion integrity. A predecessor-ID mismatch still fails, but becomes a new comparison
+    /// baseline if every other check passes, so one omitted segment does not poison the stream.
+    /// The failure remains logged, and stop-on-first-error still returns an error for that segment.
+    /// Missing/unsupported continuity metadata or any other failure never advances the baseline.
+    /// An authentic later segment delivered early can advance this baseline, causing subsequent
+    /// earlier media to fail ordering until the stream catches up or trusted playback control
+    /// explicitly calls [`Self::reset_continuity`]. Recovery does not erase the chain-break failure.
     ///
     /// [§19.3]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#using_c2pa_manifest_box
     pub fn validate_media_segment(
@@ -314,46 +442,75 @@ impl LiveVideoValidator {
         // `fail_validation` logs failures via `StatusTracker::failure`, which under the
         // default `ErrorBehavior::ContinueWhenPossible` returns `Ok(())` even after logging
         // a real failure — so the `?` calls below do not short-circuit on a failed check.
-        // Snapshot the failure count so a failed segment doesn't become the trusted
-        // continuity baseline for the next one.
+        // Only an otherwise-validated predecessor-ID mismatch may advance the baseline.
         let failures_before = tracker.filter_errors().count();
 
         self.validate_segment_has_c2pa_or_emsg(segment_data, tracker)?;
-        self.validate_continuity_rules(assertion, manifest_id, tracker)?;
-
-        if self.previous_segment.is_none() {
-            match (
-                self.manifest_box_init_id.as_deref(),
-                assertion.previous_manifest_id.as_deref(),
-            ) {
-                (Some(expected), Some(actual)) if expected == actual => {}
-                (Some(_), _) => {
-                    fail_validation(
-                        "first media segment previousManifestId must reference the signed initialization manifest",
-                        LIVEVIDEO_SEGMENT_INVALID,
-                        tracker,
-                    )?;
-                }
-                (None, _) => {}
-            }
-        }
-
         if let Some(previous) = &self.previous_segment {
             self.validate_sequence_number(assertion, previous, tracker)?;
             self.validate_stream_id(assertion, previous, tracker)?;
         }
 
-        if tracker.filter_errors().count() > failures_before {
-            return Ok(());
+        let other_checks_failed = tracker.filter_errors().count() > failures_before;
+        let expected_predecessor = self
+            .previous_segment
+            .as_ref()
+            .map(|previous| previous.manifest_id.as_str())
+            .or(if self.suppress_initial_continuity {
+                None
+            } else {
+                self.manifest_box_init_id.as_deref()
+            });
+        let mut predecessor_mismatch = false;
+        let continuity_result = match &assertion.continuity_method {
+            ContinuityMethod::ManifestId => match (
+                expected_predecessor,
+                assertion.previous_manifest_id.as_deref(),
+            ) {
+                (_, None) if self.suppress_initial_continuity => fail_validation(
+                    "previousManifestId is still required after an explicit continuity reset",
+                    LIVEVIDEO_CONTINUITY_METHOD_INVALID,
+                    tracker,
+                ),
+                (Some(expected), Some(actual)) if expected != actual => {
+                    predecessor_mismatch = true;
+                    fail_validation(
+                        "previousManifestId does not match the preceding media or initialization manifest",
+                        LIVEVIDEO_SEGMENT_INVALID,
+                        tracker,
+                    )
+                }
+                (Some(_), None) => fail_validation(
+                    "previousManifestId is required for the preceding media or initialization manifest",
+                    if self.previous_segment.is_some() {
+                        LIVEVIDEO_CONTINUITY_METHOD_INVALID
+                    } else {
+                        LIVEVIDEO_SEGMENT_INVALID
+                    },
+                    tracker,
+                ),
+                _ => Ok(()),
+            },
+            ContinuityMethod::Unknown(method) => fail_validation(
+                format!("unsupported continuity method: {method}"),
+                LIVEVIDEO_CONTINUITY_METHOD_INVALID,
+                tracker,
+            ),
+        };
+
+        if !other_checks_failed
+            && (predecessor_mismatch || tracker.filter_errors().count() == failures_before)
+        {
+            self.record_sequence_gap(assertion.sequence_number, None, tracker);
+            self.manifest_box_context = true;
+            self.previous_segment = Some(SegmentState {
+                sequence_number: assertion.sequence_number,
+                stream_id: assertion.stream_id.clone(),
+                manifest_id: manifest_id.to_string(),
+            });
         }
 
-        self.previous_segment = Some(SegmentState {
-            sequence_number: assertion.sequence_number,
-            stream_id: assertion.stream_id.clone(),
-            manifest_id: manifest_id.to_string(),
-        });
-
-        Ok(())
+        continuity_result
     }
 
     /// Validates a `c2pa.session-keys` assertion and stores the keys for VSI verification ([§19.4]).
@@ -367,6 +524,8 @@ impl LiveVideoValidator {
     ///
     /// `manifest_id` is the c2pa URN label of that same trusted manifest; every subsequent VSI
     /// segment's `manifestId` is checked against it ([§19.4.4]).
+    /// This initial-setup operation clears installed keys first and may install a valid subset
+    /// in aggregate mode. For all-or-nothing updates use [`Self::update_vsi_context`].
     ///
     /// [§19.4]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#verifiable_segment_info
     /// [§19.4.4]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#_manifest_retrieval_from_the_manifestid_field
@@ -456,6 +615,78 @@ impl LiveVideoValidator {
         Ok(())
     }
 
+    /// Atomically replaces the current VSI init/manifest/key context without resetting
+    /// accepted sequence, replay IDs, coverage or playback-interval suppression.
+    ///
+    /// The caller MUST have verified the manifest with `Reader`, including signature,
+    /// trust, assertion integrity and the applicable init hard binding. The assertion,
+    /// manifest ID and end-entity certificate must come from that same verified context.
+    /// These raw arguments do not establish claim trust. The caller also owns logical-stream
+    /// scope: equal track/timing fields alone do not establish stream identity.
+    ///
+    /// Requires an already initialized track and rejects a manifest-box context. `None`
+    /// retains the current init configuration. A supplied init must pass the existing
+    /// single-track layout checks and exactly match track ID, timescale and optional
+    /// default sample duration. Codec/sample-entry equivalence is not checked here.
+    /// All keys must pass the existing shape and signer-binding checks; multiple keys
+    /// are supported within this one manifest. No old manifest/key context is retained.
+    ///
+    /// `Ok(())` guarantees installation, even with an aggregating tracker. Any error
+    /// leaves all validator state unchanged; diagnostics remain in the tracker. Earlier
+    /// tracker failures do not veto this independently validated update.
+    pub fn update_vsi_context(
+        &mut self,
+        init_segment: Option<&[u8]>,
+        assertion: &SessionKeys,
+        manifest_id: &str,
+        ee_cert_der: Option<&[u8]>,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if self.init_track_id.is_none()
+            || self.init_timescale.is_none()
+            || self.manifest_box_context
+        {
+            fail_validation(
+                "VSI update requires an initialized track outside the manifest-box method",
+                LIVEVIDEO_INIT_INVALID,
+                tracker,
+            )?;
+            return Err(Error::BadParam(LIVEVIDEO_INIT_INVALID.into()));
+        }
+
+        let failures_before = tracker.filter_errors().count();
+        let mut candidate = Self::new();
+        candidate.init_track_id = self.init_track_id;
+        candidate.init_timescale = self.init_timescale;
+        candidate.init_default_sample_duration = self.init_default_sample_duration;
+        if let Some(init) = init_segment {
+            candidate.validate_init_segment(init, tracker)?;
+            if candidate.init_track_id != self.init_track_id
+                || candidate.init_timescale != self.init_timescale
+                || candidate.init_default_sample_duration != self.init_default_sample_duration
+            {
+                fail_validation(
+                    "VSI update must retain track ID, timescale and default sample duration",
+                    LIVEVIDEO_INIT_INVALID,
+                    tracker,
+                )?;
+            }
+        }
+        candidate.validate_session_keys(assertion, manifest_id, ee_cert_der, tracker)?;
+        if tracker.filter_errors().count() != failures_before {
+            return Err(Error::BadParam(
+                "VSI context update was not installed".into(),
+            ));
+        }
+
+        self.init_track_id = candidate.init_track_id;
+        self.init_timescale = candidate.init_timescale;
+        self.init_default_sample_duration = candidate.init_default_sample_duration;
+        self.session_keys = candidate.session_keys;
+        self.expected_manifest_id = candidate.expected_manifest_id;
+        Ok(())
+    }
+
     /// Validates a media segment using the Verifiable Segment Info method ([§19.4]).
     ///
     /// [§19.4]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#verifiable_segment_info
@@ -464,6 +695,7 @@ impl LiveVideoValidator {
         segment_data: &[u8],
         tracker: &mut StatusTracker,
     ) -> Result<()> {
+        let failures_before = tracker.filter_errors().count();
         self.require_session_keys(tracker)?;
         let (parsed, event) = self.extract_and_parse_vsi(segment_data, tracker)?;
         let session_key = self.resolve_session_key(&parsed.sign1, tracker)?;
@@ -480,12 +712,6 @@ impl LiveVideoValidator {
                     return Ok(());
                 }
             };
-
-        // See the comment in `validate_media_segment`: `fail_validation` logs a failure but
-        // still returns `Ok(())` under the default tracker, so these `?` calls do not
-        // short-circuit on failure. Snapshot the failure count so a failed segment doesn't
-        // become the trusted continuity baseline for the next one.
-        let failures_before = tracker.filter_errors().count();
 
         if event.presentation_time_delta != 0 {
             fail_validation(
@@ -551,6 +777,7 @@ impl LiveVideoValidator {
             return Ok(());
         }
 
+        self.record_sequence_gap(seq_num, Some(session_key.min_sequence_number), tracker);
         self.previous_segment = Some(SegmentState {
             sequence_number: seq_num,
             stream_id: String::new(),
@@ -573,6 +800,50 @@ mod manifest_tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn sequence_coverage_retains_bounded_ranges_and_full_count() {
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = StatusTracker::default();
+        validator.previous_segment = Some(SegmentState {
+            sequence_number: 0,
+            stream_id: String::new(),
+            manifest_id: String::new(),
+        });
+        for sequence in (2..=2050).step_by(2) {
+            validator.record_sequence_gap(sequence, None, &mut tracker);
+            validator.previous_segment.as_mut().unwrap().sequence_number = sequence;
+        }
+        let coverage = validator.sequence_coverage();
+        assert_eq!(coverage.missing_ranges.len(), MAX_SEQUENCE_COVERAGE_RANGES);
+        assert_eq!(coverage.total_missing, 1025);
+        assert!(coverage.ranges_truncated);
+        assert_eq!(coverage.missing_ranges[0], 1..=1);
+        assert_eq!(coverage.missing_ranges[1023], 2047..=2047);
+        assert_eq!(tracker.filter_errors().count(), 0);
+    }
+
+    #[test]
+    fn sequence_coverage_handles_large_ranges_and_preserves_history_on_init() {
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = StatusTracker::default();
+        validator.record_sequence_gap(u64::MAX, Some(0), &mut tracker);
+        assert_eq!(
+            validator.sequence_coverage().total_missing,
+            u128::from(u64::MAX)
+        );
+        assert_eq!(
+            validator.sequence_coverage().missing_ranges,
+            vec![0..=u64::MAX - 1]
+        );
+        let coverage = validator.sequence_coverage().clone();
+        let init =
+            include_bytes!("../../tests/fixtures/bunny/bunny_791182bps/BigBuckBunny_2s_init.mp4");
+        validator.validate_init_segment(init, &mut tracker).unwrap();
+        assert_eq!(validator.sequence_coverage(), &coverage);
+        validator.reset_continuity();
+        assert_eq!(validator.sequence_coverage(), &coverage);
+    }
 
     #[test]
     fn live_manifest_injects_spec_version_without_overwriting_generator() {

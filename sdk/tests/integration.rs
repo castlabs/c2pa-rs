@@ -24,7 +24,6 @@ mod integration_1 {
         validation_status::CAWG_X509_CREDENTIAL_UNTRUSTED,
         Builder, Context, Reader, Result, Settings, ValidationState,
     };
-    use c2pa_macros::c2pa_test_async;
     #[allow(unused)] // different code path for WASI
     use tempfile::{tempdir, TempDir};
 
@@ -307,8 +306,8 @@ mod integration_1 {
     }
 
     #[cfg(feature = "file_io")]
-    #[c2pa_test_async]
-    async fn test_cawg_signing_via_settings() -> Result<()> {
+    #[test]
+    fn test_cawg_signing_via_settings() -> Result<()> {
         let settings = Settings::new().with_toml(include_str!(
             "../tests/fixtures/test_settings_with_cawg_signing.toml"
         ))?;
@@ -401,4 +400,89 @@ mod integration_1 {
             Ok(())
         }
     */
+}
+
+/// External callers can allow-list a CAWG X.509 identity credential for an
+/// `X509SignatureVerifier` using only public APIs. The credential is trusted
+/// only when it is registered for the CAWG purpose.
+mod cawg_private_credentials {
+    use std::borrow::Cow;
+
+    use c2pa::{
+        crypto::cose::{CertificateTrustPolicy, Verifier},
+        identity::{
+            builder::CredentialHolder,
+            x509::{X509CredentialHolder, X509SignatureVerifier},
+            SignatureVerifier, SignerPayload,
+        },
+        settings::TrustListKind,
+        status_tracker::StatusTracker,
+        validation_status::{
+            CAWG_X509_CREDENTIAL_TRUSTED, CAWG_X509_CREDENTIAL_UNTRUSTED,
+            CAWG_X509_SIGNATURE_VALIDATED,
+        },
+        HashedUri, SigningAlg,
+    };
+
+    #[test]
+    fn cawg_leaf_can_be_allow_listed_with_public_api() {
+        let cert_chain_pem = include_bytes!("fixtures/crypto/raw_signature/ed25519.pub");
+        let private_key = include_bytes!("fixtures/crypto/raw_signature/ed25519.priv");
+        let cert_chain = pem::parse_many(cert_chain_pem)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.contents().to_vec())
+            .collect();
+        let raw_signer =
+            c2pa_raw_crypto::signer_from_private_key(private_key, SigningAlg::Ed25519).unwrap();
+        let holder = X509CredentialHolder::from_raw_signer(raw_signer, cert_chain);
+
+        let signer_payload = SignerPayload {
+            referenced_assertions: vec![HashedUri::new(
+                "self#jumbf=c2pa.assertions/c2pa.hash.data".into(),
+                Some("sha256".into()),
+                &[1; 32],
+            )],
+            sig_type: holder.sig_type().to_owned(),
+            roles: vec![],
+        };
+        let signature = holder.sign(&signer_payload).unwrap();
+
+        // `None` exercises the manifest-only legacy allow-list API.
+        for purpose in [
+            None,
+            Some(TrustListKind::Manifest),
+            Some(TrustListKind::CAWG),
+            Some(TrustListKind::TSA),
+        ] {
+            let mut policy = CertificateTrustPolicy::default();
+            match &purpose {
+                Some(kind) => policy
+                    .add_end_entity_credentials_for(cert_chain_pem, kind.clone())
+                    .unwrap(),
+                None => policy.add_end_entity_credentials(cert_chain_pem).unwrap(),
+            }
+            let verifier = X509SignatureVerifier {
+                cose_verifier: Verifier::VerifyTrustPolicy(Cow::Owned(policy)),
+            };
+
+            let mut log = StatusTracker::default();
+            verifier
+                .check_signature(&signer_payload, &signature, &mut log)
+                .unwrap();
+
+            let trusted = purpose == Some(TrustListKind::CAWG);
+            assert!(log.has_status(CAWG_X509_SIGNATURE_VALIDATED), "{log:?}");
+            assert_eq!(
+                log.has_status(CAWG_X509_CREDENTIAL_TRUSTED),
+                trusted,
+                "purpose={purpose:?}, {log:?}"
+            );
+            assert_eq!(
+                log.has_status(CAWG_X509_CREDENTIAL_UNTRUSTED),
+                !trusted,
+                "purpose={purpose:?}, {log:?}"
+            );
+        }
+    }
 }

@@ -150,12 +150,12 @@ The `Settings` definition has the following top-level structure:
 {
   "version": 1,
   "trust": { ... },
-  "cawg_trust": { ... },
   "core": { ... },
   "verify": { ... },
   "builder": { ... },
   "signer": { ... },
-  "cawg_x509_signer": { ... }
+  "cawg_x509_signer": { ... },
+  "soft_binding": { ... }
 }
 ```
 
@@ -170,12 +170,12 @@ For a complete reference to all the `Settings` properties, see the [SDK object r
 |----------|-------------|
 | `version` | Settings format version (integer). The default and only supported value is 1. |
 | [`builder`](https://opensource.contentauthenticity.org/docs/manifest/json-ref/settings-schema#buildersettings) | Configuration for [Builder](https://docs.rs/c2pa/latest/c2pa/struct.Builder.html). |
-| [`cawg_trust`](https://opensource.contentauthenticity.org/docs/manifest/json-ref/settings-schema#trust) | Configuration for CAWG trust lists. |
 | [`cawg_x509_signer`](https://opensource.contentauthenticity.org/docs/manifest/json-ref/settings-schema#signersettings) | Configuration for the [CAWG x.509 signer](https://docs.rs/c2pa/latest/c2pa/struct.Settings.html#structfield.signer). |
 | [`core`](https://opensource.contentauthenticity.org/docs/manifest/json-ref/settings-schema#core) | Configuration for core features. |
 | [`signer`](https://opensource.contentauthenticity.org/docs/manifest/json-ref/settings-schema#signersettings) | Configuration for the base [C2PA signer](https://docs.rs/c2pa/latest/c2pa/struct.Settings.html#structfield.signer). |
-| [`trust`](https://opensource.contentauthenticity.org/docs/manifest/json-ref/settings-schema#trust) | Configuration for C2PA trust lists. |
+| [`trust`](https://opensource.contentauthenticity.org/docs/manifest/json-ref/settings-schema#trust) | Configuration for C2PA claim generator trust lists, CAWG trust lists & TSA time-stamp trust lists |
 | [`verify`](https://opensource.contentauthenticity.org/docs/manifest/json-ref/settings-schema#verify) | Configuration for verification (validation). |
+| [`soft_binding`](https://opensource.contentauthenticity.org/docs/manifest/json-ref/settings-schema#soft_binding)  | Configure allowed set of soft bindings |
 
 ### Default configuration
 
@@ -217,29 +217,29 @@ Here's the `Settings` JSON with all default values:
       "quality": "medium"
     },
   },
-  "cawg_trust": {
-    "verify_trust_list": true,
-    "user_anchors": null,
-    "trust_anchors": null,
-    "trust_config": null,
-    "allowed_list": null,
-    "trusted_ica_issuers": null
-  },
   "cawg_x509_signer": null,
   "core": {
     "merkle_tree_chunk_size_in_kb": null,
     "merkle_tree_max_proofs": 5,
+    "merkle_tree_max_leaves": 10000,
     "backing_store_memory_threshold_in_mb": 512,
     "decode_identity_assertions": true,
     "allowed_network_hosts": null,
     "max_decompressed_manifest_size_in_mb": 32
   },
   "signer": null,
-  "trust": {
-    "user_anchors": null,
-    "trust_anchors": null,
-    "trust_config": null,
-    "allowed_list": null
+  "trust":{ 
+    "anchors": [
+        {
+          "trust_uri": null,
+          "trust_kind": "manifest"
+          "trust_anchors": null,
+          "trust_config": null,
+          "allowed_list": null,
+          "trusted_ica_issuers": null
+        }
+    ]
+    "trust_config": null
   },
   "verify": {
     "verify_after_reading": true,
@@ -250,11 +250,52 @@ Here's the `Settings` JSON with all default values:
     "remote_manifest_fetch": true,
     "skip_ingredient_conflict_resolution": false,
     "strict_v1_validation": false
+  },
+  "soft_binding": {
+      "soft_binding_algorithms": [
+        "com.digimarc.validate.1",
+        "org.atsc.a336",
+        "io.iscc.v0",
+        "com.adobe.trustmark.Q",
+        "com.adobe.trustmark.C",
+        "com.adobe.icn.dense",
+        "ai.steg.api",
+        "..."
+      ]
   }
 }
 ```
 
 ## Configuration examples
+
+Ordinary embedded `Builder::sign`/`sign_file` (including async signing) automatically uses
+fragment Merkle binding for a single BMFF file containing `moov` and `moof`/`mdat`.
+This path stores a leaf row and one equal-size, zero-padded Merkle UUID before
+each moof. The primary manifest's auxiliary locator points to the first UUID's
+final absolute offset. `initHash` and fragment hashes use the final absolute
+root-box offsets; the final fragment covers EOF, including raw trailing bytes.
+It takes
+precedence over `core.merkle_tree_chunk_size_in_kb` and is bounded by
+`core.merkle_tree_max_leaves` (default 10,000) plus the hash-memory budget.
+Exceeding the limit fails rather than silently falling back to a flat hash.
+
+Supported media has one stable track: `localId` is the tkhd track ID and every
+moof must contain one matching tfhd. Multiplexed or changing track layouts fail
+explicitly. Media uses default-base-is-moof or explicit in-fragment tfhd bases,
+with trun sample ranges contained in that fragment's mdat boxes. Unsupported
+implicit bases, cross-fragment sample ranges, hybrid initialization media,
+saio/iloc auxiliary addressing, ssix and hierarchical sidx fail explicitly.
+Existing Merkle-bound single-file fMP4 requires an update manifest instead of
+ordinary re-signing; historical flat-bound fMP4 remains verifiable and can be
+re-signed. Flat MP4, caller-supplied bindings, segmented signing and VSI retain
+their separate binding paths.
+
+Automatic single-file fragment signing requires an embedded manifest, optionally
+with a remote URL. Detached/sidecar-only signing fails explicitly: upstream
+readers reject auxiliary-only C2PA assets during automatic manifest discovery.
+Updates preserve raw EOF suffixes, but reject a terminal size-zero box that would
+consume an appended update UUID. Size-changing metadata writes on fragmented
+files also apply the supported addressing restrictions to caller-supplied bindings.
 
 ### Minimal configuration
 
@@ -351,8 +392,16 @@ Here's the `Settings` JSON with all default values:
 {
   "version": 1,
   "trust": {
-    "trust_anchors": "-----BEGIN CERTIFICATE-----\n...",
-    "trust_config": "1.3.6.1.5.5.7.3.4\n1.3.6.1.5.5.7.3.36"
+      "anchors": [
+          {
+            "trust_anchors": "-----BEGIN CERTIFICATE-----\n...",
+            "trust_config": "1.3.6.1.5.5.7.3.4\n1.3.6.1.5.5.7.3.36",
+            "trust_kind": "manifest",
+            "trust_uri": "https://c2pa-rs/test_cert_trust_list",
+            "trusted_ica_issuers": ["did:jwk:eyJhbGciOiJFZERTQSIs..."]
+          }
+      ],
+      "trust_config": "1.3.6.1.5.5.7.3.4\n1.3.6.1.5.5.7.3.36"
   },
   "core": {
     "backing_store_memory_threshold_in_mb": 1024
@@ -363,6 +412,18 @@ Here's the `Settings` JSON with all default values:
       "long_edge": 512,
       "quality": "high"
     }
+  },
+  "soft_binding": {
+      "soft_binding_algorithms": [
+        "com.digimarc.validate.1",
+        "org.atsc.a336",
+        "io.iscc.v0",
+        "com.adobe.trustmark.Q",
+        "com.adobe.trustmark.C",
+        "com.adobe.icn.dense",
+        "ai.steg.api",
+        "..."
+      ]
   }
 }
 ```

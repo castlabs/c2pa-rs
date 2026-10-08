@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use coset::{iana, CoseSign1Builder, HeaderBuilder, TaggedCborSerializable};
+use coset::{iana, CborSerializable, CoseSign1Builder, HeaderBuilder, TaggedCborSerializable};
 use ed25519_dalek::{Signer as Ed25519Signer, SigningKey};
 use pkcs8::DecodePublicKey;
 
@@ -305,6 +305,45 @@ impl LiveVideoVsiSigner {
         session_signer: Arc<dyn VsiSessionSigner>,
         create_signer_binding: bool,
     ) -> Result<Self> {
+        let session_cose_key = validate_session_config(&config)?;
+        let base_manifest_json = super::prepare_live_manifest_json(&manifest_json)?;
+
+        let ee_cert_der = manifest_signer
+            .certs()
+            .map_err(|e| Error::OtherError(Box::new(e)))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::BadParam("manifest signer has no certificates".into()))?;
+
+        let mut signer = Self {
+            context,
+            session_signer,
+            algorithm: config.algorithm,
+            session_cose_key,
+            kid: config.kid,
+            signer_binding: None,
+            manifest_signer_ee_cert_der: ee_cert_der,
+            min_sequence_number: config.min_sequence_number,
+            created_at: DateT(config.created_at),
+            validity_period: config.validity_period_secs,
+            next_sequence_number: config.min_sequence_number,
+            next_event_id: 1,
+            base_manifest_json,
+            active_manifest_id: None,
+            track_id: None,
+            track_timescale: None,
+            default_sample_duration: None,
+        };
+        if create_signer_binding {
+            signer.ensure_signer_binding()?;
+        }
+        Ok(signer)
+    }
+}
+
+/// Validates a session configuration and returns its decoded public COSE_Key.
+pub(super) fn validate_session_config(config: &VsiSessionConfig) -> Result<c2pa_cbor::Value> {
+    {
         if !matches!(config.algorithm, SigningAlg::Ed25519 | SigningAlg::Es256) {
             return Err(Error::BadParam(
                 "VSI session signing supports only Ed25519 and ES256".to_string(),
@@ -371,40 +410,11 @@ impl LiveVideoVsiSigner {
             _ => unreachable!("algorithm checked above"),
         }
 
-        let base_manifest_json = super::prepare_live_manifest_json(&manifest_json)?;
-
-        let ee_cert_der = manifest_signer
-            .certs()
-            .map_err(|e| Error::OtherError(Box::new(e)))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::BadParam("manifest signer has no certificates".into()))?;
-
-        let mut signer = Self {
-            context,
-            session_signer,
-            algorithm: config.algorithm,
-            session_cose_key,
-            kid: config.kid,
-            signer_binding: None,
-            manifest_signer_ee_cert_der: ee_cert_der,
-            min_sequence_number: config.min_sequence_number,
-            created_at: DateT(config.created_at),
-            validity_period: config.validity_period_secs,
-            next_sequence_number: config.min_sequence_number,
-            next_event_id: 1,
-            base_manifest_json,
-            active_manifest_id: None,
-            track_id: None,
-            track_timescale: None,
-            default_sample_duration: None,
-        };
-        if create_signer_binding {
-            signer.ensure_signer_binding()?;
-        }
-        Ok(signer)
+        Ok(session_cose_key)
     }
+}
 
+impl LiveVideoVsiSigner {
     /// Signs an init segment, embedding a `c2pa.session-keys` assertion.
     ///
     /// Captures the manifest label from the signed output so that
@@ -613,8 +623,8 @@ impl LiveVideoVsiSigner {
     /// This init-only method is safe only before any media segment from the
     /// session has been published. It restores no media counters, so signing
     /// directly after a post-publication init-only restore can reuse a sequence.
-    /// Durable resume callers must use [`recover_from_artifacts`] with the last
-    /// committed media segment, or call [`resume_from_segment`] before signing.
+    /// Durable resume callers must use [`Self::recover_from_artifacts`] with the last
+    /// committed media segment, or call [`Self::resume_from_segment`] before signing.
     pub fn restore_manifest_id_from_signed_init(
         &mut self,
         signed_init_data: &[u8],
@@ -1003,7 +1013,11 @@ impl LiveVideoVsiSigner {
     }
 }
 
-fn ensure_key_valid_at(created_at: &DateT, validity_period: u64, unix_seconds: i64) -> Result<()> {
+pub(super) fn ensure_key_valid_at(
+    created_at: &DateT,
+    validity_period: u64,
+    unix_seconds: i64,
+) -> Result<()> {
     use chrono::{DateTime, TimeZone};
 
     chrono::Utc
@@ -1044,7 +1058,7 @@ fn vsi_emsg_exclusion() -> ExclusionsMap {
 /// A `bmff-hash-map` scoped to exclude the VSI `emsg` box, per §19.4.1. Defaults to
 /// `bmff_version` 3, which per §18.6.2 hashes each included root box as `offset || data`
 /// (8-byte big-endian file offset prefix).
-fn new_vsi_bmff_hash() -> BmffHash {
+pub(super) fn new_vsi_bmff_hash() -> BmffHash {
     let mut bmff_hash = BmffHash::new("jumbf manifest", "sha256", None);
     bmff_hash.add_exclusions(&mut vec![vsi_emsg_exclusion()]);
     bmff_hash
@@ -1113,7 +1127,7 @@ fn verify_segment_bmff_hash(full_segment: &[u8], bmff_hash_value: &c2pa_cbor::Va
 //   - the **payload** is the signer's end-entity certificate encoded as a CBOR
 //     byte string (used in Sig_structure but NOT carried in the COSE_Sign1).
 
-fn build_signer_binding(
+pub(super) fn build_signer_binding(
     ee_cert_der: &[u8],
     algorithm: SigningAlg,
     session_signer: &dyn VsiSessionSigner,
@@ -1141,16 +1155,51 @@ fn build_signer_binding(
         })?;
 
     let binding_bytes = sign1
-        .to_tagged_vec()
+        .to_vec()
         .map_err(|e| Error::BadParam(format!("failed to encode signer binding: {e}")))?;
 
-    // Deserialize back to a Value so the COSE_Sign1 is embedded as a tagged
-    // CBOR structure (tag 18) rather than an opaque bstr.
+    // SessionKey stores the inner array; its field serializer adds tag 18 once.
     c2pa_cbor::from_slice(&binding_bytes).map_err(|e| {
         Error::BadParam(format!(
             "failed to decode signer binding as CBOR Value: {e}"
         ))
     })
+}
+
+/// Same-size placeholder for a detached signerBinding, using a zero signature.
+/// Builds only public structure; it never requests a session-key signature.
+pub(super) fn build_signer_binding_placeholder(algorithm: SigningAlg) -> Result<c2pa_cbor::Value> {
+    let protected = HeaderBuilder::new()
+        .algorithm(cose_algorithm(algorithm)?)
+        .build();
+    let mut sign1 = CoseSign1Builder::new().protected(protected).build();
+    sign1.signature = vec![0; 64];
+    let bytes = sign1
+        .to_vec()
+        .map_err(|e| Error::BadParam(format!("failed to encode signer binding: {e}")))?;
+    c2pa_cbor::from_slice(&bytes).map_err(|e| {
+        Error::BadParam(format!(
+            "failed to decode signer binding as CBOR Value: {e}"
+        ))
+    })
+}
+
+/// Verifies a raw 64-byte session signature over exact `tbs` bytes using the
+/// existing session-key validation path, without reconstructing the input.
+pub(super) fn verify_raw_session_signature(
+    algorithm: SigningAlg,
+    session_cose_key: &c2pa_cbor::Value,
+    tbs: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    validate_callback_signature(algorithm, signature)?;
+    let protected = HeaderBuilder::new()
+        .algorithm(cose_algorithm(algorithm)?)
+        .build();
+    let mut sign1 = CoseSign1Builder::new().protected(protected).build();
+    sign1.signature = signature.to_vec();
+    super::session_key_validation::verify_cose_sign1_signature(&sign1, session_cose_key, tbs)
+        .map_err(|e| Error::BadParam(format!("VSI callback signature is invalid: {e}")))
 }
 
 // ── VSI COSE_Sign1 construction ──────────────────────────────────────────────
@@ -1180,7 +1229,7 @@ fn build_vsi_cose_sign1(
         .map_err(|e| Error::BadParam(format!("failed to encode COSE_Sign1: {e}")))
 }
 
-fn build_vsi_cose_sign1_dummy(
+pub(super) fn build_vsi_cose_sign1_dummy(
     segment_info_map: &SegmentInfoMap,
     algorithm: SigningAlg,
     kid: &[u8],
@@ -1193,7 +1242,7 @@ fn build_vsi_cose_sign1_dummy(
         .map_err(|e| Error::BadParam(format!("failed to encode dummy COSE_Sign1: {e}")))
 }
 
-fn build_vsi_cose_sign1_unsigned(
+pub(super) fn build_vsi_cose_sign1_unsigned(
     segment_info_map: &SegmentInfoMap,
     algorithm: SigningAlg,
     kid: &[u8],
@@ -1220,7 +1269,7 @@ fn build_vsi_cose_sign1_unsigned(
         .build())
 }
 
-fn cose_algorithm(algorithm: SigningAlg) -> Result<iana::Algorithm> {
+pub(super) fn cose_algorithm(algorithm: SigningAlg) -> Result<iana::Algorithm> {
     match algorithm {
         SigningAlg::Ed25519 => Ok(iana::Algorithm::EdDSA),
         SigningAlg::Es256 => Ok(iana::Algorithm::ES256),
@@ -1230,7 +1279,7 @@ fn cose_algorithm(algorithm: SigningAlg) -> Result<iana::Algorithm> {
     }
 }
 
-fn validate_callback_signature(algorithm: SigningAlg, signature: &[u8]) -> Result<()> {
+pub(super) fn validate_callback_signature(algorithm: SigningAlg, signature: &[u8]) -> Result<()> {
     if signature.len() != 64 {
         let format = if algorithm == SigningAlg::Es256 {
             "64-byte P1363 r||s"
@@ -1275,7 +1324,7 @@ fn protected_iat(sign1: &coset::CoseSign1) -> Result<i64> {
 ///
 /// Per §19.4.2: `timescale` and `event_duration` shall cover the whole
 /// segment, and `id` shall be a session-unique value.
-fn build_emsg_box(
+pub(super) fn build_emsg_box(
     cose_sign1_bytes: &[u8],
     timescale: u32,
     event_duration: u32,
@@ -2352,7 +2401,7 @@ mod tests {
         let init_data =
             include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
         let manifest_signer = make_test_signer();
-        let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+        let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng));
         let config = es256_config(&session_key, b"es256-session", 1);
         let observations = Arc::new(Mutex::new(Vec::new()));
         let callback_key = Arc::clone(&session_key);
@@ -2427,7 +2476,7 @@ mod tests {
     #[test]
     fn generic_constructor_rejects_algorithm_key_and_kid_mismatches() {
         let manifest_signer = make_test_signer();
-        let session_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let session_key = p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng);
         let valid = es256_config(&session_key, b"correct-kid", 1);
 
         let mut wrong_algorithm = valid.clone();
@@ -2492,7 +2541,7 @@ mod tests {
             CallbackFailure::Error,
         ] {
             let manifest_signer = make_test_signer();
-            let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+            let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng));
             let config = es256_config(&session_key, b"failure-key", 1);
             let observations = Arc::new(Mutex::new(Vec::new()));
             let callback_key = Arc::clone(&session_key);
@@ -2550,7 +2599,7 @@ mod tests {
         let init_data =
             include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
         let manifest_signer = make_test_signer();
-        let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand::thread_rng()));
+        let session_key = Arc::new(p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng));
         let mut config = es256_config(&session_key, b"recover-key", 1);
         config.created_at = "2020-01-01T00:00:00Z".to_string();
         config.validity_period_secs = 1_000_000_000;
@@ -2679,7 +2728,7 @@ mod tests {
         let init_data =
             include_bytes!("../../tests/fixtures/bunny/bunny_595491bps/BigBuckBunny_2s_init.mp4");
         let manifest_signer = make_test_signer();
-        let session_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let session_key = p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng);
         let config = es256_config(&session_key, b"binding-failure", 1);
         let observations = Arc::new(Mutex::new(Vec::new()));
         let callback_observations = Arc::clone(&observations);

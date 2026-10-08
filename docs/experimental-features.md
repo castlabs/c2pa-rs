@@ -103,5 +103,83 @@ The following table lists the experimental features currently present in the SDK
 | -- | -- | -- | -- | -- |
 | Builder action/ingredient filtering | `unstable_builder_filter` | Adds `Builder::filter_actions`, `Builder::filter_ingredients`, `Builder::filter_actions_and_ingredients`, and `Ingredient::effective_id` for filtering the actions and ingredients written into a manifest. Maintained by the Adobe CAI team to serve an internal need; kept experimental because the long-term viability of the API design is not yet settled. | Adobe CAI team ([@contentauth](https://github.com/contentauth)) | [#2368](https://github.com/contentauth/c2pa-rs/issues/2368) |
 | C2PA Live Video | `unstable_live_video` | Implements C2PA Technical Specification section 19 (Live Video) for DASH/HLS fMP4 streams: both the per-segment C2PA Manifest Box method (§19.3) and the Verifiable Segment Info method (§19.4), including `signerBinding` verification (§19.7.3), per-segment `bmffHash` validation (§19.4.1), CLI subcommands, and feature-gated VSI C APIs. VSI sessions support local Ed25519 keys and synchronous non-exportable-key callbacks for Ed25519 or ES256, with explicit signer-binding/media purpose metadata, artifact recovery, and explicit-time media signing. The C API also provides the allocation-free `c2pa_live_video_moof_sequence_number` probe: its output is `uint32_t` because the BMFF field is exactly 32 bits; it returns 0 on success or -1 on failure and resets any non-null output to zero before validating the media buffer. Signed VSI media always carries a protected `iat`; callers may supply its Unix timestamp explicitly for durable queued signing, otherwise the signer samples the production clock once. The current signer requires a signed init and supports one CMAF track per representation; muxed or multi-`traf` segments are rejected. The §19.3 CLI signs one invocation only (plus init-only retry); persisted multi-invocation continuity is deferred. Contributed by Qualabs as a reference implementation for live provenance and hardened by Castlabs for the live-video profile. | Qualabs ([@N1Knight](https://github.com/N1Knight)), Castlabs ([@mstattma](https://github.com/mstattma)) | [#2507](https://github.com/contentauth/c2pa-rs/issues/2507) |
+| Structured-text asset handler (C2PA A.9) | `unstable_structured_text` | Adds `StructuredTextIO`, embedding a Manifest Store in a host-format comment line using the A.9 ASCII-armour delimiters, as a `data:` URI or a URL reference. Registered for text formats with a comment convention (Markdown, YAML, TOML, INI, JS, CSS, SQL, LaTeX, Python, RSS/Atom, WebVTT). Implemented in-tree with no new dependencies. | David Condrey ([@dcondrey](https://github.com/dcondrey)) | [#2377](https://github.com/contentauth/c2pa-rs/issues/2377) |
+| Plain-text asset handler (C2PA A.8) | `unstable_plain_text` | Adds `PlainTextIO`, embedding a Manifest Store in `text/plain` assets as a `C2PATextManifestWrapper` (invisible Unicode variation selectors per A.8), registered for `text/plain` (`.txt`). Implemented in-tree from the A.8 wire format directly, no third-party C2PA-text crate; `unicode-normalization` is the only dependency this feature adds, for NFC. | David Condrey ([@dcondrey](https://github.com/dcondrey)) | [#2505](https://github.com/contentauth/c2pa-rs/issues/2505) |
 
 Castlabs release candidates for this feature use the separate [live-video release qualification](castlabs-live-video-qualification.md). These are controls for the Castlabs fork and are not a proposal for upstream disposition of the experimental feature; the blocking branch workflow does not alter the upstream experimental-feature or release workflows.
+
+### Trusted-VSI prehashed sessions
+
+The `unstable_live_video` surface also provides `TrustedVsiPrehashedSession` for
+trusted stream processors that compose or hash media outside the SDK. The binding
+Rust, C ABI, state, and canonical-input contract is
+[`trusted-vsi-native-contract.md`](trusted-vsi-native-contract.md).
+`TrustedVsiCapabilities::current().bits()` and
+`c2pa_live_video_trusted_vsi_capabilities()` return 63: split init UUID (1),
+expert Sig_structure (2), signer-composed EMSG (4), versioned state
+export/import (8), signing-context V1 (16), and full `u32` handling (32).
+Existing complete-buffer VSI signing is unchanged.
+Current native version is `0.92.0-dev`; version plus capability mask is not an
+ABI/build identity. The safe no-argument C probe
+`uint32_t c2pa_live_video_trusted_vsi_contract_revision(void)` returns 3;
+consumers require exactly contract revision 3 and mask 63. Contract revision is
+independent of SDK/library and persisted-state versions, even though state
+version is also currently 3. It is a compatibility gate, not build authentication
+or a cross-build state-recovery guarantee: exact source SHA and artifact
+hashes/evidence remain necessary. The probe is absent with the feature disabled;
+existing public signatures and V1 layouts are unchanged.
+
+A session is pinned at creation (`options_json`) to one mode:
+
+- `expert_sig_structure`: `sign_sig_structure(sig_structure, sequence_number)`
+  validates one untagged `["Signature1", protected, h'', payload]` item with a
+  canonical protected header and a bounded, typed VSI segment-info payload.
+  Its signed sequence and manifest ID must match the supplied sequence and
+  pinned session; protected integer `iat` must be within inclusive key validity.
+  The protected algorithm must match the session key. It signs the exact bytes
+  unchanged, verifies the raw 64-byte result, and returns only the signature.
+  The processor-supplied sequence is passed unchanged to the callback; there is
+  no native counter, event ID, or exhaustion, and `exhaust_after_sign` stays
+  false even at `UINT32_MAX`. Payload map field order is not constrained to
+  canonical order, preserving native serde-generated inputs. Detached certificate
+  signerBinding payloads are rejected under media purpose before any callback.
+  The exact native SHA-256 media bmffHash template is an intentional profile
+  limit: only its 32-byte digest may vary, not its algorithm, name or exclusions.
+  This is not support for every otherwise legal C2PA bmff-hash variant.
+- `signer_composed_emsg`: `reserve_media_emsg_at` returns a complete placeholder
+  EMSG (pinning sequence, event ID, `iat`, timescale, duration) without signing;
+  `finalize_media_emsg` accepts the canonical media bmff-hash map and returns
+  the equal-length signed EMSG. Sequences must follow `min_sequence_number`
+  in order; events start at 1; the session exhausts at `sequence_max` or
+  `u32::MAX` without wrapping.
+
+Both modes first reserve, finalize, and commit the init UUID. Finalization runs
+the signerBinding callback, the Context claim signer and its dynamic assertions
+in original order, and verifies the result. A failure after an external signing
+call begins blocks the session; retry by importing the pre-operation
+`export_state` record (versioned JSON, no keys) into a new session. Static
+`validate_trusted_vsi_input`, `trusted_vsi_hash_template`, and session
+`preflight` never invoke signing/content callbacks, use keys, or mutate state.
+State version 3 uses trusted-reservation-only nonce-derived public salts and
+stable static-map serialization. Import and init-finalize preflight reconstruct
+the entire reservation from pinned inputs and require byte equality, including
+metadata, resources, native placeholders and DA slots; old random-salt state
+versions are rejected. Ordinary SDK salting/serialization defaults are unchanged.
+Recovery requires the original reservation-producing SDK/generator version and
+Context builder settings; identity fields do not capture every Context setting,
+and full reconstruction rejects changed bytes fail-closed. Retain original pinned
+build/settings for pending/recoverable epochs during an upgrade, without trusting
+editable record metadata as proof of origin. Recovery across versions/settings is
+not guaranteed. A newly authorized epoch may use the new build without inherently
+requiring physical key rotation, stream end or sequence reset; continuous epoch
+lifecycle management remains separate, unimplemented work.
+Finalized reconstruction cannot establish provider provenance for DA/init-hash
+content: a compromised private claim key for the same certificate, plus an
+existing valid signerBinding, can produce valid signatures externally. DA content
+cannot be recomputed without content callbacks. Signature integrity alone does
+not block that bounded residual, so authenticated coordinator records remain
+necessary; see the native contract's threat limits.
+C byte delivery failure returns -1/NULL without rolling back successful native
+signing: identical init/media finalization retries replay cached bytes. See the
+native contract for provider-owned expert retries and Manifest-only legacy trust
+anchors; no cross-purpose trust fallback is introduced.
