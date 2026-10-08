@@ -11,6 +11,7 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ### Fixed
 
+* A builder restored from an archive (`Builder::with_archive`, `Reader::into_builder`) no longer carries the archive's own `org.contentauth.archive.metadata` assertion, which it previously signed into the output asset (backport of contentauth/c2pa-rs#2374).
 * Preserve each legacy TFRA entry's fragment target when inserting, resizing, or removing BMFF metadata. Offset adjustment rejects unsupported TFRA versions and out-of-bounds tables; previously corrupted tables are not repaired, so regenerate affected assets from the unsigned master. This focused backport does not change the single-file fragmented Merkle writer/relocator or correct other legacy offset tables (STCO, CO64, TFHD, ILOC, SAIO).
 
 ## [0.80.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.79.5...c2pa-v0.80.0)
