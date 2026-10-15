@@ -1581,7 +1581,7 @@ fn initless_map_is_malformed_for_every_fragment_verifier() {
     );
     #[cfg(feature = "file_io")]
     {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::utils::io_utils::tempdirectory().unwrap();
         let path = dir.path().join("frag.m4s");
         std::fs::write(&path, &fragment).unwrap();
         assert_malformed(
