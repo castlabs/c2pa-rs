@@ -947,3 +947,105 @@ fn ladder_dynamic_assertion_endorses_the_finished_binding() {
         assert_eq!(endorsement.hash.as_ref(), final_binding.hash());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Per-segment verification of a ladder: every rendition shares one manifest
+// that holds one Merkle map per rendition. A segment of rendition N must be
+// matched to map N by the ids its own merkle uuid box carries, never to a
+// sibling's map.
+// ---------------------------------------------------------------------------
+
+/// The C2PA box usertype (ISO/IEC 23001-7 style uuid), spelled out so the
+/// test stays independent of the SDK's constant.
+const C2PA_BOX_UUID: [u8; 16] = [
+    0xd8, 0xfe, 0xc3, 0xd6, 0x1b, 0x0e, 0x48, 0x3c, 0x92, 0x97, 0x58, 0x28, 0x87, 0x7e, 0xc4, 0x81,
+];
+
+fn merkle_uuids_of(data: &[u8]) -> Vec<B> {
+    roots(data)
+        .into_iter()
+        .filter(|b| {
+            b.kind == *b"uuid"
+                && b.end - b.payload >= 16 + 4 + 7
+                && data[b.payload..b.payload + 16] == C2PA_BOX_UUID
+                && &data[b.payload + 20..b.payload + 27] == b"merkle\0"
+        })
+        .collect()
+}
+
+fn spec_cut_of(signed: &[u8]) -> (Vec<u8>, Vec<(u64, Vec<u8>)>) {
+    let uuids = merkle_uuids_of(signed);
+    let init = signed[..uuids[0].start].to_vec();
+    let segments = uuids
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let end = uuids.get(i + 1).map_or(signed.len(), |n| n.start);
+            (u.start as u64, signed[u.start..end].to_vec())
+        })
+        .collect();
+    (init, segments)
+}
+
+/// Hard-binding failures are reported in the reader, never returned as an
+/// error, so the state alone tells the story.
+fn segment_state(init: &[u8], segment: &[u8], offset: u64) -> ValidationState {
+    Reader::from_fragment_at_offset("video/mp4", Cursor::new(init), Cursor::new(segment), offset)
+        .unwrap()
+        .validation_state()
+}
+
+#[test]
+fn ladder_segments_verify_against_the_shared_manifest() {
+    let signed = sign_ladder(&ladder());
+    let outputs: Vec<Vec<u8>> = signed
+        .outputs
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    assert_eq!(maps(&binding(&outputs[0])).len(), outputs.len());
+
+    let cuts: Vec<_> = outputs.iter().map(|o| spec_cut_of(o)).collect();
+    for (init, segments) in &cuts {
+        assert!(segments.len() > 1);
+        for (offset, segment) in segments {
+            assert!(
+                matches!(
+                    segment_state(init, segment, *offset),
+                    ValidationState::Valid | ValidationState::Trusted
+                ),
+                "segment at {offset} of a ladder rendition must verify alone"
+            );
+            assert!(
+                segment_state(init, segment, 0) == ValidationState::Invalid,
+                "a ladder segment must still need its absolute offset"
+            );
+        }
+    }
+
+    // Renditions 0 and 1 share a byte-identical initialization prefix (only
+    // media bytes differ), so a segment of one verifies under the other's
+    // init: that is the same bytes, not a confusion of maps. Renditions 0 and
+    // 2 come from different encodes and have different init prefixes; there a
+    // foreign init fails on the init hash of the map the segment names.
+    let (init0, segs0) = &cuts[0];
+    let (init1, _) = &cuts[1];
+    let (init2, segs2) = &cuts[2];
+    assert_eq!(init0, init1);
+    assert_ne!(init0, init2);
+    assert!(
+        matches!(
+            segment_state(init1, &segs0[1].1, segs0[1].0),
+            ValidationState::Valid | ValidationState::Trusted
+        ),
+        "an identical init prefix is the same init"
+    );
+    assert!(
+        segment_state(init2, &segs0[1].1, segs0[1].0) == ValidationState::Invalid,
+        "rendition 0's segment must not verify under rendition 2's init"
+    );
+    assert!(
+        segment_state(init0, &segs2[1].1, segs2[1].0) == ValidationState::Invalid,
+        "rendition 2's segment must not verify under rendition 0's init"
+    );
+}
