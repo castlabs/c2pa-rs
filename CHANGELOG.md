@@ -9,6 +9,29 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ## [Unreleased]
 
+### Castlabs conformance candidate (Program 0.2 / C2PA 2.4)
+
+* Add `verify.validation_time` (RFC 3339) as the request-scoped evaluation
+  instant for certificate, chain, OCSP and reported validation time
+  (`CertificateTrustPolicy::set_validation_time` / `evaluation_time`).
+* Purpose-scoped trust uses this line's always-strict
+  `CertificateTrustPolicy::check_certificate_trust_for(.., TrustListKind)`
+  isolation; the conformance candidate's `TrustPurpose` enum and
+  `verify.strict_trust_purposes` (with its legacy TSA/identity fallback) are not
+  carried over.
+* Route an untyped `specVersion` in `claim_generator_info` (settings or
+  `insert()`) into the typed field and reject conflicting values; unwrap
+  tag-preserving COSE_Sign1 live-video signer bindings.
+* Keep the default EKU allow-list when context trust settings are applied.
+* Checked crJSON export through the C FFI: `c2pa_reader_crjson` returns NULL
+  with an error instead of `{}` when the exporter fails.
+* crJSON reports one validation instant (the supplied `verify.validation_time`
+  when configured) for every manifest, including ancestors without deltas.
+* crJSON conforms to the published crJSON 2.4 schema: `validationResults.specVersion`
+  reports the validator version (`2.4.0`) and the post-2.4 `isUpdateManifest` /
+  `isCompressedManifest` manifest fields are not emitted; schema tests validate
+  formats against the vendored 2.4 schema.
+
 ### Experimental
 
 * Reduce the disabled trusted-VSI expert API to `sign_sig_structure(&[u8])`,

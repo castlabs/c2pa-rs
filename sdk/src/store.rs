@@ -159,6 +159,11 @@ impl Store {
         }
     }
 
+    /// Caller-controlled validation instant (Unix seconds), if configured.
+    pub(crate) fn validation_time_epoch(&self) -> Option<i64> {
+        self.ctp.validation_time()
+    }
+
     /// Create a new, empty claims store with the specified settings.
     pub fn from_context(context: &Context) -> Self {
         let mut store = Store::new();
@@ -210,6 +215,13 @@ impl Store {
         if let Some(tc) = &settings.trust.trust_config {
             let _v = store.add_trust_config(tc.as_bytes());
         }
+
+        // Settings are validated on load, so a malformed instant cannot reach here;
+        // fall back to the wall clock defensively rather than panicking. Store
+        // verification re-checks the setting and fails explicitly.
+        store
+            .ctp
+            .set_validation_time(settings.verify.validation_time_epoch().ok().flatten());
 
         store
     }
@@ -2074,6 +2086,9 @@ impl Store {
         context: &Context,
     ) -> Result<()> {
         context.check_progress(ProgressPhase::VerifyingManifest, 1, 1)?;
+        // A malformed caller-supplied validation instant must never silently
+        // degrade to the wall clock.
+        context.settings().verify.validation_time_epoch()?;
         let claim = match store.provenance_claim() {
             Some(c) => c,
             None => {

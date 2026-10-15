@@ -361,10 +361,11 @@ fn check_stapled_ocsp_response(
     let signing_cert_chain = ocsp_signing_chain(&signing_cert_chain, ctp);
 
     let mut current_validation_log = StatusTracker::default();
-    let Ok(ocsp_data) = OcspResponse::from_der_checked(
+    let Ok(ocsp_data) = OcspResponse::from_der_checked_at(
         ocsp_response_der,
         &signing_cert_chain,
         signing_time,
+        ctp.validation_time(),
         &mut current_validation_log,
     ) else {
         return Ok(OcspResponse::default());
@@ -378,6 +379,7 @@ fn check_stapled_ocsp_response(
 
         // make sure this is an OCSP signing EKU
         let mut new_ctp = CertificateTrustPolicy::default();
+        new_ctp.set_validation_time(ctp.validation_time());
         new_ctp.clear_ekus();
         new_ctp.add_mandatory_ekus(OCSP_OID_STR.as_bytes()); // ocsp signing EKU
         if check_end_entity_certificate_profile(
@@ -598,10 +600,11 @@ fn validate_fetched_ocsp(
     // response while leaving that success code behind.
     let mut current_validation_log = StatusTracker::default();
 
-    let ocsp_data = match OcspResponse::from_der_checked(
+    let ocsp_data = match OcspResponse::from_der_checked_at(
         ocsp_response_der,
         subject_chain,
         signing_time,
+        ctp.validation_time(),
         &mut current_validation_log,
     ) {
         Ok(data) => data,
@@ -616,6 +619,7 @@ fn validate_fetched_ocsp(
 
         // make sure this is an OCSP signing EKU
         let mut new_ctp = CertificateTrustPolicy::default();
+        new_ctp.set_validation_time(ctp.validation_time());
         new_ctp.clear_ekus();
         new_ctp.add_mandatory_ekus(OCSP_OID_STR.as_bytes()); // ocsp signing EKU
         if check_end_entity_certificate_profile(
@@ -644,7 +648,8 @@ fn validate_fetched_ocsp(
         // evaluates `revocationTime` against the historical `signing_time`,
         // the responder's own certificate validity and authorization (RFC 6960
         // section 3.2 requirement 4) must be evaluated at current time (`None`),
-        // matching `check_end_entity_certificate_profile` above.
+        // matching `check_end_entity_certificate_profile` above. "Current time"
+        // is the caller-controlled `verify.validation_time` when configured.
         if ctp
             .check_certificate_trust(&ocsp_cert_chain, first_cert, None)
             .is_err()
