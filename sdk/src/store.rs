@@ -166,6 +166,9 @@ impl Store {
 
         // use the incoming trust settings
         store.ctp.clear();
+        // Keep default EKUs without restoring default anchors or private credentials.
+        // The context's trust_config adds to this allow-list.
+        store.ctp.add_default_valid_ekus();
 
         // Add all of the trust anchors
         if let Some(anchors) = &settings.trust.anchors {
@@ -11872,6 +11875,110 @@ pub mod tests {
         assert!(
             validated <= 4 * DEPTH,
             "shared ingredient subtrees must be verified only once"
+        );
+    }
+
+    #[test]
+    fn test_context_default_ekus_with_explicit_anchors() {
+        use crate::crypto::cose::{check_end_entity_certificate_profile, CertificateProfileError};
+
+        let certs = pem::parse_many(include_bytes!(
+            "../tests/fixtures/crypto/cose/context_ekus.pem"
+        ))
+        .unwrap();
+        let document_leaf = certs[0].contents();
+        let custom_leaf = certs[1].contents();
+        let root = &certs[2];
+        let trust_uri = "https://example.com/context-test-roots";
+
+        for custom_eku in [None, Some("1.3.6.1.5.5.7.3.5")] {
+            let mut context = Context::new();
+            // Replace test settings, which otherwise supply both anchors and EKUs.
+            context.settings_mut().trust.anchors = Some(vec![crate::settings::TrustAnchor {
+                trust_anchors: pem::encode(root),
+                trust_uri: Some(trust_uri.to_string()),
+                trust_kind: TrustListKind::Manifest,
+                trust_config: None,
+                allowed_list: None,
+                trusted_ica_issuers: None,
+            }]);
+            context.settings_mut().trust.trust_config = custom_eku.map(str::to_owned);
+            let store = Store::from_context(&context);
+
+            let anchors = store.ctp.signing_trust_anchors();
+            assert_eq!(anchors.len(), 1);
+            assert_eq!(anchors[0].trust_anchor_ders, vec![root.contents().to_vec()]);
+            assert!(store.ctp.tsa_trust_anchors().is_empty());
+            assert!(store.ctp.cawg_trust_anchors().is_empty());
+
+            let mut log = StatusTracker::default();
+            let custom_profile =
+                check_end_entity_certificate_profile(custom_leaf, &store.ctp, &mut log, None);
+            if custom_eku.is_some() {
+                custom_profile.unwrap();
+                assert_eq!(
+                    store
+                        .ctp
+                        .check_certificate_trust(&[], custom_leaf, None)
+                        .unwrap(),
+                    (TrustAnchorType::Manifest, trust_uri.to_string())
+                );
+            } else {
+                assert_eq!(
+                    custom_profile,
+                    Err(CertificateProfileError::InvalidCertificate)
+                );
+                assert!(log
+                    .logged_items()
+                    .iter()
+                    .any(|item| item.description == "certificate missing required EKU"));
+            }
+
+            let mut log = StatusTracker::default();
+            let document_profile =
+                check_end_entity_certificate_profile(document_leaf, &store.ctp, &mut log, None);
+            assert!(
+                document_profile.is_ok(),
+                "default documentSigning EKU must survive context trust settings: {:?}",
+                log.logged_items()
+            );
+            assert!(!log.has_any_error());
+            assert_eq!(
+                store
+                    .ctp
+                    .check_certificate_trust(&[], document_leaf, None)
+                    .unwrap(),
+                (TrustAnchorType::Manifest, trust_uri.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_context_default_ekus_do_not_restore_default_anchors() {
+        use crate::crypto::cose::CertificateTrustError;
+
+        let certs = pem::parse_many(include_bytes!(
+            "../tests/fixtures/crypto/raw_signature/es256.pub"
+        ))
+        .unwrap();
+        let leaf = certs[0].contents();
+        let chain: Vec<Vec<u8>> = certs[1..]
+            .iter()
+            .map(|cert| cert.contents().to_vec())
+            .collect();
+
+        // The test-only default policy trusts this chain, but an empty context must not.
+        CertificateTrustPolicy::default()
+            .check_certificate_trust(&chain, leaf, None)
+            .unwrap();
+        let mut context = Context::new();
+        context.settings_mut().trust.anchors = None;
+        context.settings_mut().trust.trust_config = None;
+        let store = Store::from_context(&context);
+        assert_eq!(store.ctp.anchor_sets().count(), 0);
+        assert_eq!(
+            store.ctp.check_certificate_trust(&chain, leaf, None),
+            Err(CertificateTrustError::CertificateNotTrusted)
         );
     }
 
