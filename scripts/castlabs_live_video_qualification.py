@@ -100,6 +100,8 @@ REQUIRED_SYMBOLS = (
     "c2pa_signer_add_dynamic_assertion",
     "c2pa_reader_from_fragmented_files",
     "c2pa_reader_from_fragmented_files_context",
+    "c2pa_reader_with_fragment_at_offset",
+    "c2pa_reader_fragment_at_offset_supported",
     "c2pa_builder_sign_fragmented",
     "c2pa_live_video_vsi_signer_create_ed25519",
     "c2pa_live_video_vsi_signer_sign_init_segment",
