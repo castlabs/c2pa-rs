@@ -511,7 +511,7 @@ Symbol {
             (ROOT / relative).read_text(encoding="utf-8")
             for relative in ("c2pa_c_ffi/src/c_api.rs", "c2pa_c_ffi/src/live_video.rs")
         )
-        self.assertEqual(len(qualification.REQUIRED_SYMBOLS), 29)
+        self.assertEqual(len(qualification.REQUIRED_SYMBOLS), 31)
         self.assertEqual(qualification.TRUSTED_VSI_CAPABILITIES, 63)
         self.assertEqual(qualification.TRUSTED_VSI_CONTRACT_REVISION, 3)
         self.assertEqual(

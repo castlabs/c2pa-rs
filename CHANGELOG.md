@@ -30,6 +30,8 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ### Fixed
 
+* Reject a fragment that matches a fragmented BMFF Merkle map without `initHash` as `assertion.bmffHash.malformed` in the new offset-aware fragment entry points too. The guard itself is contentauth/c2pa-rs#2609, already on this line for both fragment verifiers (`Reader::from_fragment` / `with_fragment`, `from_fragmented_files` / `with_fragmented_files`); castlabs/c2pa-rs#18 adds regression tests through `Reader::from_fragment`, `from_fragment_at_offset` and its async form, and every fragment verifier.
+* Whole-file verification of a single-file fragmented asset rejects such a map the same way. This goes beyond #2609, and upstream still has the gap: without `initHash` only the leaves were verified, so the bytes before the first `moof` (`ftyp`, `moov`) were not covered. A file with a root `moof` whose maps were written without `initHash` (for example `ftyp` + `moof` + `mdat` with no `moov`, signed with `merkle_tree_chunk_size_in_kb`) now reports `assertion.bmffHash.malformed` instead of `assertion.bmffHash.mismatch`; it did not validate before either.
 * Preserve each TFRA entry's fragment target when inserting, resizing, or removing BMFF metadata. Offset adjustment now rejects unsupported TFRA versions instead of interpreting them as version 0. Previously corrupted TFRA tables are not repaired.
 * Generate fragment Merkle bindings when embedding manifests in supported single-track, single-file fragmented MP4 assets. Unsupported addressing, multiplexed layouts, and detached fragment signing fail explicitly; existing Merkle-bound files require an update manifest instead of ordinary re-signing.
 * Verify single-file fragmented BMFF assets against the Merkle maps named by their UUID boxes rather than unrelated rendition maps.
@@ -37,6 +39,7 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ### Added
 
+* Verify one fragment of a single-file fragmented BMFF asset without the whole file: `Reader::from_fragment_at_offset` / `with_fragment_at_offset`, `Store::load_fragment_from_stream_at_offset` and `BmffHash::verify_stream_segment_at_offset` take the fragment's absolute byte offset in the asset, which the leaf hashes of such an asset cover. The fragment must contain exactly the leaf's hashed root boxes at their absolute offsets: with the default exclusions it starts at a `merkle` uuid box and ends right before the next one (or at end of file), and the initialization bytes are everything before the first `merkle` uuid box. This is what a byte-range HLS player needs to validate per segment; the multi-file entry points are unchanged and keep hashing fragments as their own files.
 * Register `.m4s` and `.cmfv` BMFF extensions for fragmented init segments.
 
 ## [0.89.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.2...c2pa-v0.89.3)
