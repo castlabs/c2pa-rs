@@ -1290,7 +1290,7 @@ fn single_file_segment_offsets_are_mandatory_on_the_old_api() {
     }
 }
 
-#[tokio::test]
+#[c2pa_macros::c2pa_test_async]
 async fn single_file_segments_verify_async() {
     let signed = sign(RELATIVE);
     let (init, segments) = spec_cut(&signed);
@@ -1539,7 +1539,7 @@ fn initless_map_is_malformed_through_the_reader() {
     assert_malformed(&reader, "from_fragment");
 }
 
-#[tokio::test]
+#[c2pa_macros::c2pa_test_async]
 async fn initless_map_is_malformed_through_the_async_reader() {
     let (init, fragment) = initless_init_and_fragment();
     let reader = Reader::from_fragment_at_offset_async(
