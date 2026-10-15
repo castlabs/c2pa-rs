@@ -12,16 +12,24 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 ### Castlabs conformance candidate (Program 0.2 / C2PA 2.4)
 
 * Add `verify.validation_time` (RFC 3339) as the request-scoped evaluation
-  instant for certificate, chain, OCSP and reported validation time
-  (`CertificateTrustPolicy::set_validation_time` / `evaluation_time`).
+  instant (`CertificateTrustPolicy::set_validation_time` / `evaluation_time`)
+  for exactly these paths: claim-signer chain and end-entity validity without
+  an authenticated signing time; OCSP freshness/revocation without a signing
+  time, including the certificate-status assertion pre-pass and the OCSP
+  responder certificate policy; the CAWG X.509 identity-assertion trust policy;
+  and the reported `validationTime` (Reader and crJSON). CAWG identity claims
+  aggregation (ICA) credential `validFrom`/`validUntil` and live-video
+  session-key validity windows still use the current time.
 * Purpose-scoped trust uses this line's always-strict
   `CertificateTrustPolicy::check_certificate_trust_for(.., TrustListKind)`
   isolation; the conformance candidate's `TrustPurpose` enum and
   `verify.strict_trust_purposes` (with its legacy TSA/identity fallback) are not
   carried over.
 * Route an untyped `specVersion` in `claim_generator_info` (settings or
-  `insert()`) into the typed field and reject conflicting values; unwrap
-  tag-preserving COSE_Sign1 live-video signer bindings.
+  `insert()`) into the typed field and reject conflicting values; a
+  non-string `specVersion` in `builder.claim_generator_info` settings is a
+  `BadParam` error. Accept live-video signer bindings carrying at most one
+  COSE_Sign1 tag (18); nested tags are rejected, matching the serializer.
 * Keep the default EKU allow-list when context trust settings are applied.
 * Checked crJSON export through the C FFI: `c2pa_reader_crjson` returns NULL
   with an error instead of `{}` when the exporter fails.

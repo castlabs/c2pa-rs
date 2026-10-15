@@ -646,13 +646,23 @@ pub struct Verify {
     pub strict_v1_validation: bool,
     /// Caller-controlled validation instant as an RFC 3339 date-time.
     ///
-    /// When set, every decision that means "the current time" during
-    /// validation (certificate validity without a trusted timestamp, the
-    /// certificate chain check time, OCSP freshness/revocation without a
-    /// signing time, and the reported `validationTime`) uses this instant
-    /// instead of the wall clock. Authenticated signing and time-stamp times
-    /// are unaffected. Offsets are normalized to UTC; sub-second precision is
-    /// accepted and truncated to whole seconds for certificate decisions.
+    /// When set, exactly these validation paths use this instant instead of
+    /// the wall clock:
+    ///
+    /// * claim-signer certificate chain and end-entity validity when there is
+    ///   no authenticated signing time;
+    /// * OCSP freshness/revocation without a signing time, including the
+    ///   certificate-status assertion pre-pass and the OCSP responder
+    ///   certificate policy;
+    /// * the CAWG X.509 identity-assertion trust policy;
+    /// * the reported `validationTime` (Reader validation results and crJSON).
+    ///
+    /// Other time checks still use the current time; in particular CAWG
+    /// identity claims aggregation (ICA) credential `validFrom`/`validUntil`
+    /// and live-video session-key validity windows. Authenticated signing and
+    /// time-stamp times are unaffected. Offsets are normalized to UTC;
+    /// sub-second precision is accepted and truncated to whole seconds for
+    /// certificate decisions.
     ///
     /// The default value is `None` (use the wall clock).
     pub validation_time: Option<String>,

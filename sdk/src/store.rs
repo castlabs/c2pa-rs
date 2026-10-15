@@ -40,12 +40,11 @@ use crate::{
     crypto::{
         asn1::rfc3161::TstInfo,
         cose::{
-            cert_chain_from_sign1, fetch_and_check_ocsp_response,
-            fetch_and_check_ocsp_response_async, parse_cose_sign1, CertificateTrustPolicy,
-            TimeStampStorage, TrustAnchorType,
+            cert_chain_from_sign1, check_certificate_status_response,
+            fetch_and_check_ocsp_response, fetch_and_check_ocsp_response_async, parse_cose_sign1,
+            CertificateTrustPolicy, TimeStampStorage, TrustAnchorType,
         },
         hash::sha256,
-        ocsp::OcspResponse,
         time_stamp::verify_time_stamp,
     },
     dynamic_assertion::{
@@ -2044,12 +2043,16 @@ impl Store {
 
                 // save the ocsp_ders stored in the StoreValidationInfo
                 for ocsp_der in certificate_status_assertion.as_ref() {
-                    // OCSP status codes refer to the claim signature box
+                    // OCSP status codes refer to the claim signature box.
+                    // Evaluate at the same instant as the later stapled check
+                    // (`verify.validation_time` when set, else wall clock) so
+                    // one signature cannot be reported both notRevoked and
+                    // revoked.
                     validation_log.push_current_uri(found_claim.signature_uri());
-                    let checked = OcspResponse::from_der_checked(
+                    let checked = check_certificate_status_response(
                         ocsp_der,
                         &signing_cert_chain,
-                        None,
+                        &self.ctp,
                         validation_log,
                     );
                     validation_log.pop_current_uri();

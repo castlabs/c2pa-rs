@@ -52,8 +52,10 @@ where
 
 /// Deserialize the `signer_binding` field.
 ///
-/// Keep the inner representation for tag 18; retain legacy untagged values.
-/// Other tags are not stripped and will fail signer-binding validation.
+/// Keep the inner representation for a single tag 18; retain legacy untagged
+/// values. Other tags, and a tag 18 that wraps a further tag, are kept intact
+/// so signer-binding validation rejects them (the serializer permits at most
+/// one tag 18).
 fn deserialize_cose_sign1_tagged<'de, D>(
     deserializer: D,
 ) -> std::result::Result<c2pa_cbor::Value, D::Error>
@@ -61,7 +63,9 @@ where
     D: serde::Deserializer<'de>,
 {
     match c2pa_cbor::Value::deserialize(deserializer)? {
-        c2pa_cbor::Value::Tag(18, value) => Ok(*value),
+        c2pa_cbor::Value::Tag(18, value) if !matches!(*value, c2pa_cbor::Value::Tag(..)) => {
+            Ok(*value)
+        }
         value => Ok(value),
     }
 }
@@ -119,6 +123,7 @@ impl AssertionCbor for SessionKeys {}
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic)]
     #![allow(clippy::unwrap_used)]
 
     use super::*;
@@ -219,6 +224,43 @@ mod tests {
             };
             assert!(c2pa_cbor::to_vec(&invalid_key).is_err());
         }
+    }
+
+    #[test]
+    fn signer_binding_deserialization_strips_only_one_cose_tag() {
+        use c2pa_cbor::Value;
+
+        let original = SessionKeys {
+            keys: vec![minimal_session_key()],
+        };
+        let inner = original.keys[0].signer_binding.clone();
+
+        // Re-encode the wire form with a given signerBinding value.
+        let wire_with = |binding: Value| {
+            let mut root: Value =
+                c2pa_cbor::from_slice(&c2pa_cbor::to_vec(&original).unwrap()).unwrap();
+            let Value::Map(root_map) = &mut root else {
+                panic!("session keys must be a map");
+            };
+            let Some(Value::Array(keys)) = root_map.get_mut(&Value::Text("keys".into())) else {
+                panic!("keys must be an array");
+            };
+            let Value::Map(key) = &mut keys[0] else {
+                panic!("session key must be a map");
+            };
+            key.insert(Value::Text("signerBinding".into()), binding);
+            c2pa_cbor::to_vec(&root).unwrap()
+        };
+
+        // One tag: stripped to the inner COSE_Sign1 array.
+        let single: SessionKeys =
+            c2pa_cbor::from_slice(&wire_with(Value::Tag(18, Box::new(inner.clone())))).unwrap();
+        assert_eq!(single.keys[0].signer_binding, inner);
+
+        // Nested tags: kept intact so signer-binding validation rejects them.
+        let nested_value = Value::Tag(18, Box::new(Value::Tag(18, Box::new(inner))));
+        let nested: SessionKeys = c2pa_cbor::from_slice(&wire_with(nested_value.clone())).unwrap();
+        assert_eq!(nested.keys[0].signer_binding, nested_value);
     }
 
     #[test]

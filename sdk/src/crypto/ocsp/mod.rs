@@ -69,6 +69,10 @@ impl OcspResponse {
     /// single response in the OCSP response whose `certId` does not identify
     /// that certificate is ignored, so a validly-signed response issued for an
     /// unrelated certificate cannot produce a status for the signer.
+    ///
+    /// Test-only: production callers use [`Self::from_der_checked_at`] so the
+    /// caller-controlled `verify.validation_time` replaces the wall clock.
+    #[cfg(test)]
     pub(crate) fn from_der_checked(
         der: &[u8],
         signing_cert_chain: &[Vec<u8>],
