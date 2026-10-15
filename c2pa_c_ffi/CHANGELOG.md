@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+* Add `c2pa_reader_with_fragment_at_offset(reader, format, stream, fragment,
+  fragment_offset)` to verify one byte-range fragment of a single-file
+  fragmented MP4 at its absolute offset (`Reader::with_fragment_at_offset`),
+  and the `bool c2pa_reader_fragment_at_offset_supported(void)` probe. Not
+  feature-gated; the trusted VSI contract revision (3) and capability mask
+  are unchanged.
 * Add an experimental, feature-gated stateful C API for local Ed25519 C2PA
   live-video VSI signing. The Milestone 1 profile supports one CMAF track per
   representation and requires a signed initialization segment.
