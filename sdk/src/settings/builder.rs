@@ -198,6 +198,20 @@ pub struct ClaimGeneratorInfoSettings {
     pub other: HashMap<String, serde_json::Value>,
 }
 
+/// Reads an untyped `specVersion` from claim generator info settings.
+///
+/// A present but non-string value is an error rather than being dropped,
+/// consistent with [`ClaimGeneratorInfo`]'s own `specVersion` normalization.
+fn spec_version_from_other(other: &HashMap<String, serde_json::Value>) -> Result<Option<String>> {
+    match other.get("specVersion") {
+        None => Ok(None),
+        Some(serde_json::Value::String(version)) => Ok(Some(version.clone())),
+        Some(_) => Err(Error::BadParam(
+            "claim_generator_info specVersion must be a string".to_string(),
+        )),
+    }
+}
+
 impl TryFrom<ClaimGeneratorInfoSettings> for ClaimGeneratorInfo {
     type Error = Error;
 
@@ -214,10 +228,11 @@ impl TryFrom<ClaimGeneratorInfoSettings> for ClaimGeneratorInfo {
                     ClaimGeneratorInfoOperatingSystem::Other(name) => name,
                 })
             },
-            spec_version: None,
+            spec_version: spec_version_from_other(&value.other)?,
             other: value
                 .other
                 .into_iter()
+                .filter(|(key, _)| key != "specVersion")
                 .map(|(key, value)| {
                     serde_json::to_value(value)
                         .map(|value| (key, value))
@@ -247,10 +262,11 @@ impl TryFrom<&ClaimGeneratorInfoSettings> for ClaimGeneratorInfo {
                     ClaimGeneratorInfoOperatingSystem::Other(name) => name.clone(),
                 })
             },
-            spec_version: None,
+            spec_version: spec_version_from_other(&value.other)?,
             other: value
                 .other
                 .iter()
+                .filter(|(key, _)| key.as_str() != "specVersion")
                 .map(|(key, value)| {
                     serde_json::to_value(value)
                         .map(|value| (key.clone(), value))
@@ -758,6 +774,44 @@ pub mod tests {
         let info = ClaimGeneratorInfo::try_from(&settings).unwrap();
         assert_eq!(info.name, "Test Generator");
         assert_eq!(settings.name, "Test Generator"); // Original still valid
+    }
+
+    #[test]
+    fn test_claim_generator_info_spec_version_must_be_string() {
+        fn assert_rejected(settings: ClaimGeneratorInfoSettings) {
+            for result in [
+                ClaimGeneratorInfo::try_from(&settings),
+                ClaimGeneratorInfo::try_from(settings.clone()),
+            ] {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(&err, Error::BadParam(msg) if msg.contains("specVersion must be a string")),
+                    "expected BadParam, got {err:?}"
+                );
+            }
+        }
+
+        // TOML number
+        let toml_settings: ClaimGeneratorInfoSettings =
+            toml::from_str("name = \"Test Generator\"\nspecVersion = 2\n").unwrap();
+        assert!(toml_settings.other["specVersion"].is_number());
+        assert_rejected(toml_settings);
+
+        // JSON number
+        let json_settings: ClaimGeneratorInfoSettings =
+            serde_json::from_str(r#"{"name":"Test Generator","specVersion":2.4}"#).unwrap();
+        assert_rejected(json_settings);
+
+        // A string is routed into the typed field, not `other`.
+        let string_settings: ClaimGeneratorInfoSettings =
+            serde_json::from_str(r#"{"name":"Test Generator","specVersion":"2.4"}"#).unwrap();
+        for info in [
+            ClaimGeneratorInfo::try_from(&string_settings).unwrap(),
+            ClaimGeneratorInfo::try_from(string_settings).unwrap(),
+        ] {
+            assert_eq!(info.spec_version.as_deref(), Some("2.4"));
+            assert!(!info.other.contains_key("specVersion"));
+        }
     }
 
     #[test]

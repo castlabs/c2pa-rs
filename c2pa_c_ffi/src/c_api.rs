@@ -1725,13 +1725,18 @@ pub unsafe extern "C" fn c2pa_reader_detailed_json(reader_ptr: *mut C2paReader) 
 
 /// Returns a crJSON string generated from a C2paReader.
 ///
+/// Returns NULL and sets the last error if the crJSON export fails.
+///
 /// # Safety
 /// The returned value MUST be released by calling c2pa_free
 /// and it is no longer valid after that call.
 #[no_mangle]
 pub unsafe extern "C" fn c2pa_reader_crjson(reader_ptr: *mut C2paReader) -> *mut c_char {
     let c2pa_reader = deref_or_return_null!(reader_ptr, C2paReader);
-    to_c_string(c2pa_reader.crjson())
+    // Exporter failures must surface as errors, never as an empty `{}` that a
+    // caller could mistake for a successful crJSON document.
+    let crjson = ok_or_return_null!(c2pa_reader.crjson_checked());
+    to_c_string(crjson)
 }
 
 /// Returns the remote url of the manifest if it was obtained remotely.
