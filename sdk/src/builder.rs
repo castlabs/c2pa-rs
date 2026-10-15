@@ -7338,6 +7338,78 @@ mod tests {
     }
 
     #[test]
+    fn test_with_archive_drops_archive_metadata_assertion() -> Result<()> {
+        let settings = Settings::new().with_value("builder.generate_c2pa_archive", true)?;
+        let context = Context::new().with_settings(settings)?;
+        let builder = Builder::from_context(context)
+            .with_definition(r#"{"title": "Test Archive Metadata"}"#)?;
+
+        let mut archive = Cursor::new(Vec::new());
+        builder.to_archive(&mut archive)?;
+        archive.rewind()?;
+
+        let loaded = Builder::default().with_archive(archive)?;
+        assert!(
+            !loaded
+                .definition
+                .assertions
+                .iter()
+                .any(|a| a.label == crate::assertions::labels::ARCHIVE_METADATA),
+            "archive bookkeeping assertion should not survive into the reconstructed builder"
+        );
+
+        Ok(())
+    }
+
+    /// The restored builder must not sign the archive's bookkeeping assertion,
+    /// while the definition's own assertions survive the round trip.
+    #[test]
+    fn test_signing_from_archive_omits_archive_metadata_assertion() -> Result<()> {
+        let settings = Settings::new().with_value("builder.generate_c2pa_archive", true)?;
+        let context = Context::new().with_settings(settings)?;
+        let mut builder = Builder::from_context(context)
+            .with_definition(r#"{"title": "Signed From Archive"}"#)?;
+        builder.add_action(json!({
+            "action": "c2pa.created",
+            "digitalSourceType": "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCreation"
+        }))?;
+        builder.add_assertion("org.example.kept", &json!({"answer": 42}))?;
+
+        let mut archive = Cursor::new(Vec::new());
+        builder.to_archive(&mut archive)?;
+        archive.rewind()?;
+        let mut loaded = Builder::default().with_archive(archive)?;
+
+        let signer = test_signer(SigningAlg::Ps256);
+        let mut source = Cursor::new(TEST_IMAGE);
+        let mut dest = Cursor::new(Vec::new());
+        loaded.sign(signer.as_ref(), "image/jpeg", &mut source, &mut dest)?;
+
+        dest.rewind()?;
+        let reader = Reader::default().with_stream("image/jpeg", &mut dest)?;
+        assert_ne!(reader.validation_state(), ValidationState::Invalid);
+        let labels: Vec<String> = reader
+            .active_manifest()
+            .expect("signed asset should have an active manifest")
+            .assertions()
+            .iter()
+            .map(|a| a.label().to_owned())
+            .collect();
+        assert!(
+            labels.iter().any(|l| l == "org.example.kept"),
+            "the definition's own assertion was lost: {labels:?}"
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l.starts_with(crate::assertions::labels::ARCHIVE_METADATA)),
+            "archive bookkeeping assertion was signed into the asset: {labels:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_archive_self_signed_ed25519_signature() -> Result<()> {
         let settings = Settings::new().with_value("builder.generate_c2pa_archive", true)?;
 
