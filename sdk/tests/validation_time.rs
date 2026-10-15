@@ -238,6 +238,8 @@ fn claim_signer_cannot_use_tsa_only_list() -> Result<()> {
     Ok(())
 }
 
+// WASI test runners cannot spawn threads.
+#[cfg(not(target_os = "wasi"))]
 #[test]
 fn concurrent_contexts_do_not_share_time() -> Result<()> {
     let asset = std::sync::Arc::new(signed_untimestamped()?);
