@@ -37,6 +37,7 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ### Added
 
+* Verify one fragment of a single-file fragmented BMFF asset without the whole file: `Reader::from_fragment_at_offset` / `with_fragment_at_offset`, `Store::load_fragment_from_stream_at_offset` and `BmffHash::verify_stream_segment_at_offset` take the fragment's absolute byte offset in the asset, which the leaf hashes of such an asset cover. The fragment must contain exactly the leaf's hashed root boxes at their absolute offsets: with the default exclusions it starts at a `merkle` uuid box and ends right before the next one (or at end of file), and the initialization bytes are everything before the first `merkle` uuid box. This is what a byte-range HLS player needs to validate per segment; the multi-file entry points are unchanged and keep hashing fragments as their own files.
 * Register `.m4s` and `.cmfv` BMFF extensions for fragmented init segments.
 
 ## [0.89.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.2...c2pa-v0.89.3)
