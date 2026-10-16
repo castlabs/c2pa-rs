@@ -13,8 +13,9 @@
 
 //! Schema compliance tests for crJSON format.
 //!
-//! These tests validate CrJSON output against the actual crJSON JSON Schema
-//! (`cli/schemas/crJSON-schema.json`) using the `jsonschema` crate, plus
+//! These tests validate default crJSON output against the SDK schema and explicit
+//! published 2.4 output against the pinned published schema (see
+//! `fixtures/schemas/README.md`), with format validation enabled, plus
 //! targeted structural assertions for requirements the schema leaves as
 //! `additionalProperties: true`.
 //!
@@ -28,14 +29,18 @@
 
 use std::io::Cursor;
 
-use c2pa::{Context, Reader, Result, Settings};
-use jsonschema::validator_for;
+use c2pa::{Builder, BuilderIntent, Context, Reader, Result, Settings};
+use sha2::{Digest, Sha256};
+
+use crate::common::{test_settings, test_signer};
 
 const IMAGE_WITH_MANIFEST: &[u8] = include_bytes!("../fixtures/CA.jpg");
 const IMAGE_WITH_INGREDIENT: &[u8] = include_bytes!("../fixtures/CA.jpg");
 
 /// The crJSON JSON Schema bundled with the project.
 const CRJSON_SCHEMA: &str = include_str!("../fixtures/schemas/crJSON-schema.json");
+const CRJSON_PUBLISHED_2_4_SCHEMA: &str =
+    include_str!("../fixtures/schemas/crJSON-2.4-schema.json");
 
 /// When `C2PA_WRITE_CRJSON` is set, write crJSON to `target/crjson_test_output/`
 /// so you can inspect the exact output.
@@ -50,15 +55,18 @@ fn maybe_write_crjson_output(name: &str, json: &str) {
 }
 
 /// Parse the bundled schema and compile a validator. Panics if the schema is invalid.
-fn compiled_schema() -> jsonschema::Validator {
+fn compiled_schema(schema: &str) -> jsonschema::Validator {
     let schema_value: serde_json::Value =
-        serde_json::from_str(CRJSON_SCHEMA).expect("crJSON-schema.json must be valid JSON");
-    validator_for(&schema_value).expect("crJSON schema must compile without errors")
+        serde_json::from_str(schema).expect("crJSON schema must be valid JSON");
+    jsonschema::options()
+        .should_validate_formats(true)
+        .build(&schema_value)
+        .expect("crJSON schema must compile without errors")
 }
 
 /// Assert that `value` validates against the crJSON schema, printing all errors on failure.
 fn assert_schema_valid(value: &serde_json::Value) {
-    let validator = compiled_schema();
+    let validator = compiled_schema(CRJSON_SCHEMA);
     let errors: Vec<_> = validator.iter_errors(value).collect();
     if !errors.is_empty() {
         let msgs: Vec<String> = errors
@@ -73,6 +81,112 @@ fn assert_schema_valid(value: &serde_json::Value) {
 }
 
 // ── Root document ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_crjson_published_2_4_schema_hash() {
+    assert_eq!(
+        hex::encode(Sha256::digest(CRJSON_PUBLISHED_2_4_SCHEMA.as_bytes())),
+        "0cd7c0d554f9d3c388257688a361152a98c112fc9fc36a25e032972d7fc55613"
+    );
+}
+
+fn assert_published_2_4_export(reader: &Reader) -> Result<()> {
+    let latest = reader.to_crjson_value()?;
+    assert_schema_valid(&latest);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reader.crjson_checked()?)?,
+        latest
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reader.crjson())?,
+        latest
+    );
+
+    let validator = compiled_schema(CRJSON_PUBLISHED_2_4_SCHEMA);
+    // The default/latest export intentionally has fields forbidden by published 2.4.
+    assert!(!validator.is_valid(&latest));
+    let published = reader.to_crjson_value_published_2_4()?;
+    if let Err(error) = validator.validate(&published) {
+        panic!("published 2.4 schema: [{}] {error}", error.instance_path());
+    }
+
+    let mut expected = latest.clone();
+    for manifest in expected["manifests"].as_array_mut().unwrap() {
+        let manifest = manifest.as_object_mut().unwrap();
+        assert!(manifest.remove("isUpdateManifest").unwrap().is_boolean());
+        assert!(manifest
+            .remove("isCompressedManifest")
+            .unwrap()
+            .is_boolean());
+    }
+    assert_eq!(published, expected);
+    assert_eq!(
+        reader.to_crjson_value()?,
+        latest,
+        "export must not mutate the reader"
+    );
+
+    let mut invalid = published.clone();
+    invalid["manifests"][0]["validationResults"]["validationTime"] =
+        serde_json::json!("not a date");
+    assert!(!validator.is_valid(&invalid));
+    let mut invalid = published;
+    invalid["@context"]["@vocab"] = serde_json::json!("not a URI");
+    assert!(!validator.is_valid(&invalid));
+    Ok(())
+}
+
+#[test]
+fn test_crjson_published_2_4_standard_and_update() -> Result<()> {
+    for (image, is_update) in [
+        (IMAGE_WITH_MANIFEST, false),
+        (
+            include_bytes!("../fixtures/update_manifest.jpg").as_slice(),
+            true,
+        ),
+    ] {
+        let reader = Reader::default().with_stream("image/jpeg", Cursor::new(image))?;
+        let latest = reader.to_crjson_value()?;
+        assert_eq!(latest["manifests"][0]["isUpdateManifest"], is_update);
+        assert_eq!(latest["manifests"][0]["isCompressedManifest"], false);
+        assert_published_2_4_export(&reader)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_crjson_published_2_4_generated_v2_and_compressed() -> Result<()> {
+    for compressed in [false, true] {
+        let mut settings = test_settings();
+        settings.core.prefer_compress_manifests = compressed;
+        let context = Context::new().with_settings(settings)?.into_shared();
+        let mut builder = Builder::from_shared_context(&context);
+        builder.set_intent(BuilderIntent::Edit);
+        builder.definition.claim_version = Some(2);
+        builder.add_assertion(
+            "org.test.flags",
+            &serde_json::json!({
+                "isUpdateManifest": true,
+                "isCompressedManifest": true
+            }),
+        )?;
+        let mut dest = Cursor::new(Vec::new());
+        builder.sign(
+            &test_signer(),
+            "image/jpeg",
+            &mut Cursor::new(IMAGE_WITH_MANIFEST),
+            &mut dest,
+        )?;
+        dest.set_position(0);
+        let reader = Reader::from_shared_context(&context).with_stream("image/jpeg", dest)?;
+        let latest = reader.to_crjson_value()?;
+        assert!(latest["manifests"][0]["claim.v2"].is_object());
+        assert_eq!(latest["manifests"][0]["isUpdateManifest"], false);
+        assert_eq!(latest["manifests"][0]["isCompressedManifest"], compressed);
+        assert_published_2_4_export(&reader)?;
+    }
+    Ok(())
+}
 
 /// The full crJSON output must pass JSON Schema validation.
 #[test]
@@ -661,17 +775,20 @@ fn test_crjson_version_matches_native_validator_with_v1_settings() -> Result<()>
             .with_stream("image/jpeg", Cursor::new(IMAGE_WITH_MANIFEST))?;
         let native = serde_json::to_value(reader.validation_results().unwrap())?;
         let exported = reader.to_crjson_value()?;
+        let published = reader.to_crjson_value_published_2_4()?;
         assert_eq!(native["specVersion"], "2.4.0");
         assert!(exported["manifests"]
             .as_array()
             .unwrap()
             .iter()
             .any(|manifest| manifest.get("claim").is_some()));
-        for manifest in exported["manifests"].as_array().unwrap() {
-            assert_eq!(
-                manifest["validationResults"]["specVersion"], native["specVersion"],
-                "strict_v1_validation={strict_v1}"
-            );
+        for document in [&exported, &published] {
+            for manifest in document["manifests"].as_array().unwrap() {
+                assert_eq!(
+                    manifest["validationResults"]["specVersion"], native["specVersion"],
+                    "strict_v1_validation={strict_v1}"
+                );
+            }
         }
     }
     Ok(())

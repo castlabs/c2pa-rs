@@ -166,10 +166,13 @@ struct CrJsonClaim {
 #[derive(Serialize)]
 struct CrJsonManifest {
     label: String,
-    #[serde(rename = "isUpdateManifest")]
-    is_update_manifest: bool,
-    #[serde(rename = "isCompressedManifest")]
-    is_compressed_manifest: bool,
+    #[serde(rename = "isUpdateManifest", skip_serializing_if = "Option::is_none")]
+    is_update_manifest: Option<bool>,
+    #[serde(
+        rename = "isCompressedManifest",
+        skip_serializing_if = "Option::is_none"
+    )]
+    is_compressed_manifest: Option<bool>,
     /// Assertions map: `label -> assertion value`. Keys may include instance suffixes
     /// such as `c2pa.actions__2`.
     assertions: Map<String, Value>,
@@ -206,8 +209,17 @@ struct CrJsonDocument {
 // ── Public entry point ──────────────────────────────────────────────────────
 
 /// Convert a Reader's manifest store to crJSON format.
-pub fn from_reader(reader: &Reader) -> Result<Value> {
-    CrJsonExporter::new(reader).to_value()
+pub fn from_reader(reader: &Reader, published_2_4: bool) -> Result<Value> {
+    let mut doc = CrJsonExporter::new(reader).build_document()?;
+    if published_2_4 {
+        // These wrapper fields postdate the published 2.4 schema. Do not strip
+        // similarly named fields from assertions or change validation results.
+        for manifest in &mut doc.manifests {
+            manifest.is_update_manifest = None;
+            manifest.is_compressed_manifest = None;
+        }
+    }
+    serde_json::to_value(doc).map_err(Error::JsonError)
 }
 
 // ── Exporter ────────────────────────────────────────────────────────────────
@@ -219,11 +231,6 @@ struct CrJsonExporter<'a> {
 impl<'a> CrJsonExporter<'a> {
     fn new(reader: &'a Reader) -> Self {
         Self { reader }
-    }
-
-    fn to_value(&self) -> Result<Value> {
-        let doc = self.build_document()?;
-        serde_json::to_value(doc).map_err(Error::JsonError)
     }
 
     fn build_document(&self) -> Result<CrJsonDocument> {
@@ -281,8 +288,8 @@ impl<'a> CrJsonExporter<'a> {
 
         Ok(CrJsonManifest {
             label: label.to_string(),
-            is_update_manifest: claim.update_manifest(),
-            is_compressed_manifest: claim.compressed(),
+            is_update_manifest: Some(claim.update_manifest()),
+            is_compressed_manifest: Some(claim.compressed()),
             assertions,
             claim_v1,
             claim_v2,
