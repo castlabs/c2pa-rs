@@ -34,6 +34,7 @@ use crate::{
         },
     },
     log_item,
+    settings::TrustListKind,
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
         ALGORITHM_UNSUPPORTED, SIGNING_CREDENTIAL_INVALID, SIGNING_CREDENTIAL_TRUSTED,
@@ -97,7 +98,8 @@ fn spki_matches_signing_alg(alg: SigningAlg, spki: &AlgorithmIdentifier) -> bool
 }
 
 impl Verifier<'_> {
-    /// Verify a COSE signature according to the configured policies.
+    /// Verify a manifest COSE signature according to the configured policies.
+    /// CAWG identity verification selects its own trust purpose internally.
     #[async_generic]
     pub fn verify_signature(
         &self,
@@ -106,6 +108,38 @@ impl Verifier<'_> {
         additional_data: &[u8],
         tst_info: Option<&TstInfo>,
         validation_log: &mut StatusTracker,
+    ) -> Result<CertificateInfo, CoseError> {
+        if _sync {
+            self.verify_signature_for(
+                cose_sign1,
+                data,
+                additional_data,
+                tst_info,
+                validation_log,
+                TrustListKind::Manifest,
+            )
+        } else {
+            self.verify_signature_for_async(
+                cose_sign1,
+                data,
+                additional_data,
+                tst_info,
+                validation_log,
+                TrustListKind::Manifest,
+            )
+            .await
+        }
+    }
+
+    #[async_generic]
+    pub(crate) fn verify_signature_for(
+        &self,
+        cose_sign1: &[u8],
+        data: &[u8],
+        additional_data: &[u8],
+        tst_info: Option<&TstInfo>,
+        validation_log: &mut StatusTracker,
+        purpose: TrustListKind,
     ) -> Result<CertificateInfo, CoseError> {
         let mut sign1 = parse_cose_sign1(cose_sign1, data, validation_log)?;
 
@@ -138,9 +172,9 @@ impl Verifier<'_> {
 
         // check the trust for this item
         let result = if _sync {
-            self.verify_trust(&sign1, tst_info, validation_log)
+            self.verify_trust(&sign1, tst_info, validation_log, purpose)
         } else {
-            self.verify_trust_async(&sign1, tst_info, validation_log)
+            self.verify_trust_async(&sign1, tst_info, validation_log, purpose)
                 .await
         }; // Ignore errors here - they have already been logged.
 
@@ -286,6 +320,7 @@ impl Verifier<'_> {
         sign1: &CoseSign1,
         tst_info_res: Option<&TstInfo>,
         validation_log: &mut StatusTracker,
+        purpose: TrustListKind,
     ) -> Result<(TrustAnchorType, Option<String>), CoseError> {
         // should be used in conjunction with verify_profile in most cases
 
@@ -311,10 +346,20 @@ impl Verifier<'_> {
         });
 
         let verify_result = if _sync {
-            ctp.check_certificate_trust(chain_der, end_entity_cert_der, signing_time_epoch)
+            ctp.check_certificate_trust_for(
+                chain_der,
+                end_entity_cert_der,
+                signing_time_epoch,
+                purpose,
+            )
         } else {
-            ctp.check_certificate_trust_async(chain_der, end_entity_cert_der, signing_time_epoch)
-                .await
+            ctp.check_certificate_trust_for_async(
+                chain_der,
+                end_entity_cert_der,
+                signing_time_epoch,
+                purpose,
+            )
+            .await
         };
 
         match verify_result {

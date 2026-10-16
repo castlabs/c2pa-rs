@@ -130,6 +130,9 @@ pub struct TrustAnchor {
     ///
     /// When used for C2PA this will not be C2PA trust list recognized or acknowledged certificates and
     /// should only be used for non-C2PA conformant cases.
+    ///
+    /// Entries only authorize the trust purpose named by `trust_kind` (manifest
+    /// or CAWG signing). They never authorize time-stamping authority certificates.
     pub allowed_list: Option<String>,
 
     /// Exact-match allow-list of trusted CAWG identity claims aggregation (ICA)

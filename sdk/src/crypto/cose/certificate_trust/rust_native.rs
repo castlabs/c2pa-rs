@@ -34,8 +34,9 @@ pub(crate) fn check_certificate_trust(
     chain_der: &[Vec<u8>],
     cert_der: &[u8],
     signing_time_epoch: Option<i64>,
+    purpose: TrustAnchorType,
 ) -> Result<(TrustAnchorType, String), CertificateTrustError> {
-    if ctp.anchor_sets().count() == 0 {
+    if ctp.anchor_sets().all(|a| a.trust_anchor_type != purpose) {
         return Err(CertificateTrustError::CertificateNotTrusted);
     }
 
@@ -89,7 +90,7 @@ pub(crate) fn check_certificate_trust(
         }
     }
 
-    for anchor_set in ctp.anchor_sets() {
+    for anchor_set in ctp.anchor_sets().filter(|a| a.trust_anchor_type == purpose) {
         // Process each anchor set
 
         // Build anchors and check against trust anchors.

@@ -331,7 +331,8 @@ impl IdentityAssertion {
                     );
 
                     if let Some(al) = &anchor.allowed_list {
-                        let _ = ctp.add_end_entity_credentials(al.as_bytes());
+                        let _ =
+                            ctp.add_end_entity_credentials_for(al.as_bytes(), TrustListKind::CAWG);
                     }
                 }
             }
@@ -349,21 +350,23 @@ impl IdentityAssertion {
                 match parse_cose_sign1(&self.signature, &signer_payload_cbor, status_tracker) {
                     Ok(cose_sign1) => {
                         let verify_result = if _sync {
-                            cose_verifier.verify_signature(
+                            cose_verifier.verify_signature_for(
                                 &self.signature,
                                 &signer_payload_cbor,
                                 &[],
                                 None,
                                 status_tracker,
+                                TrustListKind::CAWG,
                             )
                         } else {
                             cose_verifier
-                                .verify_signature_async(
+                                .verify_signature_for_async(
                                     &self.signature,
                                     &signer_payload_cbor,
                                     &[],
                                     None,
                                     status_tracker,
+                                    TrustListKind::CAWG,
                                 )
                                 .await
                         };
