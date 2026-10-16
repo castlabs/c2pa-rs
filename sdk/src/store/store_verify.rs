@@ -26,7 +26,11 @@ use crate::{
     claim::{Claim, ClaimAssetData},
     context::{Context, ProgressPhase},
     crypto::{
-        asn1::rfc3161::TstInfo, cose::cert_chain_from_sign1, ocsp::OcspResponse,
+        asn1::rfc3161::TstInfo,
+        cose::{
+            cert_chain_from_sign1, certificate_status_signing_time,
+            check_certificate_status_response,
+        },
         time_stamp::verify_time_stamp,
     },
     error::{Error, Result},
@@ -441,30 +445,55 @@ impl Store {
                     }
                 }
             }
+        }
 
+        // Evaluate certificate-status assertions only once every timestamp
+        // assertion has been collected: a manifest's trusted time stamp may be
+        // carried by a later manifest's timestamp assertion.
+        for found_claim in svi.manifest_map.values() {
             // get the certificate status assertions
             let certificate_status_assertions = found_claim.certificate_status_assertions();
+            if certificate_status_assertions.is_empty() {
+                continue;
+            }
+
+            // The certificate status assertion carries OCSP responses for
+            // this manifest's own signing certificate, so bind each
+            // response to that certificate's chain (RFC 6960 §4.1.1).
+            let sign1 = found_claim.cose_sign1().ok();
+            let signing_cert_chain = sign1
+                .as_ref()
+                .and_then(|sign1| cert_chain_from_sign1(sign1).ok())
+                .unwrap_or_default();
+
+            // Evaluate at the same instant as the later stapled check: the
+            // authenticated signing time, else the configured validation
+            // time, else the current time. Otherwise one signature could be
+            // reported both notRevoked and revoked.
+            let signing_time = sign1.as_ref().and_then(|sign1| {
+                let data = found_claim.data().ok()?;
+                certificate_status_signing_time(
+                    sign1,
+                    &data,
+                    &self.ctp,
+                    svi.timestamps.get(found_claim.label()),
+                    context.settings().verify.verify_timestamp_trust,
+                )
+            });
+
             for csa in certificate_status_assertions {
                 let certificate_status_assertion =
                     CertificateStatus::from_assertion(csa.assertion())?;
 
-                // The certificate status assertion carries OCSP responses for
-                // this manifest's own signing certificate, so bind each
-                // response to that certificate's chain (RFC 6960 §4.1.1).
-                let signing_cert_chain = found_claim
-                    .cose_sign1()
-                    .ok()
-                    .and_then(|sign1| cert_chain_from_sign1(&sign1).ok())
-                    .unwrap_or_default();
-
                 // save the ocsp_ders stored in the StoreValidationInfo
                 for ocsp_der in certificate_status_assertion.as_ref() {
-                    // OCSP status codes refer to the claim signature box
+                    // OCSP status codes refer to the claim signature box.
                     validation_log.push_current_uri(found_claim.signature_uri());
-                    let checked = OcspResponse::from_der_checked(
+                    let checked = check_certificate_status_response(
                         ocsp_der,
                         &signing_cert_chain,
-                        None,
+                        signing_time,
+                        &self.ctp,
                         validation_log,
                     );
                     validation_log.pop_current_uri();
@@ -501,6 +530,9 @@ impl Store {
         context: &Context,
     ) -> Result<()> {
         context.check_progress(ProgressPhase::VerifyingManifest, 1, 1)?;
+        // A malformed caller-supplied validation time must never silently
+        // degrade to the current time.
+        context.settings().verify.validation_time_epoch()?;
         let claim = match store.provenance_claim() {
             Some(c) => c,
             None => {

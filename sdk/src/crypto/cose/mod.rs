@@ -37,8 +37,11 @@ mod error;
 pub use error::CoseError;
 
 mod ocsp;
+pub(crate) use ocsp::{
+    certificate_status_signing_time, check_certificate_status_response,
+    fetch_and_check_ocsp_response, fetch_and_check_ocsp_response_async,
+};
 pub use ocsp::{check_ocsp_status, check_ocsp_status_async, get_ocsp_der, OcspFetchPolicy};
-pub(crate) use ocsp::{fetch_and_check_ocsp_response, fetch_and_check_ocsp_response_async};
 
 mod sign;
 pub use sign::CosePayload;

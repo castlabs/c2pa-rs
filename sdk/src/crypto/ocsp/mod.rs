@@ -69,12 +69,30 @@ impl OcspResponse {
     /// single response in the OCSP response whose `certId` does not identify
     /// that certificate is ignored, so a validly-signed response issued for an
     /// unrelated certificate cannot produce a status for the signer.
+    ///
+    /// Test-only: production callers use [`Self::from_der_checked_at`] so a
+    /// caller-controlled validation time can replace the current time.
+    #[cfg(test)]
     pub(crate) fn from_der_checked(
         der: &[u8],
         signing_cert_chain: &[Vec<u8>],
         signing_time: Option<DateTime<Utc>>,
         validation_log: &mut StatusTracker,
     ) -> Result<Self, OcspError> {
+        Self::from_der_checked_at(der, signing_cert_chain, signing_time, None, validation_log)
+    }
+
+    /// Like `from_der_checked`, but when no `signing_time` is available the
+    /// response is evaluated at `evaluation_time` (Unix seconds) instead of the
+    /// current time. `None` uses the current time.
+    pub(crate) fn from_der_checked_at(
+        der: &[u8],
+        signing_cert_chain: &[Vec<u8>],
+        signing_time: Option<DateTime<Utc>>,
+        evaluation_time: Option<i64>,
+        validation_log: &mut StatusTracker,
+    ) -> Result<Self, OcspError> {
+        let now_epoch = || evaluation_time.unwrap_or_else(|| time::utc_now().timestamp());
         let mut output = OcspResponse {
             ocsp_der: der.to_vec(),
             ..Default::default()
@@ -204,8 +222,8 @@ impl OcspResponse {
                         st.timestamp() < this_update
                             || (st.timestamp() >= this_update && st.timestamp() <= next_update)
                     } else {
-                        // If no signing time was provided, use current system time.
-                        let now = time::utc_now().timestamp();
+                        // If no signing time was provided, use the evaluation time.
+                        let now = now_epoch();
 
                         now >= this_update
                     };
@@ -251,8 +269,8 @@ impl OcspResponse {
                             let in_range = if let Some(st) = signing_time {
                                 revoked_at > st.timestamp()
                             } else {
-                                // No signing time was provided; use current system time.
-                                let now = time::utc_now().timestamp();
+                                // No signing time was provided; use the evaluation time.
+                                let now = now_epoch();
                                 revoked_at > now
                             };
 

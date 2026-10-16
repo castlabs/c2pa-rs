@@ -150,12 +150,16 @@ pub trait IntoSettings {
 /// Implement for Settings (passthrough)
 impl IntoSettings for Settings {
     fn into_settings(self) -> Result<Settings> {
+        // Reject a malformed validation instant up front rather than silently
+        // validating against the current time.
+        self.verify.validation_time_epoch()?;
         Ok(self)
     }
 }
 
 impl IntoSettings for &Settings {
     fn into_settings(self) -> Result<Settings> {
+        self.verify.validation_time_epoch()?;
         Ok(self.clone())
     }
 }
