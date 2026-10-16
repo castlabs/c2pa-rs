@@ -25,7 +25,7 @@ use crate::{
             cert_chain_from_sign1, check_end_entity_certificate_profile, validate_cose_tst_info,
             validate_cose_tst_info_async, CertificateTrustError, CertificateTrustPolicy, CoseError,
         },
-        ocsp::OcspResponse,
+        ocsp::{OcspError, OcspResponse},
     },
     log_item,
     settings::Settings,
@@ -361,10 +361,11 @@ fn check_stapled_ocsp_response(
     let signing_cert_chain = ocsp_signing_chain(&signing_cert_chain, ctp);
 
     let mut current_validation_log = StatusTracker::default();
-    let Ok(ocsp_data) = OcspResponse::from_der_checked(
+    let Ok(ocsp_data) = OcspResponse::from_der_checked_at(
         ocsp_response_der,
         &signing_cert_chain,
         signing_time,
+        ctp.validation_time(),
         &mut current_validation_log,
     ) else {
         return Ok(OcspResponse::default());
@@ -380,6 +381,7 @@ fn check_stapled_ocsp_response(
         let mut new_ctp = CertificateTrustPolicy::default();
         new_ctp.clear_ekus();
         new_ctp.add_mandatory_ekus(OCSP_OID_STR.as_bytes()); // ocsp signing EKU
+        new_ctp.set_validation_time(ctp.validation_time());
         if check_end_entity_certificate_profile(
             first_cert,
             &new_ctp,
@@ -411,6 +413,57 @@ fn check_stapled_ocsp_response(
     // only append usable OCSP responses to validation_log
     validation_log.append(&current_validation_log);
     Ok(ocsp_data)
+}
+
+/// Returns the authenticated signing time used to evaluate a manifest's OCSP
+/// responses, mirroring `check_stapled_ocsp_response`.
+///
+/// A trusted time stamp from a time-stamp assertion (`tst_info`) takes
+/// precedence; otherwise the signature's own time stamp (`sigTst`/`sigTst2`)
+/// is validated. Returns `None` when the signature carries no usable time
+/// stamp.
+pub(crate) fn certificate_status_signing_time(
+    sign1: &CoseSign1,
+    data: &[u8],
+    ctp: &CertificateTrustPolicy,
+    tst_info: Option<&TstInfo>,
+    verify_timestamp_trust: bool,
+) -> Option<DateTime<Utc>> {
+    let tst_info = match tst_info {
+        Some(tst_info) => tst_info.clone(),
+        None => {
+            // The time stamp is reported as part of the COSE signature check.
+            let mut local_log = StatusTracker::default();
+            validate_cose_tst_info(sign1, data, ctp, &mut local_log, verify_timestamp_trust).ok()?
+        }
+    };
+    Some(tst_info.gen_time.into())
+}
+
+/// Parses an OCSP response carried in a manifest's certificate-status
+/// assertion during the store-validation pre-pass.
+///
+/// The response is bound to `signing_cert_chain` (RFC 6960 section 4.1.1) and
+/// evaluated at the same instant as the later stapled check in
+/// `check_stapled_ocsp_response`: the authenticated `signing_time` (see
+/// [`certificate_status_signing_time`]) when there is one, otherwise the
+/// policy's caller-controlled validation time when configured, otherwise the
+/// current time. Using a different instant here could log a contradictory
+/// `signingCredential.ocsp.notRevoked` / `.revoked` pair for one signature.
+pub(crate) fn check_certificate_status_response(
+    ocsp_der: &[u8],
+    signing_cert_chain: &[Vec<u8>],
+    signing_time: Option<DateTime<Utc>>,
+    ctp: &CertificateTrustPolicy,
+    validation_log: &mut StatusTracker,
+) -> Result<OcspResponse, OcspError> {
+    OcspResponse::from_der_checked_at(
+        ocsp_der,
+        signing_cert_chain,
+        signing_time,
+        ctp.validation_time(),
+        validation_log,
+    )
 }
 
 /// Extends the certificates embedded in an OCSP response with the signer's
@@ -598,10 +651,11 @@ fn validate_fetched_ocsp(
     // response while leaving that success code behind.
     let mut current_validation_log = StatusTracker::default();
 
-    let ocsp_data = match OcspResponse::from_der_checked(
+    let ocsp_data = match OcspResponse::from_der_checked_at(
         ocsp_response_der,
         subject_chain,
         signing_time,
+        ctp.validation_time(),
         &mut current_validation_log,
     ) {
         Ok(data) => data,
@@ -618,6 +672,7 @@ fn validate_fetched_ocsp(
         let mut new_ctp = CertificateTrustPolicy::default();
         new_ctp.clear_ekus();
         new_ctp.add_mandatory_ekus(OCSP_OID_STR.as_bytes()); // ocsp signing EKU
+        new_ctp.set_validation_time(ctp.validation_time());
         if check_end_entity_certificate_profile(
             first_cert,
             &new_ctp,
@@ -644,7 +699,8 @@ fn validate_fetched_ocsp(
         // evaluates `revocationTime` against the historical `signing_time`,
         // the responder's own certificate validity and authorization (RFC 6960
         // section 3.2 requirement 4) must be evaluated at current time (`None`),
-        // matching `check_end_entity_certificate_profile` above.
+        // matching `check_end_entity_certificate_profile` above. "Current time"
+        // is the policy's caller-controlled validation time when configured.
         if ctp
             .check_certificate_trust(&ocsp_cert_chain, first_cert, None)
             .is_err()
@@ -696,10 +752,15 @@ pub fn get_ocsp_der(sign1: &coset::CoseSign1) -> Option<Vec<u8>> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use std::io::Cursor;
+
     use chrono::{TimeZone, Utc};
 
     use super::*;
-    use crate::crypto::cert_chain_pem_to_der;
+    use crate::{
+        crypto::{cert_chain_pem_to_der, cose::parse_cose_sign1},
+        store::Store,
+    };
 
     // es256.pub is a two-certificate chain: [signing leaf, intermediate CA]
     fn leaf_and_intermediate() -> Vec<Vec<u8>> {
@@ -710,6 +771,139 @@ mod tests {
     fn ocsp_signing_chain() -> Vec<Vec<u8>> {
         let pem = include_bytes!("../../../tests/fixtures/crypto/ocsp/ocsp_chain.pem");
         cert_chain_pem_to_der(pem).unwrap()
+    }
+
+    #[test]
+    fn certificate_status_pre_pass_honors_validation_time() {
+        // The certificate-status pre-pass must evaluate a response at the same
+        // instant as the later stapled check, or one signature could be
+        // reported both notRevoked and revoked. `response_good.der` has
+        // thisUpdate 2025-03-07; without a signing time a "good" response is
+        // usable only at or after thisUpdate.
+        let rsp = include_bytes!("../../../tests/fixtures/crypto/ocsp/response_good.der");
+        let chain = ocsp_signing_chain();
+        let at = |y, m, d| Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap().timestamp();
+
+        // Validation time before thisUpdate: the response is not usable.
+        let mut ctp = CertificateTrustPolicy::default();
+        ctp.set_validation_time(Some(at(2024, 1, 1)));
+        let mut log = StatusTracker::default();
+        let pre = check_certificate_status_response(rsp, &chain, None, &ctp, &mut log).unwrap();
+        assert!(!log.has_status(SIGNING_CREDENTIAL_NOT_REVOKED));
+        assert!(log.has_status(SIGNING_CREDENTIAL_REVOKED));
+
+        // Same evaluation the stapled check performs (no signing time).
+        let mut stapled_log = StatusTracker::default();
+        let stapled = OcspResponse::from_der_checked_at(
+            rsp,
+            &chain,
+            None,
+            ctp.validation_time(),
+            &mut stapled_log,
+        )
+        .unwrap();
+        assert_eq!(pre.revoked_at, stapled.revoked_at);
+        assert_eq!(
+            log.has_status(SIGNING_CREDENTIAL_NOT_REVOKED),
+            stapled_log.has_status(SIGNING_CREDENTIAL_NOT_REVOKED)
+        );
+        assert_eq!(
+            log.has_status(SIGNING_CREDENTIAL_REVOKED),
+            stapled_log.has_status(SIGNING_CREDENTIAL_REVOKED)
+        );
+
+        // Validation time after thisUpdate: usable.
+        ctp.set_validation_time(Some(at(2025, 6, 1)));
+        let mut log = StatusTracker::default();
+        check_certificate_status_response(rsp, &chain, None, &ctp, &mut log).unwrap();
+        assert!(log.has_status(SIGNING_CREDENTIAL_NOT_REVOKED));
+        assert!(!log.has_status(SIGNING_CREDENTIAL_REVOKED));
+
+        // Unset: falls back to the current time (after the 2025 thisUpdate).
+        ctp.set_validation_time(None);
+        let mut log = StatusTracker::default();
+        check_certificate_status_response(rsp, &chain, None, &ctp, &mut log).unwrap();
+        assert!(log.has_status(SIGNING_CREDENTIAL_NOT_REVOKED));
+    }
+
+    #[test]
+    fn certificate_status_pre_pass_prefers_signing_time() {
+        // Precedence must match the stapled check: authenticated signing time,
+        // then validation time, then the current time. With a signing time
+        // before thisUpdate (2025-03-07) a "good" response is usable even
+        // though the configured validation time is also before thisUpdate;
+        // evaluating at the validation time instead would log `revoked` that
+        // the timestamp-aware stapled check does not.
+        let rsp = include_bytes!("../../../tests/fixtures/crypto/ocsp/response_good.der");
+        let chain = ocsp_signing_chain();
+        let at = |y, m, d| Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap();
+        let this_update = at(2025, 3, 7);
+
+        let mut ctp = CertificateTrustPolicy::default();
+        ctp.set_validation_time(Some(at(2024, 1, 1).timestamp()));
+
+        let signing_time = at(2024, 6, 1);
+        let mut log = StatusTracker::default();
+        let pre =
+            check_certificate_status_response(rsp, &chain, Some(signing_time), &ctp, &mut log)
+                .unwrap();
+        assert!(log.has_status(SIGNING_CREDENTIAL_NOT_REVOKED));
+        assert!(!log.has_status(SIGNING_CREDENTIAL_REVOKED));
+
+        // Same evaluation the timestamp-aware stapled check performs.
+        let mut stapled_log = StatusTracker::default();
+        let stapled = OcspResponse::from_der_checked_at(
+            rsp,
+            &chain,
+            Some(signing_time),
+            ctp.validation_time(),
+            &mut stapled_log,
+        )
+        .unwrap();
+        assert_eq!(pre.revoked_at, stapled.revoked_at);
+        assert_eq!(
+            log.has_status(SIGNING_CREDENTIAL_NOT_REVOKED),
+            stapled_log.has_status(SIGNING_CREDENTIAL_NOT_REVOKED)
+        );
+        assert_eq!(
+            log.has_status(SIGNING_CREDENTIAL_REVOKED),
+            stapled_log.has_status(SIGNING_CREDENTIAL_REVOKED)
+        );
+
+        // The signing time comes from the manifest's own time stamp, as in the
+        // stapled check. C.jpg carries a sigTst generated before thisUpdate.
+        let context = Context::new();
+        let (bytes, _) = Store::load_jumbf_from_stream(
+            "image/jpeg",
+            &mut Cursor::new(include_bytes!("../../../tests/fixtures/C.jpg")),
+            &context,
+        )
+        .unwrap();
+        let store = Store::from_jumbf_with_context(&bytes, &mut StatusTracker::default(), &context)
+            .unwrap();
+        let claim = store.provenance_claim().unwrap();
+        let data = claim.data().unwrap();
+        let sign1 =
+            parse_cose_sign1(claim.signature_val(), &data, &mut StatusTracker::default()).unwrap();
+        let tst_signing_time =
+            certificate_status_signing_time(&sign1, &data, &ctp, None, false).unwrap();
+        assert!(tst_signing_time < this_update);
+        assert!(tst_signing_time.timestamp() > ctp.validation_time().unwrap());
+
+        // A time stamp supplied by a time-stamp assertion takes precedence.
+        let tst_info =
+            validate_cose_tst_info(&sign1, &data, &ctp, &mut StatusTracker::default(), false)
+                .unwrap();
+        assert_eq!(
+            certificate_status_signing_time(&sign1, &data, &ctp, Some(&tst_info), false),
+            Some(tst_info.gen_time.clone().into())
+        );
+
+        let mut log = StatusTracker::default();
+        check_certificate_status_response(rsp, &chain, Some(tst_signing_time), &ctp, &mut log)
+            .unwrap();
+        assert!(log.has_status(SIGNING_CREDENTIAL_NOT_REVOKED));
+        assert!(!log.has_status(SIGNING_CREDENTIAL_REVOKED));
     }
 
     #[test]

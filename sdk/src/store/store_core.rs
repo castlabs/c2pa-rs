@@ -168,7 +168,19 @@ impl Store {
             let _v = store.add_trust_config(tc.as_bytes());
         }
 
+        // Settings are validated when loaded and `verify_store` rejects a
+        // malformed instant, so fall back to the current time here rather than
+        // panicking.
         store
+            .ctp
+            .set_validation_time(settings.verify.validation_time_epoch().ok().flatten());
+
+        store
+    }
+
+    /// Caller-controlled validation instant (Unix seconds), if configured.
+    pub(crate) fn validation_time_epoch(&self) -> Option<i64> {
+        self.ctp.validation_time()
     }
 
     // Append new Store to the current Store preserving the order from the new Store
