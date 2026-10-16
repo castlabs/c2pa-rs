@@ -740,6 +740,56 @@ fn test_validation_results_no_extra_fields() -> Result<()> {
     Ok(())
 }
 
+/// Every manifest reports the single instant at which the Reader validated the
+/// store, including ancestor manifests without an ingredient validation delta.
+#[test]
+fn test_validation_time_is_one_instant_for_all_manifests() -> Result<()> {
+    let context = Context::new().with_settings(test_settings())?.into_shared();
+    // Three generations: the oldest manifest is an ingredient of an ingredient,
+    // so the active manifest's validation results carry no delta for it.
+    let mut asset = include_bytes!("../fixtures/earth_apollo17.jpg").to_vec();
+    for _ in 0..3 {
+        let mut builder = Builder::from_shared_context(&context);
+        builder.set_intent(BuilderIntent::Edit);
+        let mut dest = Cursor::new(Vec::new());
+        builder.sign(
+            &test_signer(),
+            "image/jpeg",
+            &mut Cursor::new(asset),
+            &mut dest,
+        )?;
+        asset = dest.into_inner();
+    }
+    let dest = Cursor::new(asset);
+    let reader = Reader::from_shared_context(&context).with_stream("image/jpeg", dest)?;
+    let results = reader.validation_results().unwrap();
+    let expected = results
+        .validation_time()
+        .expect("reader must record a validation time");
+    // The exporter falls back to an empty status set for manifests without a
+    // delta; make sure at least one ancestor takes that path.
+    let delta_count = results.ingredient_deltas().map_or(0, |d| d.len());
+
+    for document in [
+        reader.to_crjson_value()?,
+        reader.to_crjson_value_published_2_4()?,
+    ] {
+        let manifests = document["manifests"].as_array().unwrap();
+        assert!(
+            manifests.len() > 1 + delta_count,
+            "expected an ancestor manifest without a validation delta"
+        );
+        for manifest in manifests {
+            assert_eq!(
+                manifest["validationResults"]["validationTime"], expected,
+                "manifest {}",
+                manifest["label"]
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `specVersion` must not be absent or set to a wrong value (negative test).
 #[test]
 fn test_validation_results_spec_version_wrong_value() -> Result<()> {
