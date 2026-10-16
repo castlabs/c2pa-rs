@@ -159,7 +159,9 @@ impl Store {
                 );
 
                 if let Some(al) = &anchor.allowed_list {
-                    let _v = store.add_trust_allowed_list(al.as_bytes());
+                    let _v = store
+                        .ctp
+                        .add_end_entity_credentials_for(al.as_bytes(), anchor.trust_kind.clone());
                 }
             }
         }
@@ -214,10 +216,6 @@ impl Store {
     pub fn add_trust_config(&mut self, trust_vec: &[u8]) -> Result<()> {
         self.ctp.add_valid_ekus(trust_vec);
         Ok(())
-    }
-
-    pub fn add_trust_allowed_list(&mut self, allowed_vec: &[u8]) -> Result<()> {
-        Ok(self.ctp.add_end_entity_credentials(allowed_vec)?)
     }
 
     /// Get the provenance if available.

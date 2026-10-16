@@ -75,9 +75,8 @@ pub struct CertificateTrustPolicy {
     /// Anchors Map
     trust_anchors: Vec<TrustAnchor>,
 
-    /// Base-64 encoded SHA-256 hash of end-entity certificates (root X.509
-    /// certificates) in DER format.
-    end_entity_cert_set: HashSet<String>,
+    /// Purpose and Base-64 encoded SHA-256 hash of allowed end-entity DER certificates.
+    end_entity_cert_set: HashSet<(TrustListKind, String)>,
 
     /// Additional extended key usage (EKU) OIDs.
     additional_ekus: HashSet<String>,
@@ -170,13 +169,15 @@ impl CertificateTrustPolicy {
             .collect::<Vec<_>>()
     }
 
-    /// Evaluate a certificate against the trust policy described by this
-    /// struct.
+    /// Evaluate a manifest signing certificate against this trust policy.
     ///
     /// Returns `Ok((TrustAnchorType, String))` if the certificate appears on the end-entity
     /// certificate list or has a valid chain to one of the trust anchors that
     /// was provided and that it has a valid extended key usage (EKU).  The return String contains
     /// the C2PA trustListUri of the trust anchor.
+    ///
+    /// Only manifest trust anchors and manifest private credentials are
+    /// considered; CAWG and TSA anchors never authorize manifest signers.
     ///
     /// If `signing_time_epoch` is provided, evaluates the signing time (which
     /// must be in Unix seconds since the epoch) against the certificate's
@@ -189,6 +190,40 @@ impl CertificateTrustPolicy {
         end_entity_cert_der: &[u8],
         signing_time_epoch: Option<i64>,
     ) -> Result<(TrustAnchorType, String), CertificateTrustError> {
+        if _sync {
+            self.check_certificate_trust_for(
+                chain_der,
+                end_entity_cert_der,
+                signing_time_epoch,
+                TrustListKind::Manifest,
+            )
+        } else {
+            self.check_certificate_trust_for_async(
+                chain_der,
+                end_entity_cert_der,
+                signing_time_epoch,
+                TrustListKind::Manifest,
+            )
+            .await
+        }
+    }
+
+    /// Evaluate a certificate against this trust policy for one trust purpose.
+    ///
+    /// Behaves like [`check_certificate_trust`](Self::check_certificate_trust),
+    /// but only trust anchors and private credentials registered for `purpose`
+    /// are considered. Use [`TrustListKind::CAWG`] for CAWG X.509 identity
+    /// credentials and [`TrustListKind::TSA`] for time-stamping authorities.
+    /// TSA trust never accepts private end-entity credentials (C2PA 14.4.3).
+    #[allow(unused)] // parameters may be unused in some cases
+    #[async_generic]
+    pub fn check_certificate_trust_for(
+        &self,
+        chain_der: &[Vec<u8>],
+        end_entity_cert_der: &[u8],
+        signing_time_epoch: Option<i64>,
+        purpose: TrustListKind,
+    ) -> Result<(TrustAnchorType, String), CertificateTrustError> {
         if self.passthrough {
             return Ok((TrustAnchorType::NoCheck, String::new()));
         }
@@ -196,7 +231,11 @@ impl CertificateTrustPolicy {
         // First check to see if the certificate appears in the allowed set of
         // end-entity certificates.
         let cert_hash = base64_sha256_cert_der(end_entity_cert_der);
-        if self.end_entity_cert_set.contains(&cert_hash) {
+        if purpose != TrustListKind::TSA
+            && self
+                .end_entity_cert_set
+                .contains(&(purpose.clone(), cert_hash))
+        {
             return Ok((TrustAnchorType::EndEntity, String::new()));
         }
 
@@ -208,6 +247,7 @@ impl CertificateTrustPolicy {
                 chain_der,
                 end_entity_cert_der,
                 signing_time_epoch,
+                purpose.into(),
             );
         }
 
@@ -221,6 +261,7 @@ impl CertificateTrustPolicy {
                 chain_der,
                 end_entity_cert_der,
                 signing_time_epoch,
+                purpose.into(),
             );
         }
 
@@ -318,10 +359,35 @@ impl CertificateTrustPolicy {
     ///
     /// Lines that match neither format (PEM or hash) are ignored.
     ///
+    /// Credentials added here are accepted only when verifying manifest
+    /// signatures. They are not used for CAWG identity or time-stamp trust;
+    /// use [`add_end_entity_credentials_for`](Self::add_end_entity_credentials_for)
+    /// to allow-list CAWG X.509 identity credentials.
+    ///
     /// [§14.4.3, Private Credential Storage]: https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_private_credential_storage
     pub fn add_end_entity_credentials(
         &mut self,
         end_entity_cert_pems: &[u8],
+    ) -> Result<(), InvalidCertificateError> {
+        self.add_end_entity_credentials_for(end_entity_cert_pems, TrustListKind::Manifest)
+    }
+
+    /// Add individual end-entity credentials that shall be accepted only for
+    /// the given trust `purpose`.
+    ///
+    /// Accepts the same input formats as
+    /// [`add_end_entity_credentials`](Self::add_end_entity_credentials), which is
+    /// equivalent to calling this function with [`TrustListKind::Manifest`].
+    /// Use [`TrustListKind::CAWG`] to allow-list CAWG X.509 identity
+    /// credentials, for example for an
+    /// [`X509SignatureVerifier`](crate::identity::x509::X509SignatureVerifier).
+    ///
+    /// Credentials added for [`TrustListKind::TSA`] are never trusted: a private
+    /// credential store shall not apply to validating time-stamps (C2PA 14.4.3).
+    pub fn add_end_entity_credentials_for(
+        &mut self,
+        end_entity_cert_pems: &[u8],
+        purpose: TrustListKind,
     ) -> Result<(), InvalidCertificateError> {
         let mut inside_pem_block = false;
 
@@ -333,7 +399,7 @@ impl CertificateTrustPolicy {
                 inside_pem_block = false;
             }
             if !inside_pem_block && line.len() == 44 && base64::decode(&line).is_ok() {
-                self.end_entity_cert_set.insert(line);
+                self.end_entity_cert_set.insert((purpose.clone(), line));
             }
         }
 
@@ -343,7 +409,7 @@ impl CertificateTrustPolicy {
             match maybe_pem {
                 Ok(pem) => {
                     self.end_entity_cert_set
-                        .insert(base64_sha256_cert_der(&pem.contents));
+                        .insert((purpose.clone(), base64_sha256_cert_der(&pem.contents)));
                 }
                 Err(e) => {
                     return Err(InvalidCertificateError(e.to_string()));
@@ -611,10 +677,12 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test;
     use x509_parser::{extensions::ExtendedKeyUsage, pem::Pem};
 
+    use super::base64_sha256_cert_der;
     use crate::{
         crypto::cose::{
             CertificateTrustError, CertificateTrustPolicy, InvalidCertificateError, TrustAnchorType,
         },
+        settings::TrustListKind,
         Settings,
     };
 
@@ -959,6 +1027,110 @@ zGxQnM2hCA==
                 .0
                 == TrustAnchorType::Manifest
         );
+    }
+
+    #[c2pa_test_async]
+    async fn trust_purpose_isolation_sync_and_async() {
+        let certs = test_cert_chain(SigningAlg::Es256);
+        let roots = include_bytes!(
+            "../../../tests/fixtures/crypto/raw_signature/test_cert_root_bundle.pem"
+        );
+        let purposes = [
+            TrustListKind::Manifest,
+            TrustListKind::CAWG,
+            TrustListKind::TSA,
+        ];
+        for configured in &purposes {
+            let mut policy = CertificateTrustPolicy::new();
+            policy.add_default_valid_ekus();
+            policy
+                .add_trust_anchors(roots, "only-purpose", configured.clone().into(), None)
+                .unwrap();
+            for requested in &purposes {
+                let sync = policy.check_certificate_trust_for(
+                    &certs[1..],
+                    &certs[0],
+                    None,
+                    requested.clone(),
+                );
+                let asynchronous = policy
+                    .check_certificate_trust_for_async(
+                        &certs[1..],
+                        &certs[0],
+                        None,
+                        requested.clone(),
+                    )
+                    .await;
+                let expected = if configured == requested {
+                    Ok((configured.clone().into(), "only-purpose".to_string()))
+                } else {
+                    Err(CertificateTrustError::CertificateNotTrusted)
+                };
+                assert_eq!(sync, expected);
+                assert_eq!(asynchronous, expected);
+            }
+            assert_eq!(
+                policy
+                    .check_certificate_trust(&certs[1..], &certs[0], None)
+                    .is_ok(),
+                *configured == TrustListKind::Manifest,
+            );
+        }
+
+        let mut mixed = CertificateTrustPolicy::new();
+        mixed.add_default_valid_ekus();
+        for purpose in &purposes {
+            mixed
+                .add_trust_anchors(roots, &format!("{purpose:?}"), purpose.clone().into(), None)
+                .unwrap();
+        }
+        for purpose in purposes {
+            assert_eq!(
+                mixed
+                    .check_certificate_trust_for(&certs[1..], &certs[0], None, purpose.clone())
+                    .unwrap(),
+                (purpose.clone().into(), format!("{purpose:?}")),
+            );
+        }
+    }
+
+    #[test]
+    fn private_credentials_are_purpose_scoped_and_never_authorize_tsa() {
+        let certs = test_cert_chain(SigningAlg::Es256);
+        let encoded = base64_sha256_cert_der(&certs[0]);
+        let purposes = [
+            TrustListKind::Manifest,
+            TrustListKind::CAWG,
+            TrustListKind::TSA,
+        ];
+        for configured in &purposes {
+            let mut policy = CertificateTrustPolicy::new();
+            policy
+                .add_end_entity_credentials_for(encoded.as_bytes(), configured.clone())
+                .unwrap();
+            for requested in &purposes {
+                let result =
+                    policy.check_certificate_trust_for(&[], &certs[0], None, requested.clone());
+                assert_eq!(
+                    result.is_ok(),
+                    configured == requested && *requested != TrustListKind::TSA
+                );
+                if let Ok((kind, _)) = result {
+                    assert_eq!(kind, TrustAnchorType::EndEntity);
+                }
+            }
+        }
+        let mut legacy = CertificateTrustPolicy::new();
+        legacy
+            .add_end_entity_credentials(encoded.as_bytes())
+            .unwrap();
+        assert!(legacy.check_certificate_trust(&[], &certs[0], None).is_ok());
+        assert!(legacy
+            .check_certificate_trust_for(&[], &certs[0], None, TrustListKind::CAWG)
+            .is_err());
+        assert!(legacy
+            .check_certificate_trust_for(&[], &certs[0], None, TrustListKind::TSA)
+            .is_err());
     }
 
     /// An intermediate CA certificate must be held to the same validity-period

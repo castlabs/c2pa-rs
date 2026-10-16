@@ -158,7 +158,30 @@ mod tests {
         let mut source = Cursor::new(TEST_IMAGE);
         let mut dest = Cursor::new(Vec::new());
 
-        let mut builder = Builder::default().with_definition(manifest_json()).unwrap();
+        // This positive test trusts both signers, through distinct purpose memberships.
+        let mut settings = crate::Settings::default();
+        settings
+            .trust
+            .anchors
+            .get_or_insert_with(Vec::new)
+            .push(crate::settings::TrustAnchor {
+                trust_kind: crate::settings::TrustListKind::CAWG,
+                trust_uri: Some("urn:test:cawg".into()),
+                trust_anchors: include_str!(
+                    "../tests/fixtures/crypto/raw_signature/test_cert_root_bundle.pem"
+                )
+                .into(),
+                trust_config: None,
+                allowed_list: None,
+                trusted_ica_issuers: None,
+            });
+        let context = crate::Context::new()
+            .with_settings(settings)
+            .unwrap()
+            .into_shared();
+        let mut builder = Builder::from_shared_context(&context)
+            .with_definition(manifest_json())
+            .unwrap();
         builder
             .add_ingredient_from_stream(parent_json(), format, &mut source)
             .unwrap();
@@ -178,7 +201,9 @@ mod tests {
 
         dest.rewind().unwrap();
 
-        let manifest_store = Reader::default().with_stream(format, &mut dest).unwrap();
+        let manifest_store = Reader::from_shared_context(&context)
+            .with_stream(format, &mut dest)
+            .unwrap();
         assert_eq!(
             manifest_store.validation_state(),
             crate::ValidationState::Trusted

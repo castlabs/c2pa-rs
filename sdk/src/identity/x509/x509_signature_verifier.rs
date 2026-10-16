@@ -108,21 +108,23 @@ impl X509SignatureVerifier<'_> {
             match parse_cose_sign1(signature, &signer_payload_cbor, status_tracker) {
                 Ok(cose_sign1) => {
                     let verify_result = if _sync {
-                        self.cose_verifier.verify_signature(
+                        self.cose_verifier.verify_signature_for(
                             signature,
                             &signer_payload_cbor,
                             &[],
                             None,
                             status_tracker,
+                            crate::settings::TrustListKind::CAWG,
                         )
                     } else {
                         self.cose_verifier
-                            .verify_signature_async(
+                            .verify_signature_for_async(
                                 signature,
                                 &signer_payload_cbor,
                                 &[],
                                 None,
                                 status_tracker,
+                                crate::settings::TrustListKind::CAWG,
                             )
                             .await
                     };
@@ -258,6 +260,127 @@ mod tests {
 
     const TEST_IMAGE: &[u8] = include_bytes!("../../../tests/fixtures/CA.jpg");
     const TEST_THUMBNAIL: &[u8] = include_bytes!("../../../tests/fixtures/thumbnail.jpg");
+
+    #[c2pa_test_async]
+    async fn cawg_trust_purpose_isolation_preserves_signature_validity() {
+        use crate::{
+            crypto::cose::TimeStampStorage,
+            dynamic_assertion::PartialClaim,
+            identity::SignerPayload,
+            settings::{TrustAnchor, TrustListKind},
+            HashedUri, Settings,
+        };
+
+        let binding = HashedUri::new(
+            "self#jumbf=c2pa.assertions/c2pa.hash.data".into(),
+            Some("sha256".into()),
+            &[1; 32],
+        );
+        let payload = SignerPayload {
+            referenced_assertions: vec![binding.clone()],
+            sig_type: "cawg.x509.cose".into(),
+            roles: vec![],
+        };
+        let mut partial = PartialClaim::default();
+        partial.add_assertion(&binding);
+        let signer = crate::utils::test_signer::test_signer(SigningAlg::Es256);
+        let signature = crate::cose_sign::cose_sign(
+            signer.as_ref(),
+            &c2pa_cbor::to_vec(&payload).unwrap(),
+            signer.reserve_size(),
+            TimeStampStorage::V2_sigTst2_CTT,
+            &Settings::default(),
+        )
+        .unwrap();
+        let ia = IdentityAssertion {
+            signer_payload: payload,
+            signature,
+            pad1: vec![],
+            pad2: None,
+            label: None,
+        };
+        let roots =
+            include_str!("../../../tests/fixtures/crypto/raw_signature/test_cert_root_bundle.pem");
+        let allowed_leaf = pem::encode(&pem::Pem::new(
+            "CERTIFICATE",
+            signer.certs().unwrap().remove(0),
+        ));
+        for (kind, allowed_list) in [
+            TrustListKind::Manifest,
+            TrustListKind::CAWG,
+            TrustListKind::TSA,
+        ]
+        .into_iter()
+        .flat_map(|kind| [(kind.clone(), false), (kind, true)])
+        {
+            let mut policy = CertificateTrustPolicy::new();
+            policy.add_default_valid_ekus();
+            if allowed_list {
+                policy
+                    .add_end_entity_credentials_for(allowed_leaf.as_bytes(), kind.clone())
+                    .unwrap();
+            } else {
+                policy
+                    .add_trust_anchors(roots.as_bytes(), "urn:test:cawg", kind.clone().into(), None)
+                    .unwrap();
+            }
+            let verifier = X509SignatureVerifier {
+                cose_verifier: Verifier::VerifyTrustPolicy(Cow::Owned(policy)),
+            };
+            let mut settings = Settings::default();
+            settings.trust.anchors = Some(vec![TrustAnchor {
+                trust_kind: kind.clone(),
+                trust_uri: Some("urn:test:cawg".into()),
+                trust_anchors: if allowed_list {
+                    String::new()
+                } else {
+                    roots.into()
+                },
+                trust_config: None,
+                allowed_list: allowed_list.then(|| allowed_leaf.clone()),
+                trusted_ica_issuers: None,
+            }]);
+            let context = Context::new().with_settings(settings).unwrap();
+            for asynchronous in [false, true] {
+                let mut direct_log = StatusTracker::default();
+                let mut embedded_log = StatusTracker::default();
+                if asynchronous {
+                    verifier
+                        .check_signature_async(&ia.signer_payload, &ia.signature, &mut direct_log)
+                        .await
+                        .unwrap();
+                    ia.validate_partial_claim_async(&partial, &mut embedded_log, &context)
+                        .await
+                        .unwrap();
+                } else {
+                    verifier
+                        .check_signature(&ia.signer_payload, &ia.signature, &mut direct_log)
+                        .unwrap();
+                    ia.validate_partial_claim(&partial, &mut embedded_log, &context)
+                        .unwrap();
+                }
+                for log in [direct_log, embedded_log] {
+                    assert!(log.has_status(CAWG_X509_SIGNATURE_VALIDATED), "{log:?}");
+                    assert_eq!(
+                        log.has_status(CAWG_X509_CREDENTIAL_TRUSTED),
+                        kind == TrustListKind::CAWG,
+                        "{log:?}"
+                    );
+                    assert_eq!(
+                        log.has_status(CAWG_X509_CREDENTIAL_UNTRUSTED),
+                        kind != TrustListKind::CAWG,
+                        "{log:?}"
+                    );
+                    if kind == TrustListKind::CAWG && !allowed_list {
+                        assert!(log
+                            .logged_items()
+                            .iter()
+                            .any(|item| item.trust_list_uri.as_deref() == Some("urn:test:cawg")));
+                    }
+                }
+            }
+        }
+    }
 
     // NOTE: Success case is covered in tests for x509_credential_holder.rs.
 
