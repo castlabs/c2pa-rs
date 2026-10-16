@@ -166,10 +166,13 @@ struct CrJsonClaim {
 #[derive(Serialize)]
 struct CrJsonManifest {
     label: String,
-    #[serde(rename = "isUpdateManifest")]
-    is_update_manifest: bool,
-    #[serde(rename = "isCompressedManifest")]
-    is_compressed_manifest: bool,
+    #[serde(rename = "isUpdateManifest", skip_serializing_if = "Option::is_none")]
+    is_update_manifest: Option<bool>,
+    #[serde(
+        rename = "isCompressedManifest",
+        skip_serializing_if = "Option::is_none"
+    )]
+    is_compressed_manifest: Option<bool>,
     /// Assertions map: `label -> assertion value`. Keys may include instance suffixes
     /// such as `c2pa.actions__2`.
     assertions: Map<String, Value>,
@@ -206,8 +209,17 @@ struct CrJsonDocument {
 // ── Public entry point ──────────────────────────────────────────────────────
 
 /// Convert a Reader's manifest store to crJSON format.
-pub fn from_reader(reader: &Reader) -> Result<Value> {
-    CrJsonExporter::new(reader).to_value()
+pub fn from_reader(reader: &Reader, published_2_4: bool) -> Result<Value> {
+    let mut doc = CrJsonExporter::new(reader).build_document()?;
+    if published_2_4 {
+        // These wrapper fields postdate the published 2.4 schema. Do not strip
+        // similarly named fields from assertions or change validation results.
+        for manifest in &mut doc.manifests {
+            manifest.is_update_manifest = None;
+            manifest.is_compressed_manifest = None;
+        }
+    }
+    serde_json::to_value(doc).map_err(Error::JsonError)
 }
 
 // ── Exporter ────────────────────────────────────────────────────────────────
@@ -221,20 +233,25 @@ impl<'a> CrJsonExporter<'a> {
         Self { reader }
     }
 
-    fn to_value(&self) -> Result<Value> {
-        let doc = self.build_document()?;
-        serde_json::to_value(doc).map_err(Error::JsonError)
-    }
-
     fn build_document(&self) -> Result<CrJsonDocument> {
         let active_label = self.reader.active_label();
+        // The report instant also applies to ancestors with no validation delta.
+        let validation_time = self
+            .reader
+            .validation_results()
+            .and_then(|vr| vr.validation_time())
+            .map(String::from)
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
         let validation_map = self.build_validation_results_per_manifest();
         let claims = self.reader.store.claims();
 
         // Collect (store_index, manifest) so we can sort afterwards.
         let mut indexed: Vec<(usize, CrJsonManifest)> = Vec::with_capacity(claims.len());
         for (idx, claim) in claims.iter().enumerate() {
-            indexed.push((idx, self.build_manifest(claim, &validation_map)?));
+            indexed.push((
+                idx,
+                self.build_manifest(claim, &validation_map, &validation_time)?,
+            ));
         }
 
         // Active manifest first; all others in reverse store order (newest first).
@@ -264,13 +281,15 @@ impl<'a> CrJsonExporter<'a> {
     fn build_manifest(
         &self,
         claim: &Claim,
-        validation_map: &HashMap<String, (StatusCodes, String)>,
+        validation_map: &HashMap<String, StatusCodes>,
+        validation_time: &str,
     ) -> Result<CrJsonManifest> {
         let label = claim.label();
         let assertions = self.build_assertions(claim)?;
         let claim_obj = self.build_claim(claim)?;
         let signature = self.build_signature(claim)?;
-        let validation_results = build_manifest_validation_results(label, validation_map);
+        let validation_results =
+            build_manifest_validation_results(label, validation_map, validation_time);
         let ingredient_deltas = self.build_manifest_ingredient_deltas(label);
 
         let (claim_v1, claim_v2) = if claim.version() == 1 {
@@ -281,8 +300,8 @@ impl<'a> CrJsonExporter<'a> {
 
         Ok(CrJsonManifest {
             label: label.to_string(),
-            is_update_manifest: claim.update_manifest(),
-            is_compressed_manifest: claim.compressed(),
+            is_update_manifest: Some(claim.update_manifest()),
+            is_compressed_manifest: Some(claim.compressed()),
             assertions,
             claim_v1,
             claim_v2,
@@ -493,22 +512,15 @@ impl<'a> CrJsonExporter<'a> {
 
     // ── Validation ──────────────────────────────────────────────────────────
 
-    /// Build a map from each manifest label to its (StatusCodes, validation_time).
-    ///
-    /// `validation_time` falls back to the current UTC time when the reader supplies none.
-    fn build_validation_results_per_manifest(&self) -> HashMap<String, (StatusCodes, String)> {
-        let mut map: HashMap<String, (StatusCodes, String)> = HashMap::new();
+    /// Build a sparse map from manifest labels to current status codes.
+    fn build_validation_results_per_manifest(&self) -> HashMap<String, StatusCodes> {
+        let mut map = HashMap::new();
         let Some(vr) = self.reader.validation_results() else {
             return map;
         };
-        let validation_time = vr
-            .validation_time()
-            .map(String::from)
-            .unwrap_or_else(|| Utc::now().to_rfc3339());
-
         if let Some(active_label) = self.reader.active_label() {
             let codes = vr.active_manifest().cloned().unwrap_or_default();
-            map.insert(active_label.to_string(), (codes, validation_time.clone()));
+            map.insert(active_label.to_string(), codes);
         }
 
         let Some(deltas) = vr.ingredient_deltas() else {
@@ -521,7 +533,7 @@ impl<'a> CrJsonExporter<'a> {
                 continue;
             };
             let codes = idv.validation_deltas().clone();
-            map.insert(target_label, (codes, validation_time.clone()));
+            map.insert(target_label, codes);
         }
         map
     }
@@ -640,18 +652,16 @@ fn build_assertion_refs(
 
 fn build_manifest_validation_results(
     label: &str,
-    validation_map: &HashMap<String, (StatusCodes, String)>,
+    validation_map: &HashMap<String, StatusCodes>,
+    validation_time: &str,
 ) -> ManifestValidationResults {
-    let (codes, validation_time) = validation_map
-        .get(label)
-        .cloned()
-        .unwrap_or_else(|| (StatusCodes::default(), Utc::now().to_rfc3339()));
+    let codes = validation_map.get(label).cloned().unwrap_or_default();
     ManifestValidationResults {
         success: codes.success().clone(),
         informational: codes.informational().clone(),
         failure: codes.failure().clone(),
         spec_version: C2PA_VALIDATOR_VERSION,
-        validation_time,
+        validation_time: validation_time.to_string(),
     }
 }
 

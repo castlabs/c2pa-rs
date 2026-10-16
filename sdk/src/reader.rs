@@ -592,9 +592,29 @@ impl Reader {
     /// Get the manifest store as a crJSON [`Value`](serde_json::Value).
     ///
     /// crJSON is a standardized JSON format for C2PA manifest data.
+    /// This uses the SDK's latest export shape, including `isUpdateManifest` and
+    /// `isCompressedManifest`. For the published 2.4 shape, use
+    /// [`Self::to_crjson_value_published_2_4`].
     /// Returns an error if conversion fails.
     pub fn to_crjson_value(&self) -> Result<Value> {
-        crate::crjson::from_reader(self)
+        crate::crjson::from_reader(self, false)
+    }
+
+    /// Get the manifest store as a crJSON [`Value`](serde_json::Value) using the
+    /// [published 2.4 schema](https://spec.c2pa.org/specifications/specifications/2.4/crJSON/crjson-format.html).
+    ///
+    /// Unlike [`Self::to_crjson_value`], this omits the post-2.4 manifest wrapper
+    /// fields `isUpdateManifest` and `isCompressedManifest`, even when true.
+    /// It does not change assertions, revalidate the asset, or select a C2PA
+    /// validator version: `validationResults.specVersion` still identifies the
+    /// native validator. The reader and its default exports are unchanged.
+    ///
+    /// Returns conversion errors rather than substituting an empty document.
+    /// This selects the serialization shape; it does not run JSON Schema validation
+    /// or guarantee that malformed input conforms to the schema.
+    /// Use [`serde_json::to_string_pretty`] to produce a formatted string.
+    pub fn to_crjson_value_published_2_4(&self) -> Result<Value> {
+        crate::crjson::from_reader(self, true)
     }
 
     /// Get the manifest store as a pretty-printed crJSON string.
