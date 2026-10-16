@@ -28,7 +28,7 @@
 
 use std::io::Cursor;
 
-use c2pa::{Reader, Result};
+use c2pa::{Context, Reader, Result, Settings};
 use jsonschema::validator_for;
 
 const IMAGE_WITH_MANIFEST: &[u8] = include_bytes!("../fixtures/CA.jpg");
@@ -547,7 +547,7 @@ fn test_signature_structure() -> Result<()> {
 // ── Validation results ────────────────────────────────────────────────────────
 
 /// Every manifest's `validationResults` must have `success`, `informational`, `failure` arrays,
-/// a `specVersion` of "2.3", and a required `validationTime` RFC 3339 string.
+/// the native validator's `specVersion`, and a required `validationTime` RFC 3339 string.
 #[test]
 fn test_validation_results_structure() -> Result<()> {
     let reader = Reader::default().with_stream("image/jpeg", Cursor::new(IMAGE_WITH_MANIFEST))?;
@@ -575,14 +575,14 @@ fn test_validation_results_structure() -> Result<()> {
             }
         }
 
-        // specVersion must be present and equal "2.3".
+        // This identifies the validator, not the crJSON serialization schema.
         let spec_version = vr
             .get("specVersion")
             .and_then(|v| v.as_str())
             .expect("validationResults.specVersion must be a string");
         assert_eq!(
-            spec_version, "2.3.0",
-            "validationResults.specVersion must be \"2.3.0\""
+            spec_version, "2.4.0",
+            "validationResults.specVersion must be \"2.4.0\""
         );
 
         // validationTime must be present and be an RFC 3339 string.
@@ -641,12 +641,37 @@ fn test_validation_results_spec_version_wrong_value() -> Result<()> {
             *vr.get_mut("specVersion").unwrap() = serde_json::json!("9.9.9");
             assert_ne!(
                 vr["specVersion"].as_str().unwrap(),
-                "2.3",
-                "mutated specVersion should not equal 2.3"
+                "2.4.0",
+                "mutated specVersion should not equal 2.4.0"
             );
             // Restore and confirm it's back to the correct value.
             *vr.get_mut("specVersion").unwrap() = serde_json::json!(original);
-            assert_eq!(vr["specVersion"].as_str().unwrap(), "2.3.0");
+            assert_eq!(vr["specVersion"].as_str().unwrap(), "2.4.0");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_crjson_version_matches_native_validator_with_v1_settings() -> Result<()> {
+    for strict_v1 in [false, true] {
+        let mut settings = Settings::default();
+        settings.verify.strict_v1_validation = strict_v1;
+        let reader = Reader::from_context(Context::new().with_settings(settings)?)
+            .with_stream("image/jpeg", Cursor::new(IMAGE_WITH_MANIFEST))?;
+        let native = serde_json::to_value(reader.validation_results().unwrap())?;
+        let exported = reader.to_crjson_value()?;
+        assert_eq!(native["specVersion"], "2.4.0");
+        assert!(exported["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|manifest| manifest.get("claim").is_some()));
+        for manifest in exported["manifests"].as_array().unwrap() {
+            assert_eq!(
+                manifest["validationResults"]["specVersion"], native["specVersion"],
+                "strict_v1_validation={strict_v1}"
+            );
         }
     }
     Ok(())
