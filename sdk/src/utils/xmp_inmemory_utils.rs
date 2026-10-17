@@ -79,7 +79,9 @@ fn extract_xmp_key(xmp: &str, key: &str) -> Option<String> {
                 } else if e.name() == QName(key.as_bytes()) {
                     // tag case
                     if let Ok(s) = reader.read_text(e.name()) {
-                        return Some(s.to_string());
+                        if let Ok(s) = s.decode() {
+                            return Some(s.into_owned());
+                        }
                     }
                 }
             }
@@ -305,6 +307,38 @@ mod tests {
         assert_eq!(unicorn, None);
         let bad_xmp = extract_xmp_key("bad xmp", "unicorn");
         assert_eq!(bad_xmp, None);
+    }
+
+    #[test]
+    fn read_xmp_element_preserves_raw_entities() {
+        let xmp = r#"<rdf:Description><dcterms:provenance>https://example.com/?a=1&amp;b=2</dcterms:provenance></rdf:Description>"#;
+        assert_eq!(
+            extract_provenance(xmp).as_deref(),
+            Some("https://example.com/?a=1&amp;b=2")
+        );
+        assert_eq!(
+            extract_provenance("<dcterms:provenance>caf\u{e9}</dcterms:provenance>").as_deref(),
+            Some("caf\u{e9}")
+        );
+    }
+
+    #[test]
+    fn many_xmp_attributes_and_duplicate_are_handled() {
+        // Bounded input exercises duplicate checking after many distinct names.
+        let mut xmp = String::from("<rdf:Description");
+        for index in 0..4096 {
+            xmp.push_str(&format!(" a{index}=\"value\""));
+        }
+        xmp.push_str(&format!(" dcterms:provenance=\"{PROVENANCE}\"/>"));
+        assert_eq!(extract_provenance(&xmp).as_deref(), Some(PROVENANCE));
+        let updated = add_provenance(&xmp, "replacement").unwrap();
+        assert_eq!(extract_provenance(&updated).as_deref(), Some("replacement"));
+
+        let duplicate = xmp.replace("/>", " a0=\"duplicate\"/>");
+        assert!(matches!(
+            add_provenance(&duplicate, "replacement"),
+            Err(Error::XmpReadError(_))
+        ));
     }
 
     #[test]

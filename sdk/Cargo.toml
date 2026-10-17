@@ -135,7 +135,6 @@ img-parts = "0.4.0"
 iref = { version = "3.2.2", features = ["serde"] }
 jfifdump = "0.6.0"
 log = "0.4.8"
-lopdf = { version = "0.39.0", optional = true }
 lazy_static = "1.4.0"
 memchr = "2.7.6"
 mp4 = "0.14.0"
@@ -154,7 +153,7 @@ pem = "3.0.6"
 pkcs1 = { version = "0.7.5", optional = true }
 pkcs8 = "0.10.2"
 png_pong = "0.10.0"
-quick-xml = "0.39.0"
+quick-xml = "0.41.0"
 rand = "0.8.5"
 rand_chacha = { version = "0.9.0", features = ["os_rng"] }
 range-set = "0.1.0"
@@ -207,6 +206,7 @@ reqwest = { version = "0.12.23", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lopdf = { version = "0.42.0", optional = true }
 openssl = { version = "0.10.72", features = ["vendored"], optional = true }
 ureq = { version = "3.1.0", default-features = false, features = [
     "rustls"
@@ -222,6 +222,8 @@ wstd = "0.5.4"
 
 # This list matches the `rust_native_crypto` feature since they are not optional on WASM.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# Browser WASM has no OS threads; use lopdf's serial parser instead of rayon.
+lopdf = { version = "0.42.0", optional = true, default-features = false }
 const-oid = "0.9.6"
 ecdsa = { version = "0.16.9", features = ["digest", "sha2"] }
 num-bigint-dig = "0.8.4"
@@ -263,6 +265,7 @@ default-features = false
 features = ["clock", "serde"]
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]
+lopdf = { version = "0.42.0", optional = true, default-features = false, features = ["wasm_js"] }
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 # Also enable getrandom 0.2 with js feature for other dependencies (rand, tempfile, config)
 # This is needed until all dependencies migrate to getrandom 0.3
