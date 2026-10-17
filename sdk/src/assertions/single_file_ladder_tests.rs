@@ -1099,8 +1099,7 @@ fn fragmented_files_apply_extra_exclusions() {
     let mut builder = Builder::from_shared_context(&context)
         .with_definition(DEFINITION)
         .unwrap();
-    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/bunny/bunny_89283bps/BigBuckBunny_2s_init.mp4");
+    let input = crate::utils::test::fixture_path("bunny/bunny_89283bps/BigBuckBunny_2s_init.mp4");
     let output = tempdirectory().unwrap();
     builder
         .sign_fragmented_files(
