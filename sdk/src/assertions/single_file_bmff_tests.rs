@@ -1537,3 +1537,251 @@ fn initless_map_is_malformed_for_whole_file_verification() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// builder.bmff_hash_extra_exclusions: extra exclusions for SDK-generated BMFF
+// hashes. With `/sidx` excluded, segments cut at each per-fragment `sidx`
+// (how byte-range HLS packagers address a single-file fMP4) verify as
+// delivered; the media stays bound, the index does not.
+// ---------------------------------------------------------------------------
+
+const EXCLUDE_SIDX: &str = r#"{"builder":{"bmff_hash_extra_exclusions":[{"xpath":"/sidx"}]}}"#;
+
+fn sign_with_settings(input: &[u8], settings_json: &str) -> Vec<u8> {
+    let settings = Settings::new().with_json(settings_json).unwrap();
+    let mut output = Cursor::new(Vec::new());
+    Builder::from_context(Context::new().with_settings(settings).unwrap())
+        .with_definition(DEFINITION)
+        .unwrap()
+        .sign(
+            test_signer(SigningAlg::Es256).as_ref(),
+            "video/mp4",
+            &mut Cursor::new(input),
+            &mut output,
+        )
+        .unwrap();
+    output.into_inner()
+}
+
+fn exclusion_xpaths(signed: &[u8]) -> Vec<String> {
+    binding(signed)
+        .exclusions
+        .iter()
+        .map(|e| e.xpath.clone())
+        .collect()
+}
+
+#[test]
+fn extra_exclusions_default_changes_nothing() {
+    let default = exclusion_xpaths(&sign(PER_FRAGMENT_SIDX));
+    let empty = exclusion_xpaths(&sign_with_settings(
+        PER_FRAGMENT_SIDX,
+        r#"{"builder":{"bmff_hash_extra_exclusions":[]}}"#,
+    ));
+    assert_eq!(default, empty);
+    assert!(!default.contains(&"/sidx".to_owned()));
+}
+
+#[test]
+fn extra_exclusions_are_appended_once_after_the_defaults() {
+    let default = exclusion_xpaths(&sign(PER_FRAGMENT_SIDX));
+    // `/ftyp` duplicates a default and is not added again; `/sidx` twice is
+    // added once.
+    let signed = sign_with_settings(
+        PER_FRAGMENT_SIDX,
+        r#"{"builder":{"bmff_hash_extra_exclusions":[{"xpath":"/sidx"},{"xpath":"/ftyp"},{"xpath":"/sidx"}]}}"#,
+    );
+    let mut expected = default;
+    expected.push("/sidx".to_owned());
+    assert_eq!(exclusion_xpaths(&signed), expected);
+}
+
+#[test]
+fn extra_exclusions_cover_init_and_every_leaf() {
+    let signed = sign_with_settings(PER_FRAGMENT_SIDX, EXCLUDE_SIDX);
+    // Recompute init and leaf hashes with every root sidx excluded,
+    // independently of the hashing code under test.
+    let hash = binding(&signed);
+    let map = &hash.merkle().unwrap()[0];
+    let r = roots(&signed);
+    let moof: Vec<B> = r.iter().copied().filter(|b| b.kind == *b"moof").collect();
+    let leaf = |start: usize, end: usize| -> Vec<u8> {
+        let mut digest = Sha256::new();
+        for b in r.iter().filter(|b| b.start >= start && b.end <= end) {
+            let excluded = [*b"ftyp", *b"mfra", *b"free", *b"skip", *b"sidx"].contains(&b.kind)
+                || (b.kind == *b"uuid" && signed[b.payload..b.payload + 16] == C2PA_BOX_UUID);
+            if !excluded {
+                digest.update((b.start as u64).to_be_bytes());
+                digest.update(&signed[b.start..b.end]);
+            }
+        }
+        digest.finalize().to_vec()
+    };
+    assert_eq!(
+        map.init_hash.as_ref().unwrap().as_ref(),
+        leaf(0, moof[0].start)
+    );
+    for i in 0..moof.len() {
+        let end = moof.get(i + 1).map_or(signed.len(), |b| b.start);
+        assert_eq!(
+            map.hashes.0[i].as_ref(),
+            leaf(moof[i].start, end),
+            "leaf {i}"
+        );
+    }
+}
+
+#[test]
+fn extra_sidx_exclusion_lets_sidx_cut_segments_verify() {
+    let signed = sign_with_settings(PER_FRAGMENT_SIDX, EXCLUDE_SIDX);
+    let (init, segments) = sidx_cut(&signed);
+    assert_eq!(segments.len(), 3);
+    for (offset, segment) in &segments {
+        assert_segment_valid(&init, segment, *offset);
+    }
+    // The spec's own cut still verifies.
+    let (spec_init, spec_segments) = spec_cut(&signed);
+    for (offset, segment) in &spec_segments {
+        assert_segment_valid(&spec_init, segment, *offset);
+    }
+    // The offset is still load-bearing.
+    let (offset, segment) = &segments[1];
+    assert_segment_rejected(&init, segment, offset + 1, "sidx cut at the wrong offset");
+}
+
+#[test]
+fn extra_sidx_exclusion_still_binds_the_media() {
+    let signed = sign_with_settings(PER_FRAGMENT_SIDX, EXCLUDE_SIDX);
+    let r = roots(&signed);
+    let nth = |kind: &[u8; 4]| {
+        r.iter()
+            .filter(|b| &b.kind == kind)
+            .nth(1)
+            .copied()
+            .unwrap()
+    };
+    let (moof, mdat, sidx) = (nth(b"moof"), nth(b"mdat"), nth(b"sidx"));
+
+    for (at, what) in [(moof.payload + 4, "moof"), (mdat.payload + 10, "mdat")] {
+        let mut tampered = signed.clone();
+        tampered[at] ^= 0xff;
+        let reader = Reader::default()
+            .with_stream("video/mp4", Cursor::new(&tampered))
+            .unwrap();
+        assert_eq!(
+            reader.validation_state(),
+            ValidationState::Invalid,
+            "{what} tamper must fail"
+        );
+        let (init, segments) = sidx_cut(&tampered);
+        let (offset, segment) = &segments[1];
+        assert_segment_rejected(&init, segment, *offset, what);
+    }
+
+    // The documented trade-off: the excluded sidx itself is not bound.
+    let mut tampered = signed.clone();
+    tampered[sidx.payload + 12] ^= 0xff;
+    let reader = Reader::default()
+        .with_stream("video/mp4", Cursor::new(&tampered))
+        .unwrap();
+    assert_ne!(
+        reader.validation_state(),
+        ValidationState::Invalid,
+        "{reader}"
+    );
+}
+
+#[test]
+fn extra_exclusions_support_subsets_and_conditions() {
+    // A conditional, partial exclusion round-trips into the assertion.
+    let signed = sign_with_settings(
+        PER_FRAGMENT_SIDX,
+        r#"{"builder":{"bmff_hash_extra_exclusions":[{"xpath":"/sidx","version":0,"subset":[{"offset":20,"length":4}]}]}}"#,
+    );
+    let hash = binding(&signed);
+    let extra = hash.exclusions.iter().find(|e| e.xpath == "/sidx").unwrap();
+    assert_eq!(extra.version, Some(0));
+    let subset = extra.subset.as_ref().unwrap();
+    assert_eq!((subset[0].offset, subset[0].length), (20, 4));
+}
+
+#[test]
+fn extra_exclusions_are_validated_when_settings_load() {
+    for (json, why) in [
+        (r#"[{"xpath":"sidx"}]"#, "relative path"),
+        (r#"[{"xpath":"/si"}]"#, "short box type"),
+        (r#"[{"xpath":"/moov//trak"}]"#, "empty path element"),
+        (r#"[{"xpath":"/sidx","subset":[]}]"#, "empty subset"),
+        (
+            r#"[{"xpath":"/sidx","subset":[{"offset":8,"length":8},{"offset":12,"length":4}]}]"#,
+            "overlapping subsets",
+        ),
+        (
+            r#"[{"xpath":"/sidx","subset":[{"offset":8,"length":0},{"offset":20,"length":4}]}]"#,
+            "open-ended subset before another",
+        ),
+        (
+            r#"[{"xpath":"/sidx","subset":[{"offset":18446744073709551615,"length":2}]}]"#,
+            "subset overflow",
+        ),
+        (r#"[{"xpath":"/sidx","flags":[1]}]"#, "short flags"),
+        (r#"[{"xpath":"/sidx","exact":true}]"#, "exact without flags"),
+        (r#"[{"xpath":"/sidx","data":[]}]"#, "empty data"),
+    ] {
+        let settings = format!(r#"{{"builder":{{"bmff_hash_extra_exclusions":{json}}}}}"#);
+        assert!(
+            Settings::new().with_json(&settings).is_err(),
+            "{why} must be refused"
+        );
+    }
+    let too_many = format!(
+        r#"{{"builder":{{"bmff_hash_extra_exclusions":[{}]}}}}"#,
+        vec![r#"{"xpath":"/sidx"}"#; 65].join(",")
+    );
+    assert!(Settings::new().with_json(&too_many).is_err());
+}
+
+#[test]
+fn extra_exclusions_refuse_a_caller_hash_missing_the_descriptor() {
+    let settings = Settings::new().with_json(EXCLUDE_SIDX).unwrap();
+    let mut builder = Builder::from_context(Context::new().with_settings(settings).unwrap())
+        .with_definition(DEFINITION)
+        .unwrap();
+    let mut supplied = BmffHash::new("jumbf manifest", "sha256", None);
+    supplied.set_default_exclusions();
+    supplied.set_bmff_version(3);
+    builder
+        .add_assertion("c2pa.hash.bmff.v3", &supplied)
+        .unwrap();
+    let result = builder.sign(
+        test_signer(SigningAlg::Es256).as_ref(),
+        "video/mp4",
+        &mut Cursor::new(PER_FRAGMENT_SIDX),
+        &mut Cursor::new(Vec::new()),
+    );
+    assert!(
+        matches!(&result, Err(crate::Error::BadParam(m)) if m.contains("bmff_hash_extra_exclusions")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn extra_exclusions_apply_to_flat_bmff_hashing() {
+    const FLAT: &[u8] = include_bytes!("../../tests/fixtures/video1_no_manifest.mp4");
+    let signed = sign_with_settings(
+        FLAT,
+        r#"{"builder":{"bmff_hash_extra_exclusions":[{"xpath":"/moov/udta"}]}}"#,
+    );
+    assert!(exclusion_xpaths(&signed).contains(&"/moov/udta".to_owned()));
+}
+
+#[test]
+fn extra_exclusions_apply_to_the_placeholder() {
+    let settings = Settings::new().with_json(EXCLUDE_SIDX).unwrap();
+    let mut builder = Builder::from_context(Context::new().with_settings(settings).unwrap())
+        .with_definition(DEFINITION)
+        .unwrap();
+    builder.placeholder("video/mp4").unwrap();
+    let hash: BmffHash = builder.find_assertion(BmffHash::LABEL).unwrap();
+    assert!(hash.exclusions.iter().any(|e| e.xpath == "/sidx"));
+}
