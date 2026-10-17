@@ -147,6 +147,17 @@ fn references(path: &Path, segments: &[PathBuf]) -> Result<Vec<(usize, PathBuf)>
     if bytes.len() as u64 > MAX_SCHEDULE_BYTES {
         bail!("VSI update schedule exceeds 1 MiB");
     }
+    // Serde struct deserializers also accept positional arrays; the schedule requires objects.
+    let shape: serde_json::Value =
+        serde_json::from_slice(&bytes).context("Invalid VSI update schedule")?;
+    if !shape.is_object()
+        || shape
+            .get("updates")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|updates| updates.iter().any(|event| !event.is_object()))
+    {
+        bail!("VSI update schedule and its events must be JSON objects");
+    }
     let schedule: Schedule =
         serde_json::from_slice(&bytes).context("Invalid VSI update schedule")?;
     if schedule.version != 1 {
@@ -352,15 +363,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let selected = vec![PathBuf::from("seg-103.m4s")];
         for value in [
+            json!([1, []]),
             json!({"version": 0, "updates": []}),
             json!({"version": 2, "updates": []}),
             json!({"version": 1, "updates": [], "extra": true}),
             json!({"updates": []}),
             json!({"version": 1}),
+            json!({"version": 1, "updates": [["seg-103.m4s", "b.mp4"]]}),
             json!({"version": 1, "updates": [{"before_segment": "seg-103.m4s"}]}),
             json!({"version": 1, "updates": [{"before_segment": "seg-103.m4s", "init": "init.mp4", "extra": true}]}),
         ] {
             assert!(references(&schedule(&dir, value), &selected).is_err());
+        }
+        let path = dir.path().join("updates.json");
+        for bytes in [
+            r#"{"version":1,"version":1,"updates":[]}"#,
+            r#"{"version":1,"updates":[{"before_segment":"seg-103.m4s","init":"b.mp4","init":"c.mp4"}]}"#,
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert!(references(&path, &selected).is_err());
         }
         assert!(references(&schedule(&dir, json!({"version": 1, "updates": []})), &[]).is_ok());
     }
