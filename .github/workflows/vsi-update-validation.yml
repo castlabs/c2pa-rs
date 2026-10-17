@@ -49,7 +49,9 @@ jobs:
         with:
           key: vsi-update-sdk-${{ matrix.crypto }}
       - name: Test live-video SDK with isolated crypto backend
-        run: cargo +1.96.0 test --locked -p c2pa --lib --no-default-features --features ${{ matrix.crypto }},unstable_live_video live_video::
+        run: >-
+          cargo +1.96.0 test --locked -p c2pa --lib --no-default-features
+          --features ${{ matrix.crypto }},unstable_live_video live_video::
       - name: Lint live-video SDK
         run: cargo +1.96.0 clippy --locked -p c2pa --lib --no-default-features --features ${{ matrix.crypto }},unstable_live_video -- -D warnings
       - name: Check feature-off SDK
