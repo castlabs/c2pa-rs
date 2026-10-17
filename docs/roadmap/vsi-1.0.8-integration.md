@@ -8,9 +8,10 @@ approval or evidence that the combined candidate has passed.
 ## Native Scope
 
 - [#27](https://github.com/castlabs/c2pa-rs/pull/27): BMFF extra exclusions,
-  owned and merged by another agent. Do not rewrite its branch or duplicate its
-  merge. Its current base is the fragment-offset branch; ensure its changes
-  reach `feat/trusted-vsi-functional` before selecting the release candidate.
+  ZIP 9.0.4 remediation and WASI test fixes. The owning agent merged final head
+  `33721e6a` into `feat/trusted-vsi-functional` as `6ce147fb`. Do not rewrite its
+  branch or duplicate its merge. The dependency-fix integration hold is lifted;
+  #28/#29 still require checks on this updated base before their source merges.
 - [#28](https://github.com/castlabs/c2pa-rs/pull/28): verified init refresh fix
   and Reader-trusted transition tests, targeting `feat/trusted-vsi-functional`.
 - [#29](https://github.com/castlabs/c2pa-rs/pull/29): explicit CLI update schedules,
