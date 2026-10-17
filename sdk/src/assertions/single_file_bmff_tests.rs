@@ -1822,7 +1822,7 @@ fn extra_exclusions_are_validated_when_settings_load() {
 }
 
 #[test]
-fn extra_exclusions_refuse_a_caller_supplied_bmff_hash() {
+fn extra_exclusions_refuse_a_caller_hash_missing_the_descriptor() {
     let settings = Settings::new().with_json(EXCLUDE_SIDX).unwrap();
     let mut builder = Builder::from_context(Context::new().with_settings(settings).unwrap())
         .with_definition(DEFINITION)
