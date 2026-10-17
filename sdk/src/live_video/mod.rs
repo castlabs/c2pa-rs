@@ -869,3 +869,6 @@ mod manifest_tests {
 
 #[cfg(test)]
 mod test_helpers;
+
+#[cfg(test)]
+mod verified_updates_tests;
