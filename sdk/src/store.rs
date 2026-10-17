@@ -2274,12 +2274,14 @@ impl Store {
         Ok(hashes)
     }
 
-    fn generate_bmff_data_hash_for_stream(alg: &str) -> Result<BmffHash> {
+    fn generate_bmff_data_hash_for_stream(alg: &str, settings: &Settings) -> Result<BmffHash> {
         // The spec has mandatory BMFF exclusion ranges for certain atoms.
-        // The function makes sure those are included.
+        // The function makes sure those are included, then adds any extra
+        // exclusions configured for SDK-generated BMFF hashes.
 
         let mut dh = BmffHash::new("jumbf manifest", alg, None);
         dh.set_default_exclusions();
+        dh.add_extra_exclusions(&settings.builder.bmff_hash_extra_exclusions);
 
         // fill in temporary hash
         match alg {
@@ -2925,11 +2927,16 @@ impl Store {
 
         // get the BMFF hash assertion if it exists or create a new one if not
         let mut bmff_hash = if let Some(bmff_hash_assertion) = pc.bmff_hash_assertions().first() {
-            BmffHash::from_assertion(bmff_hash_assertion.assertion())?
+            // Renditions after the first reuse the assertion generated for the
+            // first one, which already carries the extra exclusions.
+            let mut bmff_hash = BmffHash::from_assertion(bmff_hash_assertion.assertion())?;
+            bmff_hash.add_extra_exclusions(&settings.builder.bmff_hash_extra_exclusions);
+            bmff_hash
         } else {
             let mut bmff_hash = BmffHash::new("jumbf manifest", pc.alg(), None);
 
             bmff_hash.set_default_exclusions();
+            bmff_hash.add_extra_exclusions(&settings.builder.bmff_hash_extra_exclusions);
 
             if pc.version() < 2 {
                 bmff_hash.set_bmff_version(2); // backcompat support
@@ -3512,7 +3519,7 @@ impl Store {
         //    UUID boxes: they are a few dozen bytes per fragment, and pass 2
         //    needs them again.
         let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
-        let mut bmff_hash = Store::generate_bmff_data_hash_for_stream(pc.alg())?;
+        let mut bmff_hash = Store::generate_bmff_data_hash_for_stream(pc.alg(), settings)?;
         if pc.version() < 2 {
             bmff_hash.set_bmff_version(2); // backcompat support
         }
@@ -3901,12 +3908,22 @@ impl Store {
         }
 
         if is_bmff {
+            // Extra exclusions only apply to a BMFF hash the SDK generates here.
+            // Refuse rather than sign without them.
+            if !settings.builder.bmff_hash_extra_exclusions.is_empty()
+                && (pc.update_manifest() || !pc.bmff_hash_assertions().is_empty())
+            {
+                return Err(Error::BadParam(
+                    "builder.bmff_hash_extra_exclusions applies only to BMFF hash assertions the SDK generates; this claim already has one or is an update manifest".to_string(),
+                ));
+            }
+
             // 2) Get hash ranges if needed, do not generate for update manifests
             let mut needs_hash = false;
             let mut single_file_fragments = false;
             if !pc.update_manifest() && pc.bmff_hash_assertions().is_empty() {
                 intermediate_stream.rewind()?;
-                let mut bmff_hash = Store::generate_bmff_data_hash_for_stream(pc.alg())?;
+                let mut bmff_hash = Store::generate_bmff_data_hash_for_stream(pc.alg(), settings)?;
 
                 if pc.version() < 2 {
                     bmff_hash.set_bmff_version(2); // backcompat support

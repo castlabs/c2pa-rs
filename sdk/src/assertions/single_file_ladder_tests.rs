@@ -1049,3 +1049,107 @@ fn ladder_segments_verify_against_the_shared_manifest() {
         "rendition 2's segment must not verify under rendition 0's init"
     );
 }
+
+/// `builder.bmff_hash_extra_exclusions` reaches the shared ladder assertion:
+/// every rendition's init and leaves exclude `/sidx`, so segments cut at
+/// each per-fragment `sidx` verify against the shared manifest.
+#[test]
+fn ladder_applies_extra_exclusions_to_every_rendition() {
+    const SIDX: &[u8] = include_bytes!("../../tests/fixtures/single_file_fragments_sidx.mp4");
+    let dir = tempfile::tempdir().unwrap();
+    let mut sources = Vec::new();
+    let mut outputs = Vec::new();
+    for i in 0..2u8 {
+        let source = dir.path().join(format!("r{i}.mp4"));
+        std::fs::write(&source, rendition(SIDX, i + 1)).unwrap();
+        sources.push(source);
+        outputs.push(dir.path().join(format!("s{i}.mp4")));
+    }
+    let settings = Settings::new()
+        .with_json(r#"{"builder":{"bmff_hash_extra_exclusions":[{"xpath":"/sidx"}]}}"#)
+        .unwrap();
+    Builder::from_context(Context::new().with_settings(settings).unwrap())
+        .with_definition(DEFINITION)
+        .unwrap()
+        .sign_ladder_files(test_signer(SigningAlg::Es256).as_ref(), &sources, &outputs)
+        .unwrap();
+
+    for out in &outputs {
+        let signed = std::fs::read(out).unwrap();
+        let hash = binding(&signed);
+        assert_eq!(
+            hash.exclusions
+                .iter()
+                .filter(|e| e.xpath == "/sidx")
+                .count(),
+            1
+        );
+        assert_eq!(maps(&hash).len(), 2);
+
+        let r = roots(&signed);
+        let sidx: Vec<B> = r.iter().copied().filter(|b| b.kind == *b"sidx").collect();
+        let mdat: Vec<B> = r.iter().copied().filter(|b| b.kind == *b"mdat").collect();
+        let init = &signed[..sidx[0].start];
+        for (s, m) in sidx.iter().zip(&mdat) {
+            assert!(matches!(
+                segment_state(init, &signed[s.start..m.end], s.start as u64),
+                ValidationState::Valid | ValidationState::Trusted
+            ));
+            assert_eq!(
+                segment_state(init, &signed[s.start..m.end], s.start as u64 + 1),
+                ValidationState::Invalid
+            );
+        }
+    }
+}
+
+/// Multi-file fragmented signing (`sign_fragmented_files`) carries the extra
+/// exclusions in the assertion it generates.
+#[test]
+fn fragmented_files_apply_extra_exclusions() {
+    let settings = Settings::new()
+        .with_json(r#"{"builder":{"bmff_hash_extra_exclusions":[{"xpath":"/sidx"}]}}"#)
+        .unwrap();
+    let context = Context::new()
+        .with_settings(settings)
+        .unwrap()
+        .into_shared();
+    let mut builder = Builder::from_shared_context(&context)
+        .with_definition(DEFINITION)
+        .unwrap();
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/bunny/bunny_89283bps/BigBuckBunny_2s_init.mp4");
+    let output = tempfile::tempdir().unwrap();
+    builder
+        .sign_fragmented_files(
+            test_signer(SigningAlg::Es256).as_ref(),
+            input.as_path(),
+            std::path::Path::new("BigBuckBunny_2s1*.m4s"),
+            output.path(),
+        )
+        .unwrap();
+    let rendition = output.path().join("bunny_89283bps");
+    let init = std::fs::read(rendition.join("BigBuckBunny_2s_init.mp4")).unwrap();
+    let fragment = std::fs::read(rendition.join("BigBuckBunny_2s1.m4s")).unwrap();
+    let reader = Reader::from_shared_context(&context)
+        .with_fragment("video/mp4", Cursor::new(&init), Cursor::new(&fragment))
+        .unwrap();
+    assert_ne!(
+        reader.validation_state(),
+        ValidationState::Invalid,
+        "{reader}"
+    );
+    let mut hash: BmffHash = reader
+        .active_manifest()
+        .unwrap()
+        .find_assertion("c2pa.hash.bmff.v3")
+        .unwrap();
+    hash.set_bmff_version(3);
+    assert_eq!(
+        hash.exclusions
+            .iter()
+            .filter(|e| e.xpath == "/sidx")
+            .count(),
+        1
+    );
+}
