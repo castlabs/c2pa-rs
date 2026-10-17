@@ -18,7 +18,60 @@ By default, C2PA Tool writes the JSON manifest data found in the asset to the st
 The tool supports the following subcommands:
 - `trust` [configures trust support](#configuring-trust-support) for certificates on a "known certificate list." With this subcommand, several additional options are available.
 - `fragment` [adds a manifest to fragmented BMFF content](#adding-a-manifest-to-fragmented-bmff-content).  With this subcommand, one additional option is available.
+- `live-video` validates live media when built with the experimental `unstable_live_video` feature. See [VSI context updates](#vsi-context-updates).
 - `help` displays command line help information.
+
+### VSI context updates
+
+The Castlabs experimental `live-video` command can install signed initialization
+updates while preserving the existing validator's sequence, replay and coverage
+history. This opt-in applies only to VSI (section 19.4), not the manifest-box method:
+
+```shell
+c2patool init-a.mp4 --settings trusted.toml live-video \
+  --segments_glob 'seg-*.m4s' --updates updates.json
+```
+
+```json
+{"version":1,"updates":[{"before_segment":"seg-103.m4s","init":"init-b.mp4"}]}
+```
+
+The local JSON schedule is limited to 1 MiB and 1024 events, requires version 1,
+and rejects unknown fields. Each `before_segment` must be a single filename matching
+exactly one media file **selected by the glob**. Missing, duplicate and ambiguous
+targets are errors before any media is validated. Events run in the selected media's
+natural filename order, regardless of JSON order, once immediately before their target.
+Init paths are relative to the schedule's directory; absolute local paths are allowed.
+The schedule is trusted operator input, not an untrusted playlist or network resolver.
+With `--updates`, the initial init and each scheduled init snapshot are limited to
+16 MiB. Scheduled snapshots also share a 64 MiB total budget, counting every event's
+retained copy even when paths repeat; the initial init has its own 16 MiB allowance.
+Reads are bounded before loading file contents. These are **raw snapshot byte budgets**,
+not limits on total process memory, decoder/decompressed manifest memory, or parsed
+validation data. The exact Reader-verified bytes are retained for installation so
+later file changes cannot substitute an unverified init.
+
+**The operator asserts that every scheduled init belongs to the same logical stream.**
+Matching track IDs/timing alone is not stream-identity proof. Updates must contain an
+embedded signed init manifest; key-only updates are not supported. Both
+`verify.verify_after_reading` and `verify.verify_trust` must be enabled. The initial
+init and every candidate must have Reader state `Trusted` and an empty active-manifest
+failure list; keys, manifest label and leaf certificate come from that same Reader.
+Update Readers use a settings-only context copy with remote manifest fetching disabled
+before reading asset bytes, so an asset cannot direct a manifest network fetch before
+embedded-manifest rejection. All other settings, including trust/signature/read/hash
+verification and the operator's OCSP-fetch policy, are preserved.
+All schedule references and candidate Reader checks complete before media validation.
+At each boundary the SDK also checks layout/timing compatibility and session keys.
+An update error stops validation before its target, never silently falling back to
+the old context. A successful update prints a concise `VSI update installed:` line.
+
+One current context is replaced, with no historical key/manifest cache, automatic
+stream reset or numbering restart. Late media needing an old context is not supported.
+Existing gap reporting remains informational: unobserved ranges do not prove production
+or malicious removal. Without `--updates`, existing validation behavior and text output
+are unchanged. These update controls are experimental Castlabs behavior, not additional
+adopted C2PA requirements.
 
 ## Options
 
@@ -410,4 +463,3 @@ You can run the Wasm binary created for `wasm32-wasip2` directly with [wasmtime]
 ```
 wasmtime -S cli -S http --dir . c2patool.wasm [OPTIONS] <ASSET_PATH> [COMMAND]
 ```
-

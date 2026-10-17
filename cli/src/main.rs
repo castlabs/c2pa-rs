@@ -317,6 +317,10 @@ enum Commands {
         /// The pattern should match only file names, not full paths (e.g. "segment_*[0-9].m4s").
         #[arg(long = "segments_glob", verbatim_doc_comment)]
         segments_glob: Option<PathBuf>,
+
+        /// Local JSON schedule of same-stream signed init updates (VSI only).
+        #[arg(long)]
+        updates: Option<PathBuf>,
     },
 
     /// Sign a live video stream using the per-segment C2PA Manifest Box method (C2PA section 19.3).
@@ -1191,13 +1195,15 @@ fn main() -> Result<()> {
     {
         if let Some(Commands::LiveVideo {
             segments_glob: Some(sg),
+            updates,
         }) = &args.command
         {
-            return live_video::validate_live_video(&context, path, sg);
+            return live_video::validate_live_video(&context, path, sg, updates.as_deref());
         } else if matches!(
             &args.command,
             Some(Commands::LiveVideo {
-                segments_glob: None
+                segments_glob: None,
+                ..
             })
         ) {
             bail!("segments_glob must be set for the live-video subcommand");
