@@ -35,8 +35,9 @@ Windows SDK/FFI/CLI profiles, builds same-source native/CLI bundles, and records
 source-bound evidence. Dispatch it with `publish_release=false`; test-only
 qualification must not publish a release.
 
-After all three changes reach the functional line, select an exact native SHA
-and rerun both workflows on that SHA's branch ref. Confirm the run's `headSha`
+Both workflows run on functional-branch pushes. After all three changes reach
+that line, select an exact native SHA and use its push-triggered runs, or rerun
+both workflows on that SHA's branch ref. Confirm the run's `headSha`
 and recorded source identity match the selected candidate. Per-PR runs are useful
 but do not replace qualification of the combined tree. If the ref advances,
 qualify the new SHA before updating dependency evidence.
