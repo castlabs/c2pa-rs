@@ -206,7 +206,7 @@ reqwest = { version = "0.12.23", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-lopdf = { version = "0.43.0", optional = true }
+lopdf = { version = "0.42.0", optional = true }
 openssl = { version = "0.10.72", features = ["vendored"], optional = true }
 ureq = { version = "3.1.0", default-features = false, features = [
     "rustls"
@@ -223,7 +223,7 @@ wstd = "0.5.4"
 # This list matches the `rust_native_crypto` feature since they are not optional on WASM.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Browser WASM has no OS threads; use lopdf's serial parser instead of rayon.
-lopdf = { version = "0.43.0", optional = true, default-features = false }
+lopdf = { version = "0.42.0", optional = true, default-features = false }
 const-oid = "0.9.6"
 ecdsa = { version = "0.16.9", features = ["digest", "sha2"] }
 num-bigint-dig = "0.8.4"
@@ -265,7 +265,7 @@ default-features = false
 features = ["clock", "serde"]
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]
-lopdf = { version = "0.43.0", optional = true, default-features = false, features = ["wasm_js"] }
+lopdf = { version = "0.42.0", optional = true, default-features = false, features = ["wasm_js"] }
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 # Also enable getrandom 0.2 with js feature for other dependencies (rand, tempfile, config)
 # This is needed until all dependencies migrate to getrandom 0.3
