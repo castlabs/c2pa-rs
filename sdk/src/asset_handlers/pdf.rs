@@ -563,6 +563,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_nested_pdf_objects_are_bounded() {
+        // lopdf's depth-limited parser needs more stack than the test harness default.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                for (open, close) in [("[", "]"), ("<</K ", ">>")] {
+                    for depth in [8, 256] {
+                        let body = "%PDF-1.7\n1 0 obj\n<</Type/Catalog>>\nendobj\n";
+                        let nested = format!("{}0{}", open.repeat(depth), close.repeat(depth));
+                        let bytes = format!(
+                            "{body}xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<</Size 2/Root 1 0 R/Probe {nested}>>\nstartxref\n{}\n%%EOF\n",
+                            body.len()
+                        );
+                        // Put the payload in the trailer: malformed ordinary objects can
+                        // otherwise be silently skipped by lopdf's tolerant loader.
+                        let result = Pdf::from_bytes(bytes.as_bytes());
+                        if depth == 8 {
+                            assert!(result.unwrap().document.catalog().is_ok());
+                        } else {
+                            assert!(matches!(result, Err(Error::UnableToReadPdf(_))));
+                            assert!(matches!(
+                                Pdf::from_reader(std::io::Cursor::new(bytes)),
+                                Err(Error::UnableToReadPdf(_))
+                            ));
+                        }
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     #[cfg_attr(
         all(target_arch = "wasm32", not(target_os = "wasi")),
         wasm_bindgen_test

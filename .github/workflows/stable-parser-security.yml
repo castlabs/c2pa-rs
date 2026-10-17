@@ -1,0 +1,42 @@
+name: Stable parser security
+
+on:
+  pull_request:
+    branches: [fix/stable-single-file-fmp4]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 2
+  RUST_BACKTRACE: "1"
+
+jobs:
+  native:
+    name: Native SDK tests
+    if: github.repository == 'castlabs/c2pa-rs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test SDK including PDF, XMP, fMP4 and archive regressions
+        run: cargo test --locked -p c2pa --no-default-features --features pdf,rust_native_crypto,fetch_remote_manifests,json_schema,http_reqwest,http_ureq,file_io,add_thumbnails
+
+  wasm:
+    name: Browser WASM build and test compilation
+    if: github.repository == 'castlabs/c2pa-rs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build actual browser SDK features
+        run: cargo build --locked -p c2pa --lib --target wasm32-unknown-unknown --no-default-features --features pdf,rust_native_crypto,fetch_remote_manifests,json_schema,http_reqwest
+      - name: Compile WASM tests without launching a browser
+        run: cargo test --locked -p c2pa --target wasm32-unknown-unknown --no-default-features --features pdf,rust_native_crypto,fetch_remote_manifests,json_schema,http_reqwest --no-run
