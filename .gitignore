@@ -1,5 +1,8 @@
 /target/
 
+# Castlabs fork: Cargo.lock stays tracked (qualification uses --locked and
+# records its hash in release evidence), overriding upstream #2617.
+
 **/*.rs.bk
 **/*.tmp*
 
@@ -10,12 +13,14 @@
 
 .vscode
 .claude
+.scout
 
 /semver-checks/target/
 sdk/target/
 
 # Unit test output lands here. TO DO: Fix
 cli/target
+
 .cursor/rules/manifest.json
 .cursor/rules/security-global/*
 .cursor/rules/security-lang/*

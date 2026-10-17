@@ -19,7 +19,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
 default = ["c2pa/openssl", "http", "add_thumbnails"]
-file_io = ["c2pa/file_io"]
+file_io = ["c2pa/file_io", "dep:glob"]
 rust_native_crypto = ["c2pa/rust_native_crypto"]
 unstable_live_video = ["c2pa/unstable_live_video", "dep:zeroize"]
 # HTTP and thumbnails: not enabled by default because reqwest pulls in wasm-bindgen-futures
@@ -35,20 +35,22 @@ c2pa = { workspace = true, features = [
     "file_io",
     "pdf",
 ] }
-libc = "0.2"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+c2pa_cbor = "0.78.0"
+glob = { version = "0.3.3", optional = true }
+libc = "0.2.186"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 thiserror = "2.0.18"
 zeroize = { version = "1.8", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1.52", features = ["rt-multi-thread", "rt"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "rt"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1.52", features = ["rt", "macros", "io-util", "time"] }
+tokio = { version = "1.52.3", features = ["rt", "macros", "io-util", "time"] }
 
 [dev-dependencies]
-c2pa_cbor = "0.77.2"
+c2pa_cbor = "0.78.0"
 p256 = { version = "0.13.2", features = ["ecdsa"] }
 tempfile = "3.27.0"
 

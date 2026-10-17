@@ -44,8 +44,10 @@ use crate::{
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-/// Version of the crJSON specification implemented by this exporter.
-const CRJSON_SPEC_VERSION: &str = "2.3.0";
+/// Specification version against which the reported validation was performed
+/// (crJSON 2.4 `validationResults.specVersion`). This is the C2PA version the
+/// validator implements, not a format constant.
+const CRJSON_SPEC_VERSION: &str = crate::spec_versions::C2PA_VALIDATOR_VERSION;
 
 // ── Output types ────────────────────────────────────────────────────────────
 
@@ -54,7 +56,7 @@ struct Base64Bytes(Vec<u8>);
 
 impl Serialize for Base64Bytes {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("b64'{}'", base64::encode(&self.0)))
+        s.serialize_str(&base64::encode_b64_wrapped(&self.0))
     }
 }
 
@@ -169,6 +171,10 @@ struct CrJsonClaim {
 /// A single entry in the crJSON `manifests` array.
 #[derive(Serialize)]
 struct CrJsonManifest {
+    // The published crJSON 2.4 schema (spec.c2pa.org 2.4) forbids additional
+    // manifest properties, so the post-2.4 `isUpdateManifest` /
+    // `isCompressedManifest` fields (c2pa-rs 2f9ecc9b, targeting the next crJSON
+    // revision) are not emitted by this 2.4 exporter.
     label: String,
     /// Assertions map: `label -> assertion value`. Keys may include instance suffixes
     /// such as `c2pa.actions__2`.
@@ -228,13 +234,23 @@ impl<'a> CrJsonExporter<'a> {
 
     fn build_document(&self) -> Result<CrJsonDocument> {
         let active_label = self.reader.active_label();
+        // The report instant also applies to ancestors with no validation delta.
+        let validation_time = self
+            .reader
+            .validation_results()
+            .and_then(|vr| vr.validation_time())
+            .map(String::from)
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
         let validation_map = self.build_validation_results_per_manifest();
         let claims = self.reader.store.claims();
 
         // Collect (store_index, manifest) so we can sort afterwards.
         let mut indexed: Vec<(usize, CrJsonManifest)> = Vec::with_capacity(claims.len());
         for (idx, claim) in claims.iter().enumerate() {
-            indexed.push((idx, self.build_manifest(claim, &validation_map)?));
+            indexed.push((
+                idx,
+                self.build_manifest(claim, &validation_map, &validation_time)?,
+            ));
         }
 
         // Active manifest first; all others in reverse store order (newest first).
@@ -264,13 +280,15 @@ impl<'a> CrJsonExporter<'a> {
     fn build_manifest(
         &self,
         claim: &Claim,
-        validation_map: &HashMap<String, (StatusCodes, String)>,
+        validation_map: &HashMap<String, StatusCodes>,
+        validation_time: &str,
     ) -> Result<CrJsonManifest> {
         let label = claim.label();
         let assertions = self.build_assertions(claim)?;
         let claim_obj = self.build_claim(claim)?;
         let signature = self.build_signature(claim)?;
-        let validation_results = build_manifest_validation_results(label, validation_map);
+        let validation_results =
+            build_manifest_validation_results(label, validation_map, validation_time);
         let ingredient_deltas = self.build_manifest_ingredient_deltas(label);
 
         let (claim_v1, claim_v2) = if claim.version() == 1 {
@@ -388,7 +406,7 @@ impl<'a> CrJsonExporter<'a> {
                         key,
                         json!({
                             "identifier": absolute_uri,
-                            "hash": format!("b64'{}'", base64::encode(&assertion_ref.hash()))
+                            "hash": base64::encode_b64_wrapped(&assertion_ref.hash())
                         }),
                     );
                 }
@@ -430,7 +448,7 @@ impl<'a> CrJsonExporter<'a> {
                 Ok(Some(json!({
                     "format": assertion.content_type(),
                     "identifier": absolute_uri,
-                    "hash": format!("b64'{}'", base64::encode(ca.hash()))
+                    "hash": base64::encode_b64_wrapped(ca.hash())
                 })))
             }
             _ => Ok(assertion.as_json_object().ok().map(fix_hash_encoding)),
@@ -491,22 +509,15 @@ impl<'a> CrJsonExporter<'a> {
 
     // ── Validation ──────────────────────────────────────────────────────────
 
-    /// Build a map from each manifest label to its (StatusCodes, validation_time).
-    ///
-    /// `validation_time` falls back to the current UTC time when the reader supplies none.
-    fn build_validation_results_per_manifest(&self) -> HashMap<String, (StatusCodes, String)> {
-        let mut map: HashMap<String, (StatusCodes, String)> = HashMap::new();
+    /// Build a sparse map from manifest labels to current status codes.
+    fn build_validation_results_per_manifest(&self) -> HashMap<String, StatusCodes> {
+        let mut map = HashMap::new();
         let Some(vr) = self.reader.validation_results() else {
             return map;
         };
-        let validation_time = vr
-            .validation_time()
-            .map(String::from)
-            .unwrap_or_else(|| Utc::now().to_rfc3339());
-
         if let Some(active_label) = self.reader.active_label() {
             let codes = vr.active_manifest().cloned().unwrap_or_default();
-            map.insert(active_label.to_string(), (codes, validation_time.clone()));
+            map.insert(active_label.to_string(), codes);
         }
 
         let Some(deltas) = vr.ingredient_deltas() else {
@@ -519,7 +530,7 @@ impl<'a> CrJsonExporter<'a> {
                 continue;
             };
             let codes = idv.validation_deltas().clone();
-            map.insert(target_label, (codes, validation_time.clone()));
+            map.insert(target_label, codes);
         }
         map
     }
@@ -638,26 +649,27 @@ fn build_assertion_refs(
 
 fn build_manifest_validation_results(
     label: &str,
-    validation_map: &HashMap<String, (StatusCodes, String)>,
+    validation_map: &HashMap<String, StatusCodes>,
+    validation_time: &str,
 ) -> ManifestValidationResults {
-    let (codes, validation_time) = validation_map
-        .get(label)
-        .cloned()
-        .unwrap_or_else(|| (StatusCodes::default(), Utc::now().to_rfc3339()));
+    let codes = validation_map.get(label).cloned().unwrap_or_default();
     ManifestValidationResults {
         success: codes.success().clone(),
         informational: codes.informational().clone(),
         failure: codes.failure().clone(),
         spec_version: CRJSON_SPEC_VERSION,
-        validation_time,
+        validation_time: validation_time.to_string(),
     }
 }
 
-/// Normalize byte-array hash/pad/signature fields to base64 strings after CBOR→JSON decoding.
+/// Normalize byte-array hash/pad/signature fields to base64 strings, and decode
+/// the CAWG `signature` field into a structured object.
 ///
-/// This is applied to assertion values obtained via [`Assertion::as_json_object`] and to
-/// ingredient assertions serialized via the internal [`Ingredient`] type.
-/// All other output paths use typed structs with [`Base64Bytes`] serialization.
+/// [`Assertion::as_json_object`] now emits CBOR byte strings pre-wrapped as
+/// `b64'<base64>'`, so the array-of-numbers branches below only fire for the
+/// [`Ingredient`] custom serializer path, which still produces plain `Vec<u8>` →
+/// JSON-number-array output. All other output paths use typed structs with
+/// [`Base64Bytes`] serialization.
 fn fix_hash_encoding(value: Value) -> Value {
     match value {
         Value::Object(mut map) => {
@@ -679,7 +691,7 @@ fn fix_hash_encoding(value: Value) -> Value {
                                 .collect();
                             map.insert(
                                 field.to_string(),
-                                json!(format!("b64'{}'", base64::encode(&bytes))),
+                                json!(base64::encode_b64_wrapped(&bytes)),
                             );
                         }
                     }
@@ -688,21 +700,25 @@ fn fix_hash_encoding(value: Value) -> Value {
 
             // Ensure hash-bearing objects also carry a (possibly empty) pad field.
             if map.contains_key("hash") && !map.contains_key("pad") {
-                map.insert("pad".to_string(), json!("b64''"));
+                map.insert("pad".to_string(), json!(base64::encode_b64_wrapped(&[])));
             }
 
             if let Some(sig_val) = map.get("signature") {
-                if let Some(sig_arr) = sig_val.as_array() {
-                    if sig_arr.iter().all(|v| v.is_u64() || v.is_i64()) {
-                        let sig_bytes: Vec<u8> = sig_arr
-                            .iter()
+                let sig_bytes = match sig_val {
+                    // already-decoded crJSON bstr, from Assertion::as_json_object
+                    Value::String(s) => base64::decode_b64_wrapped(s),
+                    // legacy array-of-numbers form
+                    Value::Array(arr) if arr.iter().all(|v| v.is_u64() || v.is_i64()) => Some(
+                        arr.iter()
                             .filter_map(|v| v.as_u64().map(|n| n as u8))
-                            .collect();
-                        let decoded = decode_cawg_signature(&sig_bytes).unwrap_or_else(|_| {
-                            json!(format!("b64'{}'", base64::encode(&sig_bytes)))
-                        });
-                        map.insert("signature".to_string(), decoded);
-                    }
+                            .collect(),
+                    ),
+                    _ => None,
+                };
+                if let Some(sig_bytes) = sig_bytes {
+                    let decoded = decode_cawg_signature(&sig_bytes)
+                        .unwrap_or_else(|_| json!(base64::encode_b64_wrapped(&sig_bytes)));
+                    map.insert("signature".to_string(), decoded);
                 }
             }
 

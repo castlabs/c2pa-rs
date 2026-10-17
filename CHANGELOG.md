@@ -9,8 +9,63 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ## [Unreleased]
 
+### Castlabs 1.0.8 BMFF Exclusions
+
+* Add `builder.bmff_hash_extra_exclusions` for SDK-generated BMFF hard bindings,
+  including single-file fragmented assets, rendition ladders, and placeholders.
+  Defaults are unchanged. One exclusion list covers initialization and media
+  hashes; an unconditional `/sidx` entry also excludes a leading index.
+* Require existing BMFF assertions to contain every requested exact descriptor
+  before signing, including embeddable and reused-rendition workflows. Refuse
+  incompatible requests and BMFF update manifests before writing media outputs.
+* Correct FullBox exclusion flag decoding and mask matching, and do not match
+  version or flag conditions against boxes lacking those fields. Bindings that
+  relied on the former incorrect selector behavior may validate differently.
+* Use the WASI-safe temporary-directory helper in exclusion tests.
+* Port upstream contentauth/c2pa-rs#2876: update ZIP handling to `zip 9.0.4`,
+  including its fallible filename API. This resolves the inherited ZIP 8.x
+  audit findings RUSTSEC-2026-0367, RUSTSEC-2026-0368, and RUSTSEC-2026-0369.
+
+### Castlabs conformance candidate (Program 0.2 / C2PA 2.4)
+
+* Add `verify.validation_time` (RFC 3339) as the request-scoped evaluation
+  instant (`CertificateTrustPolicy::set_validation_time` / `evaluation_time`)
+  for exactly these paths: claim-signer chain and end-entity validity without
+  an authenticated signing time; OCSP freshness/revocation without a signing
+  time, including the certificate-status assertion pre-pass and the OCSP
+  responder certificate policy; the CAWG X.509 identity-assertion trust policy;
+  and the reported `validationTime` (Reader and crJSON). CAWG identity claims
+  aggregation (ICA) credential `validFrom`/`validUntil` and live-video
+  session-key validity windows still use the current time.
+* Purpose-scoped trust uses this line's always-strict
+  `CertificateTrustPolicy::check_certificate_trust_for(.., TrustListKind)`
+  isolation; the conformance candidate's `TrustPurpose` enum and
+  `verify.strict_trust_purposes` (with its legacy TSA/identity fallback) are not
+  carried over.
+* Route an untyped `specVersion` in `claim_generator_info` (settings or
+  `insert()`) into the typed field and reject conflicting values; a
+  non-string `specVersion` in `builder.claim_generator_info` settings is a
+  `BadParam` error. Accept live-video signer bindings carrying at most one
+  COSE_Sign1 tag (18); nested tags are rejected, matching the serializer.
+* Keep the default EKU allow-list when context trust settings are applied.
+* Checked crJSON export through the C FFI: `c2pa_reader_crjson` returns NULL
+  with an error instead of `{}` when the exporter fails.
+* crJSON reports one validation instant (the supplied `verify.validation_time`
+  when configured) for every manifest, including ancestors without deltas.
+* crJSON conforms to the published crJSON 2.4 schema: `validationResults.specVersion`
+  reports the validator version (`2.4.0`) and the post-2.4 `isUpdateManifest` /
+  `isCompressedManifest` manifest fields are not emitted; schema tests validate
+  formats against the vendored 2.4 schema.
+
 ### Experimental
 
+* Reduce the disabled trusted-VSI expert API to `sign_sig_structure(&[u8])`,
+  returning `TrustedVsiSignResult` with raw signature, assigned `u32` sequence,
+  and optional inclusive sequence maximum. Remove the unshipped expert EMSG
+  skeleton method and C symbol without aliases. Capability bit 2 is now named
+  `EXPERT_SIG_STRUCTURE_BIT`; the capability mask remains zero. Split-init,
+  composed EMSG, status, recovery, and callback-context target APIs remain stubs;
+  complete-buffer VSI behavior is unchanged.
 * Add purpose-aware Ed25519/ES256 callback signing and validated artifact recovery to the
   experimental live-video VSI signer while preserving the local Ed25519 API.
 * Tighten experimental VSI validation and recovery by requiring the deterministic `emsg.id`
@@ -20,6 +75,20 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
   supplied Unix timestamp drives key-validity checks, sizing, final signatures, and callbacks.
 * Add an allocation-free experimental C FFI probe for reading the 32-bit
   `moof/mfhd.sequence_number` from a live-video media segment.
+
+### Fixed
+
+* Reject a fragment that matches a fragmented BMFF Merkle map without `initHash` as `assertion.bmffHash.malformed` in the new offset-aware fragment entry points too. The guard itself is contentauth/c2pa-rs#2609, already on this line for both fragment verifiers (`Reader::from_fragment` / `with_fragment`, `from_fragmented_files` / `with_fragmented_files`); castlabs/c2pa-rs#18 adds regression tests through `Reader::from_fragment`, `from_fragment_at_offset` and its async form, and every fragment verifier.
+* Whole-file verification of a single-file fragmented asset rejects such a map the same way. This goes beyond #2609, and upstream still has the gap: without `initHash` only the leaves were verified, so the bytes before the first `moof` (`ftyp`, `moov`) were not covered. A file with a root `moof` whose maps were written without `initHash` (for example `ftyp` + `moof` + `mdat` with no `moov`, signed with `merkle_tree_chunk_size_in_kb`) now reports `assertion.bmffHash.malformed` instead of `assertion.bmffHash.mismatch`; it did not validate before either.
+* Preserve each TFRA entry's fragment target when inserting, resizing, or removing BMFF metadata. Offset adjustment now rejects unsupported TFRA versions instead of interpreting them as version 0. Previously corrupted TFRA tables are not repaired.
+* Generate fragment Merkle bindings when embedding manifests in supported single-track, single-file fragmented MP4 assets. Unsupported addressing, multiplexed layouts, and detached fragment signing fail explicitly; existing Merkle-bound files require an update manifest instead of ordinary re-signing.
+* Verify single-file fragmented BMFF assets against the Merkle maps named by their UUID boxes rather than unrelated rendition maps.
+* Use Merkle rendition ID 1 for new single-file fragmented MP4 signatures, aligning with the multi-file writer and C2PA's non-normative 1-based guidance. Existing ID-0 assets remain verifiable.
+
+### Added
+
+* Verify one fragment of a single-file fragmented BMFF asset without the whole file: `Reader::from_fragment_at_offset` / `with_fragment_at_offset`, `Store::load_fragment_from_stream_at_offset` and `BmffHash::verify_stream_segment_at_offset` take the fragment's absolute byte offset in the asset, which the leaf hashes of such an asset cover. The fragment must contain exactly the leaf's hashed root boxes at their absolute offsets: with the default exclusions it starts at a `merkle` uuid box and ends right before the next one (or at end of file), and the initialization bytes are everything before the first `merkle` uuid box. This is what a byte-range HLS player needs to validate per segment; the multi-file entry points are unchanged and keep hashing fragments as their own files.
+* Register `.m4s` and `.cmfv` BMFF extensions for fragmented init segments.
 
 ## [0.89.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.2...c2pa-v0.89.3)
 _13 July 2026_

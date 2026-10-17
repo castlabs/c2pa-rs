@@ -27,6 +27,30 @@ use crate::{
     SigningAlg,
 };
 
+// These malformed-assertion tests expect the fixture credential to be trusted
+// independently of the assertion error. Manifest test roots do not grant CAWG trust.
+fn trusted_x509_verifier() -> X509SignatureVerifier<'static> {
+    use std::borrow::Cow;
+
+    use crate::crypto::cose::{CertificateTrustPolicy, TrustAnchorType, Verifier};
+
+    let mut policy = CertificateTrustPolicy::new();
+    policy.add_default_valid_ekus();
+    policy
+        .add_trust_anchors(
+            include_bytes!(
+                "../../../../tests/fixtures/crypto/raw_signature/test_cert_root_bundle.pem"
+            ),
+            "https://c2pa-rs/unknown_tl",
+            TrustAnchorType::CAWG,
+            None,
+        )
+        .unwrap();
+    X509SignatureVerifier {
+        cose_verifier: Verifier::VerifyTrustPolicy(Cow::Owned(policy)),
+    }
+}
+
 /// An identity assertion MUST contain a valid CBOR data structure that contains
 /// the required fields as documented in the identity rule in [Section 5.2,
 /// “CBOR schema”]. The `cawg.identity.cbor.invalid` error code SHALL be used to
@@ -167,7 +191,7 @@ async fn assertion_not_in_claim_v1() {
 
     assert_eq!(sp.sig_type, "cawg.x509.cose".to_owned());
 
-    let x509_verifier = X509SignatureVerifier::default();
+    let x509_verifier = trusted_x509_verifier();
     let sig_info = ia
         .validate(
             reader.active_manifest().unwrap(),
@@ -204,7 +228,7 @@ async fn assertion_not_in_claim_v1() {
 
     assert_eq!(
         log.description,
-        "signing certificate trusted, found in User trust anchors"
+        "signing certificate trusted, found in [https://c2pa-rs/unknown_tl] trust anchors"
     );
 
     assert_eq!(
@@ -297,7 +321,7 @@ async fn duplicate_assertion_reference() {
 
     assert_eq!(sp.sig_type, "cawg.x509.cose".to_owned());
 
-    let x509_verifier = X509SignatureVerifier::default();
+    let x509_verifier = trusted_x509_verifier();
     let sig_info = ia
         .validate(
             reader.active_manifest().unwrap(),
@@ -334,7 +358,7 @@ async fn duplicate_assertion_reference() {
 
     assert_eq!(
         log.description,
-        "signing certificate trusted, found in User trust anchors"
+        "signing certificate trusted, found in [https://c2pa-rs/unknown_tl] trust anchors"
     );
     assert_eq!(
         log.validation_status.as_ref().unwrap().as_ref() as &str,
@@ -405,7 +429,7 @@ async fn no_hard_binding() {
     assert!(sp.referenced_assertions.is_empty());
     assert_eq!(sp.sig_type, "cawg.x509.cose".to_owned());
 
-    let x509_verifier = X509SignatureVerifier::default();
+    let x509_verifier = trusted_x509_verifier();
     let sig_info = ia
         .validate(
             reader.active_manifest().unwrap(),
@@ -442,7 +466,7 @@ async fn no_hard_binding() {
 
     assert_eq!(
         log.description,
-        "signing certificate trusted, found in User trust anchors"
+        "signing certificate trusted, found in [https://c2pa-rs/unknown_tl] trust anchors"
     );
 
     assert_eq!(
@@ -515,11 +539,16 @@ mod invalid_sig_type {
 
         let mut test_image = Cursor::new(test_image);
 
-        // Initial read with default `Reader` should pass without issues.
+        // The default (decoding-enabled) `Reader` must surface the unrecognized
+        // sig_type as a failure.
         let reader = Reader::default()
             .with_stream(format, &mut test_image)
             .unwrap();
-        assert_eq!(reader.validation_status(), None);
+        assert!(reader
+            .validation_status()
+            .unwrap()
+            .iter()
+            .any(|s| s.code() == "cawg.identity.sig_type.unknown"));
 
         // Re-parse with identity assertion code should find extra assertion error.
         let mut status_tracker = StatusTracker::default();
@@ -600,11 +629,16 @@ mod invalid_sig_type {
 
         let mut test_image = Cursor::new(test_image);
 
-        // Initial read with default `Reader` should pass without issues.
+        // The default (decoding-enabled) `Reader` must surface the unrecognized
+        // sig_type as a failure.
         let reader = Reader::default()
             .with_stream(format, &mut test_image)
             .unwrap();
-        assert_eq!(reader.validation_status(), None);
+        assert!(reader
+            .validation_status()
+            .unwrap()
+            .iter()
+            .any(|s| s.code() == "cawg.identity.sig_type.unknown"));
 
         // Re-parse with identity assertion code should find extra assertion error.
         let mut status_tracker = StatusTracker::default();
@@ -704,7 +738,7 @@ async fn pad1_invalid() {
 
     assert_eq!(sp.sig_type, "cawg.x509.cose".to_owned());
 
-    let x509_verifier = X509SignatureVerifier::default();
+    let x509_verifier = trusted_x509_verifier();
     let sig_info = ia
         .validate(
             reader.active_manifest().unwrap(),
@@ -741,7 +775,7 @@ async fn pad1_invalid() {
 
     assert_eq!(
         log.description,
-        "signing certificate trusted, found in User trust anchors"
+        "signing certificate trusted, found in [https://c2pa-rs/unknown_tl] trust anchors"
     );
 
     assert_eq!(
@@ -813,7 +847,7 @@ async fn pad2_invalid() {
 
     assert_eq!(sp.sig_type, "cawg.x509.cose".to_owned());
 
-    let x509_verifier = X509SignatureVerifier::default();
+    let x509_verifier = trusted_x509_verifier();
     let sig_info = ia
         .validate(
             reader.active_manifest().unwrap(),
@@ -850,7 +884,7 @@ async fn pad2_invalid() {
 
     assert_eq!(
         log.description,
-        "signing certificate trusted, found in User trust anchors"
+        "signing certificate trusted, found in [https://c2pa-rs/unknown_tl] trust anchors"
     );
 
     assert_eq!(

@@ -41,6 +41,9 @@ pub struct ClaimGeneratorInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub operating_system: Option<String>,
+    /// The version of the specification used to produce this manifest (SemVer)
+    #[serde(rename = "specVersion", skip_serializing_if = "Option::is_none")]
+    pub spec_version: Option<String>,
     // Any other values that are not part of the standard
     #[serde(flatten)]
     pub(crate) other: HashMap<String, Value>,
@@ -53,6 +56,7 @@ impl Default for ClaimGeneratorInfo {
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
             icon: None,
             operating_system: None,
+            spec_version: None,
             other: HashMap::new(),
         }
     }
@@ -65,6 +69,7 @@ impl ClaimGeneratorInfo {
             version: None,
             icon: None,
             operating_system: None, // todo: decide if we want to fill in this value
+            spec_version: None,
             other: HashMap::new(),
         }
     }
@@ -86,14 +91,57 @@ impl ClaimGeneratorInfo {
         self
     }
 
+    /// Get the SpecVersion
+    pub fn get_spec_version(&self) -> Option<&String> {
+        self.spec_version.as_ref()
+    }
+
+    /// Sets the SpecVersion used to create this manifest
+    pub fn set_spec_version<S: Into<String>>(&mut self, spec_version: S) {
+        self.spec_version = Some(spec_version.into());
+    }
+
     /// Adds a new key/value pair to the generator info.
     pub fn insert<K, V>(&mut self, key: K, value: V) -> &Self
     where
         K: Into<String>,
         V: Into<Value>,
     {
-        self.other.insert(key.into(), value.into());
+        let key = key.into();
+        let value = value.into();
+        // `specVersion` is a typed field; keeping it in `other` as well would
+        // serialize a duplicate CBOR map key.
+        if key == "specVersion" {
+            if let Value::String(version) = &value {
+                self.spec_version = Some(version.clone());
+                return self;
+            }
+        }
+        self.other.insert(key, value);
         self
+    }
+
+    /// Move an untyped `specVersion` entry into the typed field.
+    ///
+    /// Returns an error if both are present with different values or the
+    /// untyped value is not a string.
+    pub(crate) fn normalize_spec_version(&mut self) -> crate::Result<()> {
+        if let Some(value) = self.other.remove("specVersion") {
+            let Value::String(version) = value else {
+                return Err(crate::Error::BadParam(
+                    "claim_generator_info specVersion must be a string".to_string(),
+                ));
+            };
+            match &self.spec_version {
+                Some(existing) if existing != &version => {
+                    return Err(crate::Error::BadParam(format!(
+                        "claim_generator_info specVersion conflict: {existing} vs {version}"
+                    )));
+                }
+                _ => self.spec_version = Some(version),
+            }
+        }
+        Ok(())
     }
 
     /// Gets additional values by key.

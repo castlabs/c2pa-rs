@@ -198,6 +198,20 @@ pub struct ClaimGeneratorInfoSettings {
     pub other: HashMap<String, serde_json::Value>,
 }
 
+/// Reads an untyped `specVersion` from claim generator info settings.
+///
+/// A present but non-string value is an error rather than being dropped,
+/// consistent with [`ClaimGeneratorInfo`]'s own `specVersion` normalization.
+fn spec_version_from_other(other: &HashMap<String, serde_json::Value>) -> Result<Option<String>> {
+    match other.get("specVersion") {
+        None => Ok(None),
+        Some(serde_json::Value::String(version)) => Ok(Some(version.clone())),
+        Some(_) => Err(Error::BadParam(
+            "claim_generator_info specVersion must be a string".to_string(),
+        )),
+    }
+}
+
 impl TryFrom<ClaimGeneratorInfoSettings> for ClaimGeneratorInfo {
     type Error = Error;
 
@@ -214,9 +228,11 @@ impl TryFrom<ClaimGeneratorInfoSettings> for ClaimGeneratorInfo {
                     ClaimGeneratorInfoOperatingSystem::Other(name) => name,
                 })
             },
+            spec_version: spec_version_from_other(&value.other)?,
             other: value
                 .other
                 .into_iter()
+                .filter(|(key, _)| key != "specVersion")
                 .map(|(key, value)| {
                     serde_json::to_value(value)
                         .map(|value| (key, value))
@@ -246,9 +262,11 @@ impl TryFrom<&ClaimGeneratorInfoSettings> for ClaimGeneratorInfo {
                     ClaimGeneratorInfoOperatingSystem::Other(name) => name.clone(),
                 })
             },
+            spec_version: spec_version_from_other(&value.other)?,
             other: value
                 .other
                 .iter()
+                .filter(|(key, _)| key.as_str() != "specVersion")
                 .map(|(key, value)| {
                     serde_json::to_value(value)
                         .map(|value| (key.clone(), value))
@@ -472,7 +490,7 @@ impl SettingsValidate for ActionsSettings {
 pub enum TimeStampFetchScope {
     /// Fetch timestamps for only the parent manifest.
     Parent,
-    /// Fetch timestmaps for all manifests in the manifest store.
+    /// Fetch timestamps for all manifests in the manifest store.
     All,
 }
 
@@ -613,6 +631,159 @@ pub struct BuilderSettings {
     ///
     /// The default value is `true`.
     pub bmff_hash_exclude_free_and_skip_boxes: bool,
+    /// Whether to ignore errors encountered while loading or validating an [`Ingredient`]'s
+    /// manifest (e.g. invalid file format).
+    ///
+    /// When enabled, a hard error is reported as a `general.error` in the ingredient's
+    /// [`validation_results`] instead of being returned, so the [`Ingredient`] still loads
+    /// and callers can inspect what went wrong.
+    ///
+    /// The default value is false.
+    ///
+    /// [`Ingredient`]: crate::Ingredient
+    /// [`validation_results`]: crate::Ingredient::validation_results
+    pub ignore_ingredient_errors: bool,
+    /// Additional exclusions for BMFF hash assertions that the SDK generates.
+    ///
+    /// Each entry is added to the exclusion list of every `c2pa.hash.bmff`
+    /// assertion the SDK creates when signing a BMFF asset (flat file hash,
+    /// `mdat` Merkle hashing, single-file and multi-file fragmented signing,
+    /// shared-manifest ladders, and placeholders), after the required default
+    /// exclusions, which can never be removed this way. The same list applies
+    /// to the initialization hash and every fragment leaf. Entries use the
+    /// exclusion-map fields of the specification (`xpath`, optional `length`,
+    /// `data`, `subset`, `version`, `flags`, `exact`). Exact duplicates of an
+    /// existing exclusion are not added twice.
+    ///
+    /// Bytes matched by an exclusion are not covered by the hard binding, so a
+    /// change to them is not detected. Only exclude boxes whose content cannot
+    /// change how the asset is interpreted, or accept that the excluded data
+    /// is unauthenticated. The specification requires the informational code
+    /// `assertion.bmffHash.additionalExclusionsPresent` for additional exclusions;
+    /// older validators may not emit it.
+    ///
+    /// Every existing BMFF hash assertion, including a reused SDK placeholder,
+    /// must already contain each configured exact descriptor. Missing entries
+    /// cause an error before hashing, signing, or output writes; computed hashes
+    /// and their exclusions are never silently changed. Repeated descriptors
+    /// require only one matching entry. BMFF update manifests reject a nonempty
+    /// list. It has no effect on other formats without a BMFF hash assertion.
+    /// Defaults to an empty list.
+    #[serde(default)]
+    pub bmff_hash_extra_exclusions: Vec<BmffHashExclusion>,
+}
+
+/// One BMFF hash exclusion, as configured in
+/// [`BuilderSettings::bmff_hash_extra_exclusions`].
+///
+/// Mirrors the exclusion map of a `c2pa.hash.bmff` assertion.
+#[cfg_attr(feature = "json_schema", derive(JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct BmffHashExclusion {
+    /// Absolute path of the box to exclude, for example `/sidx` or
+    /// `/moov/trak/mdia/minf/stbl/stco`. Each path element is a
+    /// four-character box type.
+    pub xpath: String,
+    /// Only exclude boxes of exactly this length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u64>,
+    /// Only exclude boxes containing these bytes at these offsets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<BmffHashExclusionData>>,
+    /// Exclude only these byte ranges of the box, relative to its start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subset: Option<Vec<BmffHashExclusionSubset>>,
+    /// Only exclude full boxes with this version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u8>,
+    /// Only exclude full boxes with these flags (three bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flags: Option<Vec<u8>>,
+    /// Whether `flags` must match exactly rather than as a mask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<bool>,
+}
+
+/// Bytes that a box must contain at `offset` to match a [`BmffHashExclusion`].
+#[cfg_attr(feature = "json_schema", derive(JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct BmffHashExclusionData {
+    /// Offset from the start of the box, including its header.
+    pub offset: u64,
+    /// The bytes to match.
+    pub value: Vec<u8>,
+}
+
+/// A byte range of a box to exclude, relative to the start of the box.
+#[cfg_attr(feature = "json_schema", derive(JsonSchema))]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct BmffHashExclusionSubset {
+    /// Offset from the start of the box, including its header.
+    pub offset: u64,
+    /// Length of the range; `0` means to the end of the box.
+    pub length: u64,
+}
+
+/// Upper bound on configured extra exclusions; each one is resolved against
+/// every box of every hashed stream.
+const MAX_BMFF_HASH_EXTRA_EXCLUSIONS: usize = 64;
+
+impl BmffHashExclusion {
+    /// Checks the entry the way a BMFF hash validator would, so a bad entry
+    /// fails when the settings are loaded rather than producing an assertion
+    /// that does not validate.
+    fn validate(&self) -> Result<()> {
+        let bad = |why: &str| {
+            Err(Error::BadParam(format!(
+                "builder.bmff_hash_extra_exclusions: {why}: {:?}",
+                self.xpath
+            )))
+        };
+        let Some(path) = self.xpath.strip_prefix('/') else {
+            return bad("xpath must be an absolute box path");
+        };
+        if path
+            .split('/')
+            .any(|element| element.len() != 4 || !element.is_ascii())
+        {
+            return bad("xpath elements must be four-character box types");
+        }
+        if let Some(data) = &self.data {
+            if data.is_empty() || data.iter().any(|d| d.value.is_empty()) {
+                return bad("data entries must not be empty");
+            }
+        }
+        if let Some(subsets) = &self.subset {
+            if subsets.is_empty() {
+                return bad("subset must not be empty");
+            }
+            let mut previous_end = 0u64;
+            for (index, subset) in subsets.iter().enumerate() {
+                if index > 0 && subset.offset < previous_end {
+                    return bad("subsets must be ordered by offset and must not overlap");
+                }
+                if subset.length == 0 {
+                    if index + 1 != subsets.len() {
+                        return bad("only the last subset may extend to the end of the box");
+                    }
+                } else {
+                    let Some(end) = subset.offset.checked_add(subset.length) else {
+                        return bad("subset range overflows");
+                    };
+                    previous_end = end;
+                }
+            }
+        }
+        if let Some(flags) = &self.flags {
+            if flags.len() != 3 {
+                return bad("flags must be three bytes");
+            }
+        }
+        if self.exact.is_some() && self.flags.is_none() {
+            return bad("exact requires flags");
+        }
+        Ok(())
+    }
 }
 
 impl Default for BuilderSettings {
@@ -630,6 +801,8 @@ impl Default for BuilderSettings {
             generate_c2pa_archive: Some(true),
             auto_timestamp_assertion: TimeStampSettings::default(),
             bmff_hash_exclude_free_and_skip_boxes: true,
+            ignore_ingredient_errors: false,
+            bmff_hash_extra_exclusions: Vec::new(),
         }
     }
 }
@@ -648,7 +821,16 @@ pub(crate) enum OcspFetchScope {
 impl SettingsValidate for BuilderSettings {
     fn validate(&self) -> Result<()> {
         self.actions.validate()?;
-        self.thumbnail.validate()
+        self.thumbnail.validate()?;
+        if self.bmff_hash_extra_exclusions.len() > MAX_BMFF_HASH_EXTRA_EXCLUSIONS {
+            return Err(Error::BadParam(format!(
+                "builder.bmff_hash_extra_exclusions: at most {MAX_BMFF_HASH_EXTRA_EXCLUSIONS} entries"
+            )));
+        }
+        for exclusion in &self.bmff_hash_extra_exclusions {
+            exclusion.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -743,6 +925,44 @@ pub mod tests {
         let info = ClaimGeneratorInfo::try_from(&settings).unwrap();
         assert_eq!(info.name, "Test Generator");
         assert_eq!(settings.name, "Test Generator"); // Original still valid
+    }
+
+    #[test]
+    fn test_claim_generator_info_spec_version_must_be_string() {
+        fn assert_rejected(settings: ClaimGeneratorInfoSettings) {
+            for result in [
+                ClaimGeneratorInfo::try_from(&settings),
+                ClaimGeneratorInfo::try_from(settings.clone()),
+            ] {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(&err, Error::BadParam(msg) if msg.contains("specVersion must be a string")),
+                    "expected BadParam, got {err:?}"
+                );
+            }
+        }
+
+        // TOML number
+        let toml_settings: ClaimGeneratorInfoSettings =
+            toml::from_str("name = \"Test Generator\"\nspecVersion = 2\n").unwrap();
+        assert!(toml_settings.other["specVersion"].is_number());
+        assert_rejected(toml_settings);
+
+        // JSON number
+        let json_settings: ClaimGeneratorInfoSettings =
+            serde_json::from_str(r#"{"name":"Test Generator","specVersion":2.4}"#).unwrap();
+        assert_rejected(json_settings);
+
+        // A string is routed into the typed field, not `other`.
+        let string_settings: ClaimGeneratorInfoSettings =
+            serde_json::from_str(r#"{"name":"Test Generator","specVersion":"2.4"}"#).unwrap();
+        for info in [
+            ClaimGeneratorInfo::try_from(&string_settings).unwrap(),
+            ClaimGeneratorInfo::try_from(string_settings).unwrap(),
+        ] {
+            assert_eq!(info.spec_version.as_deref(), Some("2.4"));
+            assert!(!info.other.contains_key("specVersion"));
+        }
     }
 
     #[test]
