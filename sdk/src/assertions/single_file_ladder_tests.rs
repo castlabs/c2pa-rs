@@ -1038,7 +1038,7 @@ fn ladder_segments_verify_against_the_shared_manifest() {
 #[test]
 fn ladder_applies_extra_exclusions_to_every_rendition() {
     const SIDX: &[u8] = include_bytes!("../../tests/fixtures/single_file_fragments_sidx.mp4");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdirectory().unwrap();
     let mut sources = Vec::new();
     let mut outputs = Vec::new();
     for i in 0..2u8 {
@@ -1101,7 +1101,7 @@ fn fragmented_files_apply_extra_exclusions() {
         .unwrap();
     let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/bunny/bunny_89283bps/BigBuckBunny_2s_init.mp4");
-    let output = tempfile::tempdir().unwrap();
+    let output = tempdirectory().unwrap();
     builder
         .sign_fragmented_files(
             test_signer(SigningAlg::Es256).as_ref(),
