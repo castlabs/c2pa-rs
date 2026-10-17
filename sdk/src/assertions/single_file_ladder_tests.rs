@@ -1066,7 +1066,7 @@ fn ladder_applies_extra_exclusions_to_every_rendition() {
                 .count(),
             1
         );
-        assert_eq!(maps(&hash).len(), 2);
+        assert_eq!(hash.merkle.as_ref().unwrap().len(), 2);
 
         let r = roots(&signed);
         let sidx: Vec<B> = r.iter().copied().filter(|b| b.kind == *b"sidx").collect();
