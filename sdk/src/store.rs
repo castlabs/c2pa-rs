@@ -2287,10 +2287,12 @@ impl Store {
         // /ftyp, /mfra) - those are always added below. /free and /skip are
         // only spec-*permitted* to exclude, not required, so whether to
         // exclude them is controlled by
-        // `settings.builder.bmff_hash_exclude_free_and_skip_boxes`.
+        // `settings.builder.bmff_hash_exclude_free_and_skip_boxes`. Extra
+        // exclusions configured for SDK-generated BMFF hashes come last.
 
         let mut dh = BmffHash::new("jumbf manifest", alg, None);
         dh.set_default_exclusions_with_options(settings);
+        dh.add_extra_exclusions(&settings.builder.bmff_hash_extra_exclusions);
 
         // fill in temporary hash
         dh.set_hash(vec![0u8; hash_size_by_alg(alg)?]);
@@ -2905,6 +2907,24 @@ impl Store {
         Ok(modified)
     }
 
+    fn check_bmff_extra_exclusions(&self, settings: &Settings) -> Result<()> {
+        let extras = &settings.builder.bmff_hash_extra_exclusions;
+        if extras.is_empty() {
+            return Ok(());
+        }
+        let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+        if pc.update_manifest() {
+            return Err(Error::BadParam(
+                "builder.bmff_hash_extra_exclusions cannot apply to a BMFF update manifest"
+                    .to_string(),
+            ));
+        }
+        for assertion in pc.bmff_hash_assertions() {
+            BmffHash::from_assertion(assertion.assertion())?.check_extra_exclusions(extras)?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "file_io")]
     fn add_merkmap_for_rendition(
         &mut self,
@@ -2926,11 +2946,16 @@ impl Store {
 
         // get the BMFF hash assertion if it exists or create a new one if not
         let mut bmff_hash = if let Some(bmff_hash_assertion) = pc.bmff_hash_assertions().first() {
-            BmffHash::from_assertion(bmff_hash_assertion.assertion())?
+            // Renditions after the first reuse the assertion generated for the
+            // first one, which already carries the extra exclusions.
+            let bmff_hash = BmffHash::from_assertion(bmff_hash_assertion.assertion())?;
+            bmff_hash.check_extra_exclusions(&settings.builder.bmff_hash_extra_exclusions)?;
+            bmff_hash
         } else {
             let mut bmff_hash = BmffHash::new("jumbf manifest", pc.alg(), None);
 
             bmff_hash.set_default_exclusions_with_options(settings);
+            bmff_hash.add_extra_exclusions(&settings.builder.bmff_hash_extra_exclusions);
 
             if pc.version() < 2 {
                 bmff_hash.set_bmff_version(2); // backcompat support
@@ -3009,6 +3034,7 @@ impl Store {
         signer: &dyn Signer,
         context: &Context,
     ) -> Result<()> {
+        self.check_bmff_extra_exclusions(context.settings())?;
         if init_paths.is_empty() {
             return Err(Error::BadParam(
                 "at least one init segment path must be provided".to_string(),
@@ -3663,6 +3689,9 @@ impl Store {
         context: &Context,
     ) -> Result<Vec<u8>> {
         let settings = context.settings();
+        if context.io().is_bmff_format(format) {
+            self.check_bmff_extra_exclusions(settings)?;
+        }
         let threshold = settings.core.backing_store_memory_threshold_in_mb;
 
         let input_len = io_utils::stream_len(input_stream)?;
