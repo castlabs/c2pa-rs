@@ -28,6 +28,9 @@ use c2pa::{
     Context as C2paContext, Manifest, Reader,
 };
 
+#[path = "live_video_updates.rs"]
+mod updates;
+
 /// Which C2PA Live Video validation method the init segment advertises.
 enum ValidationMethod {
     /// Section 19.3: each segment carries a C2PA Manifest Box with a `LiveVideoSegment` assertion.
@@ -45,29 +48,68 @@ enum ValidationMethod {
 ///
 /// `segments_glob` is resolved relative to `init_path`'s directory and matched
 /// in natural (numeric-aware) filename order.
+/// `updates_path` opts into a trusted-operator VSI signed-init schedule.
 pub fn validate_live_video(
     context: &Arc<C2paContext>,
     init_path: &Path,
     segments_glob: &Path,
+    updates_path: Option<&Path>,
 ) -> Result<()> {
-    let init_data = fs::read(init_path)
-        .with_context(|| format!("Failed to read init segment: {init_path:?}"))?;
+    let scheduled = updates_path
+        .map(|path| -> Result<_> {
+            updates::require_verification(context)?;
+            let segments = collect_segments(init_path, segments_glob)?;
+            let plan = updates::load_plan(context, path, &segments)?;
+            Ok((segments, plan))
+        })
+        .transpose()?;
+
+    let init_data = if updates_path.is_some() {
+        updates::read_init(init_path)?
+    } else {
+        fs::read(init_path)
+            .with_context(|| format!("Failed to read init segment: {init_path:?}"))?
+    };
 
     let mut tracker = StatusTracker::default();
     let mut live_validator = LiveVideoValidator::new();
 
-    match live_validator.validate_init_segment(&init_data, &mut tracker) {
-        Ok(_) => println!("Init OK:   {init_path:?}"),
-        Err(e) => eprintln!("Init FAIL: {init_path:?}: {e}"),
+    if updates_path.is_some() {
+        live_validator
+            .validate_init_segment(&init_data, &mut tracker)
+            .context("Live video validation failed: initial init segment layout is invalid")?;
+        if tracker.filter_errors().next().is_some() {
+            bail!("Live video validation failed: initial init segment layout is invalid");
+        }
+    } else {
+        match live_validator.validate_init_segment(&init_data, &mut tracker) {
+            Ok(_) => println!("Init OK:   {init_path:?}"),
+            Err(e) => eprintln!("Init FAIL: {init_path:?}: {e}"),
+        }
     }
 
-    let method = detect_validation_method(
-        context,
-        init_path,
-        &init_data,
-        &mut live_validator,
-        &mut tracker,
-    );
+    let method = if updates_path.is_some() {
+        let verified = updates::read_context(context, init_path, &init_data)?;
+        let failures_before = tracker.filter_errors().count();
+        live_validator.validate_session_keys(
+            &verified.session_keys,
+            &verified.manifest_id,
+            Some(&verified.ee_cert_der),
+            &mut tracker,
+        )?;
+        if tracker.filter_errors().count() != failures_before {
+            bail!("Live video validation failed: initial VSI session keys are invalid");
+        }
+        ValidationMethod::VerifiableSegmentInfo
+    } else {
+        detect_validation_method(
+            context,
+            init_path,
+            &init_data,
+            &mut live_validator,
+            &mut tracker,
+        )
+    };
 
     // If the init segment's manifest failed trust/signature validation, don't proceed to
     // validate segments under a guessed fallback method — the segments' actual method (and
@@ -82,6 +124,10 @@ pub fn validate_live_video(
         bail!("Live video validation failed: init segment layout or manifest is invalid");
     }
 
+    if updates_path.is_some() {
+        println!("Init OK:   {init_path:?}");
+    }
+
     match &method {
         ValidationMethod::ManifestBox => {
             println!("Method:    19.3 (per-segment C2PA Manifest Box)")
@@ -91,7 +137,11 @@ pub fn validate_live_video(
         }
     }
 
-    let segment_paths = collect_segments(init_path, segments_glob)?;
+    let (segment_paths, plan) = match scheduled {
+        Some(scheduled) => scheduled,
+        None => (collect_segments(init_path, segments_glob)?, Vec::new()),
+    };
+    let mut plan = plan.into_iter().peekable();
 
     if segment_paths.is_empty() {
         let init_dir = init_path.parent().unwrap_or(Path::new("."));
@@ -104,7 +154,29 @@ pub fn validate_live_video(
 
     let mut failed_count = 0usize;
 
-    for segment_path in &segment_paths {
+    for (segment_index, segment_path) in segment_paths.iter().enumerate() {
+        if plan.peek().map(|update| update.segment_index) == Some(segment_index) {
+            if let Some(update) = plan.next() {
+                if let Err(error) = update.install(&mut live_validator, &mut tracker) {
+                    print!(
+                        "{}",
+                        format_sequence_coverage(live_validator.sequence_coverage())
+                    );
+                    let failures = collect_live_video_failures(&tracker);
+                    if !failures.is_empty() {
+                        eprintln!("\nLive video continuity failures:");
+                        for (code, description) in failures {
+                            eprintln!("  [{code}] {description}");
+                        }
+                    }
+                    bail!("VSI update FAIL before {segment_path:?}: {error:#}");
+                }
+                println!(
+                    "VSI update installed: {:?} before {segment_path:?}",
+                    update.init_path
+                );
+            }
+        }
         let ok = match method {
             ValidationMethod::ManifestBox => validate_segment_manifest_box(
                 context,
@@ -581,15 +653,21 @@ mod tests {
         )
         .unwrap();
         let init = signed.join("BigBuckBunny_2s_init.mp4");
-        validate_live_video(&context, &init, Path::new("BigBuckBunny_2s27[7-9].m4s")).unwrap();
+        validate_live_video(
+            &context,
+            &init,
+            Path::new("BigBuckBunny_2s27[7-9].m4s"),
+            None,
+        )
+        .unwrap();
         // Select only 277 and 279: omission must be visible, but not invalidate either segment.
         let gap_glob = Path::new("BigBuckBunny_2s27[79].m4s");
-        validate_live_video(&context, &init, gap_glob).unwrap();
+        validate_live_video(&context, &init, gap_glob, None).unwrap();
         let last_path = signed.join("BigBuckBunny_2s279.m4s");
         let mut tampered = fs::read(&last_path).unwrap();
         *tampered.last_mut().unwrap() ^= 1;
         fs::write(&last_path, tampered).unwrap();
-        assert!(validate_live_video(&context, &init, gap_glob).is_err());
+        assert!(validate_live_video(&context, &init, gap_glob, None).is_err());
     }
 
     #[test]
@@ -714,8 +792,12 @@ mod tests {
         init_data.extend(make_bmff_box(b"mdat"));
         let init = write_temp_file(&dir, "init.mp4", &init_data);
 
-        let result =
-            validate_live_video(&Arc::new(C2paContext::new()), &init, Path::new("seg_*.m4s"));
+        let result = validate_live_video(
+            &Arc::new(C2paContext::new()),
+            &init,
+            Path::new("seg_*.m4s"),
+            None,
+        );
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("init segment"));
@@ -732,8 +814,12 @@ mod tests {
         let seg_data = make_bmff_box(b"mdat");
         write_temp_file(&dir, "seg_001.m4s", &seg_data);
 
-        let result =
-            validate_live_video(&Arc::new(C2paContext::new()), &init, Path::new("seg_*.m4s"));
+        let result = validate_live_video(
+            &Arc::new(C2paContext::new()),
+            &init,
+            Path::new("seg_*.m4s"),
+            None,
+        );
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
