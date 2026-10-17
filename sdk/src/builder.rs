@@ -1425,15 +1425,18 @@ impl Builder {
             let mut file = zip
                 .by_index(i)
                 .map_err(|e| Error::OtherError(Box::new(e)))?;
+            let file_name = file
+                .name()
+                .map_err(|e| Error::OtherError(Box::new(e)))?
+                .into_owned();
 
-            if file.name().starts_with("resources/") && file.name() != "resources/" {
+            if file_name.starts_with("resources/") && file_name != "resources/" {
                 // Validate the full path from the archive to prevent path traversal
-                let _sanitized_path = sanitize_archive_path(file.name())?;
+                let _sanitized_path = sanitize_archive_path(&file_name)?;
 
                 let mut data = Vec::new();
                 file.read_to_end(&mut data)?;
-                let id = file
-                    .name()
+                let id = file_name
                     .split('/')
                     .nth(1)
                     .ok_or(Error::BadParam("Invalid resource path".to_string()))?;
@@ -1447,14 +1450,13 @@ impl Builder {
 
             // Load the c2pa_manifests.
             // Adds the manifest data to any ingredient that has a matching active_manfiest label.
-            if file.name().starts_with("manifests/") && file.name() != "manifests/" {
+            if file_name.starts_with("manifests/") && file_name != "manifests/" {
                 // Validate the full path from the archive to prevent path traversal
-                let _sanitized_path = sanitize_archive_path(file.name())?;
+                let _sanitized_path = sanitize_archive_path(&file_name)?;
 
                 let mut data = Vec::new();
                 file.read_to_end(&mut data)?;
-                let manifest_label = file
-                    .name()
+                let manifest_label = file_name
                     .split('/')
                     .nth(1)
                     .ok_or(Error::BadParam("Invalid manifest path".to_string()))?;
@@ -1474,20 +1476,19 @@ impl Builder {
 
             // Keep this for temporary unstable api support (un-versioned).
             // Earlier method used numbered library folders instead of manifests.
-            if file.name().starts_with("ingredients/") && file.name() != "ingredients/" {
+            if file_name.starts_with("ingredients/") && file_name != "ingredients/" {
                 // Validate the full path from the archive to prevent path traversal
-                let _sanitized_path = sanitize_archive_path(file.name())?;
+                let _sanitized_path = sanitize_archive_path(&file_name)?;
 
                 let mut data = Vec::new();
                 file.read_to_end(&mut data)?;
-                let index: usize = file
-                    .name()
+                let index: usize = file_name
                     .split('/')
                     .nth(1)
                     .ok_or_else(|| Error::BadParam("Invalid ingredient path".to_string()))?
                     .parse::<usize>()
                     .map_err(|_| Error::BadParam("Invalid ingredient path".to_string()))?;
-                let id = file.name().split('/').nth(2).unwrap_or_default();
+                let id = file_name.split('/').nth(2).unwrap_or_default();
 
                 // Sanitize id to prevent path traversal via stored key
                 let sanitized_id = if !id.is_empty() {
@@ -2242,6 +2243,12 @@ impl Builder {
     /// Converts the `Builder` into a [`Store`] with the specified [`Claim`], usually obtained
     /// by calling [`Builder::to_claim`].
     fn to_store_with_claim(&self, claim: Claim) -> Result<Store> {
+        let extras = &self.context.settings().builder.bmff_hash_extra_exclusions;
+        if !extras.is_empty() {
+            for assertion in claim.bmff_hash_assertions() {
+                BmffHash::from_assertion(assertion.assertion())?.check_extra_exclusions(extras)?;
+            }
+        }
         let mut store = Store::from_context(&self.context);
 
         // if this can be an update manifest, then set the update_manifest flag
@@ -2252,6 +2259,30 @@ impl Builder {
         }?;
 
         Ok(store)
+    }
+
+    // Check before hashing, timestamp signing, or opening an output. The shared
+    // claim check above also covers assertions assembled outside the definition.
+    fn check_bmff_settings(&self, format: &str) -> Result<()> {
+        let extras = &self.context.settings().builder.bmff_hash_extra_exclusions;
+        if extras.is_empty() {
+            return Ok(());
+        }
+        if self.context.io().is_bmff_format(format) && self.intent() == Some(BuilderIntent::Update)
+        {
+            return Err(Error::BadParam(
+                "builder.bmff_hash_extra_exclusions cannot apply to a BMFF update manifest"
+                    .to_string(),
+            ));
+        }
+        for assertion in &self.definition.assertions {
+            if assertion.label().starts_with(BmffHash::LABEL) {
+                assertion
+                    .to_assertion::<BmffHash>()?
+                    .check_extra_exclusions(extras)?;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "add_thumbnails")]
@@ -2604,6 +2635,7 @@ impl Builder {
     /// # Errors
     /// * Returns an [`Error`] if the placeholder cannot be created or if multiple hash assertions exist.
     pub fn placeholder(&mut self, format: &str) -> Result<Vec<u8>> {
+        self.check_bmff_settings(format)?;
         // Check existing hash assertions
         let has_data_hash = self.find_assertion::<DataHash>(DataHash::LABEL).is_ok();
         let has_bmff_hash = self.find_assertion::<BmffHash>(BmffHash::LABEL).is_ok();
@@ -2634,6 +2666,9 @@ impl Builder {
                 // Baked into this assertion's exclusions now; later setting
                 // changes won't affect this placeholder or its signed hash.
                 placeholder_bmff.set_default_exclusions_with_options(self.context.settings());
+                placeholder_bmff.add_extra_exclusions(
+                    &self.context.settings().builder.bmff_hash_extra_exclusions,
+                );
                 placeholder_bmff.add_place_holder_hash()?;
                 let assertion_label = placeholder_bmff.to_assertion()?.label();
                 self.add_assertion(&assertion_label, &placeholder_bmff)?;
@@ -2820,6 +2855,7 @@ impl Builder {
         data: &[u8],
         large_size: bool,
     ) -> Result<&mut Self> {
+        self.check_bmff_settings("video/mp4")?;
         self.bmff_hasher
             .add_merkle_leaf(mdat_id, large_size, data)?;
         Ok(self)
@@ -2955,6 +2991,7 @@ impl Builder {
     where
         R: Read + Seek + MaybeSend,
     {
+        self.check_bmff_settings(format)?;
         // Algorithm resolution: assertion alg → definition.hash_alg → "sha256".
         let definition_alg = self.definition.hash_alg.as_deref().unwrap_or("sha256");
 
@@ -3124,6 +3161,7 @@ impl Builder {
     /// * In Mode 2, returns an [`Error`] if no valid hard binding assertion exists.
     /// * Returns an [`Error`] if signing fails.
     pub fn sign_embeddable(&self, format: &str) -> Result<Vec<u8>> {
+        self.check_bmff_settings(format)?;
         let placeholder_jumbf_len = self.placeholder_jumbf_len;
 
         // Check that a valid hard binding exists in Mode 2 (no placeholder).
@@ -3280,6 +3318,7 @@ impl Builder {
         W: Write + Read + Seek + Send,
     {
         let format = format_to_mime(format);
+        self.check_bmff_settings(&format)?;
         self.definition.format.clone_from(&format);
         if let Some(instance_id) = XmpInfo::from_source(source, &format).instance_id {
             self.definition.instance_id = instance_id;
@@ -3453,6 +3492,7 @@ impl Builder {
         sources: &[S],
         dests: &[D],
     ) -> Result<Vec<u8>> {
+        self.check_bmff_settings("video/mp4")?;
         if sources.is_empty() || sources.len() != dests.len() {
             return Err(Error::BadParam(
                 "a ladder requires nonempty, equal source and destination lists".into(),
@@ -3526,6 +3566,7 @@ impl Builder {
         fragment_glob: P,
         output_path: P,
     ) -> Result<()> {
+        self.check_bmff_settings("video/mp4")?;
         // convert the manifest to a store
         let mut store = self.to_store()?;
 
@@ -3597,6 +3638,7 @@ impl Builder {
                 "Source and destination file formats must match".to_string(),
             ));
         }
+        self.check_bmff_settings(&format)?;
         let mut source = std::fs::File::open(source)?;
 
         let mut dest = std::fs::OpenOptions::new()
@@ -3683,6 +3725,7 @@ impl Builder {
                 "Source and destination file formats must match".to_string(),
             ));
         }
+        self.check_bmff_settings(&format)?;
         let mut source = std::fs::File::open(source)?;
 
         let mut dest = std::fs::OpenOptions::new()
@@ -4033,6 +4076,10 @@ fn rewrite_action_ingredient_urls(
     actions.actions = rewritten;
     Ok(())
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "builder_bmff_extra_exclusions_tests.rs"]
+mod bmff_extra_exclusions_tests;
 
 #[cfg(test)]
 mod tests {
