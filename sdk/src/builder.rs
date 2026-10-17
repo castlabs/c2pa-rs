@@ -1853,6 +1853,12 @@ impl Builder {
     /// Converts the `Builder` into a [`Store`] with the specified [`Claim`], usually obtained
     /// by calling [`Builder::to_claim`].
     fn to_store_with_claim(&self, claim: Claim) -> Result<Store> {
+        let extras = &self.context.settings().builder.bmff_hash_extra_exclusions;
+        if !extras.is_empty() {
+            for assertion in claim.bmff_hash_assertions() {
+                BmffHash::from_assertion(assertion.assertion())?.check_extra_exclusions(extras)?;
+            }
+        }
         let mut store = Store::from_context(&self.context);
 
         // if this can be an update manifest, then set the update_manifest flag
@@ -1863,6 +1869,29 @@ impl Builder {
         }?;
 
         Ok(store)
+    }
+
+    // Check before hashing, timestamp signing, or opening an output. The shared
+    // claim check above also covers assertions assembled outside the definition.
+    fn check_bmff_settings(&self, format: &str) -> Result<()> {
+        let extras = &self.context.settings().builder.bmff_hash_extra_exclusions;
+        if extras.is_empty() {
+            return Ok(());
+        }
+        if jumbf_io::is_bmff_format(format) && self.intent() == Some(BuilderIntent::Update) {
+            return Err(Error::BadParam(
+                "builder.bmff_hash_extra_exclusions cannot apply to a BMFF update manifest"
+                    .to_string(),
+            ));
+        }
+        for assertion in &self.definition.assertions {
+            if assertion.label().starts_with(BmffHash::LABEL) {
+                assertion
+                    .to_assertion::<BmffHash>()?
+                    .check_extra_exclusions(extras)?;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "add_thumbnails")]
@@ -2085,6 +2114,7 @@ impl Builder {
         reserve_size: usize,
         format: &str,
     ) -> Result<Vec<u8>> {
+        self.check_bmff_settings(format)?;
         // Add DataHash to builder's definition if not present, so it persists for sign_data_hashed_embeddable
         let dh: Result<DataHash> = self.find_assertion(DataHash::LABEL);
         if dh.is_err() {
@@ -2195,6 +2225,7 @@ impl Builder {
     /// # Errors
     /// * Returns an [`Error`] if the placeholder cannot be created or if multiple hash assertions exist.
     pub fn placeholder(&mut self, format: &str) -> Result<Vec<u8>> {
+        self.check_bmff_settings(format)?;
         // Check existing hash assertions
         let has_data_hash = self.find_assertion::<DataHash>(DataHash::LABEL).is_ok();
         let has_bmff_hash = self.find_assertion::<BmffHash>(BmffHash::LABEL).is_ok();
@@ -2412,6 +2443,7 @@ impl Builder {
         data: &[u8],
         large_size: bool,
     ) -> Result<&mut Self> {
+        self.check_bmff_settings("video/mp4")?;
         self.bmff_hasher
             .add_merkle_leaf(mdat_id, large_size, data)?;
         Ok(self)
@@ -2547,6 +2579,7 @@ impl Builder {
     where
         R: Read + Seek + MaybeSend,
     {
+        self.check_bmff_settings(format)?;
         // Algorithm resolution: assertion alg → definition.hash_alg → "sha256".
         let definition_alg = self.definition.hash_alg.as_deref().unwrap_or("sha256");
 
@@ -2743,6 +2776,7 @@ impl Builder {
     /// * In Mode 2, returns an [`Error`] if no valid hard binding assertion exists.
     /// * Returns an [`Error`] if signing fails.
     pub fn sign_embeddable(&self, format: &str) -> Result<Vec<u8>> {
+        self.check_bmff_settings(format)?;
         let placeholder_jumbf_len = self.placeholder_jumbf_len;
 
         // Check that a valid hard binding exists in Mode 2 (no placeholder).
@@ -2811,6 +2845,7 @@ impl Builder {
         data_hash: &DataHash,
         format: &str,
     ) -> Result<Vec<u8>> {
+        self.check_bmff_settings(format)?;
         let mut store = self.to_store()?;
         if _sync {
             store.get_data_hashed_embeddable_manifest(
@@ -2853,6 +2888,7 @@ impl Builder {
         signer: &dyn Signer,
         format: &str,
     ) -> Result<Vec<u8>> {
+        self.check_bmff_settings(format)?;
         self.definition.instance_id = format!("xmp:iid:{}", Uuid::new_v4());
 
         let mut store = self.to_store()?;
@@ -2897,6 +2933,7 @@ impl Builder {
         W: Write + Read + Seek + Send,
     {
         let format = format_to_mime(format);
+        self.check_bmff_settings(&format)?;
         self.definition.format.clone_from(&format);
         // todo:: read instance_id from xmp from stream ?
         self.definition.instance_id = format!("xmp:iid:{}", Uuid::new_v4());
@@ -3095,6 +3132,7 @@ impl Builder {
         fragment_glob: P,
         output_path: P,
     ) -> Result<()> {
+        self.check_bmff_settings("video/mp4")?;
         // convert the manifest to a store
         let mut store = self.to_store()?;
 
@@ -3194,6 +3232,7 @@ impl Builder {
             "at least one rendition path must be provided".to_string(),
         ))?;
         let format = crate::format_from_path(first).ok_or(crate::Error::UnsupportedType)?;
+        self.check_bmff_settings(&format)?;
         self.definition.format.clone_from(&format);
         self.definition.instance_id = format!("xmp:iid:{}", Uuid::new_v4());
 
@@ -3247,6 +3286,7 @@ impl Builder {
                 "Source and destination file formats must match".to_string(),
             ));
         }
+        self.check_bmff_settings(&format)?;
         let mut source = std::fs::File::open(source)?;
 
         let mut dest = std::fs::OpenOptions::new()
@@ -3325,6 +3365,7 @@ impl Builder {
                 "Source and destination file formats must match".to_string(),
             ));
         }
+        self.check_bmff_settings(&format)?;
         let mut source = std::fs::File::open(source)?;
 
         let mut dest = std::fs::OpenOptions::new()
@@ -3509,6 +3550,10 @@ impl std::fmt::Display for Builder {
         f.write_str(&output)
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "builder_bmff_extra_exclusions_tests.rs"]
+mod bmff_extra_exclusions_tests;
 
 #[cfg(test)]
 mod tests {
