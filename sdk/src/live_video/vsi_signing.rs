@@ -874,7 +874,7 @@ impl LiveVideoVsiSigner {
                     .to_string(),
             ));
         }
-        let session_key = session_keys.keys.into_iter().next().ok_or_else(|| {
+        let mut session_key = session_keys.keys.into_iter().next().ok_or_else(|| {
             Error::BadParam("signed initialization manifest has no session key".to_string())
         })?;
         let signed_key = &session_key.key;
@@ -913,6 +913,16 @@ impl LiveVideoVsiSigner {
         }
         self.verify_restored_signer_binding(&session_key, &ee_cert_der)?;
         self.validate_session_key_metadata(&session_key)?;
+
+        // Reader's JSON projection can turn bstr fields into integer arrays. Cache the
+        // already-verified binding in native CBOR form so later init serialization stays strict.
+        let binding_bytes = super::session_key_validation::extract_signer_binding_bytes(
+            &session_key.signer_binding,
+        )
+        .ok_or_else(|| Error::BadParam("session key signerBinding is malformed".to_string()))?;
+        session_key.signer_binding = c2pa_cbor::from_slice(&binding_bytes).map_err(|error| {
+            Error::BadParam(format!("cannot normalize verified signerBinding: {error}"))
+        })?;
 
         Ok((label.to_string(), session_key))
     }
