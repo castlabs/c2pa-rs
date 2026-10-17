@@ -9,6 +9,23 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ## [Unreleased]
 
+### Castlabs 1.0.8 BMFF Exclusions
+
+* Add `builder.bmff_hash_extra_exclusions` for SDK-generated BMFF hard bindings,
+  including single-file fragmented assets, rendition ladders, and placeholders.
+  Defaults are unchanged. One exclusion list covers initialization and media
+  hashes; an unconditional `/sidx` entry also excludes a leading index.
+* Require existing BMFF assertions to contain every requested exact descriptor
+  before signing, including embeddable and reused-rendition workflows. Refuse
+  incompatible requests and BMFF update manifests before writing media outputs.
+* Correct FullBox exclusion flag decoding and mask matching, and do not match
+  version or flag conditions against boxes lacking those fields. Bindings that
+  relied on the former incorrect selector behavior may validate differently.
+* Use the WASI-safe temporary-directory helper in exclusion tests.
+* Port upstream contentauth/c2pa-rs#2876: update ZIP handling to `zip 9.0.4`,
+  including its fallible filename API. This resolves the inherited ZIP 8.x
+  audit findings RUSTSEC-2026-0367, RUSTSEC-2026-0368, and RUSTSEC-2026-0369.
+
 ### Castlabs conformance candidate (Program 0.2 / C2PA 2.4)
 
 * Add `verify.validation_time` (RFC 3339) as the request-scoped evaluation
