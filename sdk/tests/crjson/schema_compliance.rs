@@ -13,8 +13,11 @@
 
 //! Schema compliance tests for crJSON format.
 //!
-//! These tests validate CrJSON output against the actual crJSON JSON Schema
-//! (`cli/schemas/crJSON-schema.json`) using the `jsonschema` crate, plus
+//! These tests validate CrJSON output against the published crJSON 2.4 JSON
+//! Schema (`fixtures/schemas/crJSON-2.4-schema.json`, extracted verbatim from
+//! spec.c2pa.org 2.4 crjson-format, SHA-256
+//! 0cd7c0d554f9d3c388257688a361152a98c112fc9fc36a25e032972d7fc55613) using the
+//! `jsonschema` crate, plus
 //! targeted structural assertions for requirements the schema leaves as
 //! `additionalProperties: true`.
 //!
@@ -29,13 +32,12 @@
 use std::io::Cursor;
 
 use c2pa::{Reader, Result};
-use jsonschema::validator_for;
 
 const IMAGE_WITH_MANIFEST: &[u8] = include_bytes!("../fixtures/CA.jpg");
 const IMAGE_WITH_INGREDIENT: &[u8] = include_bytes!("../fixtures/CA.jpg");
 
 /// The crJSON JSON Schema bundled with the project.
-const CRJSON_SCHEMA: &str = include_str!("../fixtures/schemas/crJSON-schema.json");
+const CRJSON_SCHEMA: &str = include_str!("../fixtures/schemas/crJSON-2.4-schema.json");
 
 /// When `C2PA_WRITE_CRJSON` is set, write crJSON to `target/crjson_test_output/`
 /// so you can inspect the exact output.
@@ -53,7 +55,12 @@ fn maybe_write_crjson_output(name: &str, json: &str) {
 fn compiled_schema() -> jsonschema::Validator {
     let schema_value: serde_json::Value =
         serde_json::from_str(CRJSON_SCHEMA).expect("crJSON-schema.json must be valid JSON");
-    validator_for(&schema_value).expect("crJSON schema must compile without errors")
+    // Validate `format` keywords too (date-time, uri): the 2.4 schema relies on
+    // them for validationTime and @context.
+    jsonschema::options()
+        .should_validate_formats(true)
+        .build(&schema_value)
+        .expect("crJSON schema must compile without errors")
 }
 
 /// Assert that `value` validates against the crJSON schema, printing all errors on failure.
@@ -183,18 +190,6 @@ fn test_manifest_required_fields() -> Result<()> {
             "manifest.label required"
         );
         assert!(
-            obj.get("isUpdateManifest")
-                .and_then(|v| v.as_bool())
-                .is_some(),
-            "manifest.isUpdateManifest required boolean"
-        );
-        assert!(
-            obj.get("isCompressedManifest")
-                .and_then(|v| v.as_bool())
-                .is_some(),
-            "manifest.isCompressedManifest required boolean"
-        );
-        assert!(
             obj.get("assertions")
                 .map(|v| v.is_object())
                 .unwrap_or(false),
@@ -219,8 +214,6 @@ fn test_manifest_required_fields() -> Result<()> {
         // No extra top-level keys beyond what the schema allows (additionalProperties: false).
         let allowed = [
             "label",
-            "isUpdateManifest",
-            "isCompressedManifest",
             "assertions",
             "claim",
             "claim.v2",
@@ -547,7 +540,7 @@ fn test_signature_structure() -> Result<()> {
 // ── Validation results ────────────────────────────────────────────────────────
 
 /// Every manifest's `validationResults` must have `success`, `informational`, `failure` arrays,
-/// a `specVersion` of "2.3", and a required `validationTime` RFC 3339 string.
+/// a `specVersion` of "2.4.0", and a required `validationTime` RFC 3339 string.
 #[test]
 fn test_validation_results_structure() -> Result<()> {
     let reader = Reader::default().with_stream("image/jpeg", Cursor::new(IMAGE_WITH_MANIFEST))?;
@@ -575,14 +568,14 @@ fn test_validation_results_structure() -> Result<()> {
             }
         }
 
-        // specVersion must be present and equal "2.3".
+        // specVersion must be present and equal the 2.4 validator version.
         let spec_version = vr
             .get("specVersion")
             .and_then(|v| v.as_str())
             .expect("validationResults.specVersion must be a string");
         assert_eq!(
-            spec_version, "2.3.0",
-            "validationResults.specVersion must be \"2.3.0\""
+            spec_version, "2.4.0",
+            "validationResults.specVersion must be \"2.4.0\""
         );
 
         // validationTime must be present and be an RFC 3339 string.
@@ -641,12 +634,12 @@ fn test_validation_results_spec_version_wrong_value() -> Result<()> {
             *vr.get_mut("specVersion").unwrap() = serde_json::json!("9.9.9");
             assert_ne!(
                 vr["specVersion"].as_str().unwrap(),
-                "2.3",
-                "mutated specVersion should not equal 2.3"
+                "2.4.0",
+                "mutated specVersion should not equal 2.4.0"
             );
             // Restore and confirm it's back to the correct value.
             *vr.get_mut("specVersion").unwrap() = serde_json::json!(original);
-            assert_eq!(vr["specVersion"].as_str().unwrap(), "2.3.0");
+            assert_eq!(vr["specVersion"].as_str().unwrap(), "2.4.0");
         }
     }
     Ok(())

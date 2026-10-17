@@ -491,12 +491,27 @@ fn extract_iat(sign1: &coset::CoseSign1) -> std::result::Result<Option<i64>, Str
 /// Extracts raw COSE_Sign1_Tagged bytes from a `signerBinding` CBOR value.
 ///
 /// The value may appear in different forms depending on the serialization roundtrip:
+/// - `Value::Tag(18, ..)` — at most one COSE_Sign1_Tagged wrapper around one of the
+///   untagged forms below. A nested tag (for example `Tag(18, Tag(18, ..))`) is
+///   rejected, matching the `signerBinding` serializer.
 /// - `Value::Array` with 4 elements — COSE_Sign1 inner content, possibly from JSON roundtrip
 ///   where byte strings become integer arrays. Re-serialized with tag 18.
 /// - `Value::Array` of integers — legacy: flat byte representation of tagged COSE_Sign1 bytes
 /// - `Value::Bytes` — direct CBOR byte string (ideal CBOR-only case)
 /// - `Value::Text` — base64-encoded string (serde_json with base64 for bytes)
 pub(super) fn extract_signer_binding_bytes(value: &c2pa_cbor::Value) -> Option<Vec<u8>> {
+    match value {
+        // A `SessionKey` normally stores the untagged inner value (its
+        // deserializer strips one tag 18), but a caller-constructed value may
+        // still carry the single COSE_Sign1_Tagged wrapper. Unwrap exactly one
+        // tag; the untagged extractor rejects any further tag.
+        c2pa_cbor::Value::Tag(18, inner) => extract_untagged_signer_binding_bytes(inner),
+        value => extract_untagged_signer_binding_bytes(value),
+    }
+}
+
+/// Extracts signer-binding bytes from a value that must not carry a CBOR tag.
+fn extract_untagged_signer_binding_bytes(value: &c2pa_cbor::Value) -> Option<Vec<u8>> {
     match value {
         c2pa_cbor::Value::Array(items) if is_cose_sign1_array(items) => {
             // COSE_Sign1 inner array [protected, unprotected, payload, signature].
@@ -562,9 +577,12 @@ mod tests {
 
     use coset::TaggedCborSerializable;
 
-    use super::super::{test_helpers::*, LiveVideoValidator};
     #[cfg(feature = "rust_native_crypto")]
     use super::super::{LIVEVIDEO_SEGMENT_GAP, LIVEVIDEO_SEGMENT_LEADING_GAP};
+    use super::{
+        super::{test_helpers::*, LiveVideoValidator},
+        extract_signer_binding_bytes,
+    };
     #[cfg(feature = "rust_native_crypto")]
     use crate::status_tracker::{ErrorBehavior, LogKind, StatusTracker};
     use crate::{
@@ -1956,6 +1974,69 @@ mod tests {
             validator.session_keys.is_empty(),
             "a key with a failed signerBinding must not be retained for segment validation"
         );
+    }
+
+    /// The `signerBinding` serializer permits at most one COSE_Sign1 tag (18).
+    /// Validation must agree: untagged and single-tagged forms verify, while a
+    /// nested `Tag(18, Tag(18, COSE_Sign1))` is rejected and the key dropped.
+    #[test]
+    fn signer_binding_accepts_at_most_one_cose_tag() {
+        use c2pa_cbor::Value;
+
+        let signer =
+            crate::utils::ephemeral_signer::EphemeralSigner::new("test-binding.local").unwrap();
+        let ee_cert_der = signer.cert_chain_der[0].clone();
+        let session_key = generate_ed25519_session_key();
+        let cose_key = build_ed25519_cose_key_value(&session_key.verifying_key(), b"k");
+        let tagged_bytes = make_signer_binding_for_ee_cert(&session_key, &ee_cert_der);
+        let Value::Tag(18, inner) = c2pa_cbor::from_slice::<Value>(&tagged_bytes).unwrap() else {
+            panic!("signer binding must decode as COSE_Sign1_Tagged");
+        };
+        assert!(matches!(*inner, Value::Array(_)));
+
+        let untagged = (*inner).clone();
+        let single = Value::Tag(18, inner.clone());
+        let nested = Value::Tag(18, Box::new(Value::Tag(18, inner)));
+
+        assert!(extract_signer_binding_bytes(&untagged).is_some());
+        assert!(extract_signer_binding_bytes(&single).is_some());
+        assert_eq!(
+            extract_signer_binding_bytes(&untagged),
+            extract_signer_binding_bytes(&single)
+        );
+        assert!(extract_signer_binding_bytes(&nested).is_none());
+        assert!(extract_signer_binding_bytes(&Value::Tag(
+            18,
+            Box::new(Value::Bytes(tagged_bytes.clone()))
+        ))
+        .is_some());
+        assert!(extract_signer_binding_bytes(&Value::Tag(
+            18,
+            Box::new(Value::Tag(18, Box::new(Value::Bytes(tagged_bytes))))
+        ))
+        .is_none());
+
+        let validate = |binding: Value| {
+            let mut keys = session_key_with_ed25519_binding(cose_key.clone(), Vec::new());
+            keys.keys[0].signer_binding = binding;
+            let mut validator = LiveVideoValidator::new();
+            let mut tracker = aggregate_tracker();
+            let _ = validator.validate_session_keys(
+                &keys,
+                "urn:c2pa:test-manifest",
+                Some(&ee_cert_der),
+                &mut tracker,
+            );
+            let invalid = tracker
+                .logged_items()
+                .iter()
+                .any(|i| i.validation_status.as_deref() == Some(LIVEVIDEO_SESSIONKEY_INVALID));
+            (invalid, validator.session_keys.len())
+        };
+
+        assert_eq!(validate(untagged), (false, 1));
+        assert_eq!(validate(single), (false, 1));
+        assert_eq!(validate(nested), (true, 0));
     }
 
     // ── COSE_Sign1 wire format tests (§18.25.2) ─────────────────────────────────

@@ -317,6 +317,7 @@ impl IdentityAssertion {
 
         if sig_type == "cawg.x509.cose" {
             let mut ctp = CertificateTrustPolicy::default();
+            ctp.set_validation_time(settings.verify.validation_time_epoch().ok().flatten());
 
             // Load the trust handler settings. Don't worry about status as these
             // are checked during setting generation.

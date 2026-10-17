@@ -86,6 +86,10 @@ pub struct CertificateTrustPolicy {
 
     /// passthrough mode
     passthrough: bool,
+
+    /// Caller-supplied evaluation instant (Unix seconds) used instead of the
+    /// wall clock when no authenticated signing time applies.
+    validation_time: Option<i64>,
 }
 
 impl Default for CertificateTrustPolicy {
@@ -96,6 +100,7 @@ impl Default for CertificateTrustPolicy {
             additional_ekus: HashSet::default(),
             mandatory_ekus: HashSet::default(),
             passthrough: false,
+            validation_time: None,
         };
 
         this.add_valid_ekus(include_bytes!("./valid_eku_oids.cfg"));
@@ -131,6 +136,7 @@ impl CertificateTrustPolicy {
             additional_ekus: HashSet::default(),
             mandatory_ekus: HashSet::default(),
             passthrough: false,
+            validation_time: None,
         }
     }
 
@@ -142,6 +148,7 @@ impl CertificateTrustPolicy {
             additional_ekus: HashSet::default(),
             mandatory_ekus: HashSet::default(),
             passthrough: true,
+            validation_time: None,
         }
     }
 
@@ -205,6 +212,33 @@ impl CertificateTrustPolicy {
         }
     }
 
+    /// Set the caller-controlled evaluation instant (Unix seconds).
+    ///
+    /// When set, trust and certificate-profile evaluations that have no
+    /// authenticated signing time use this instant instead of the wall clock.
+    pub fn set_validation_time(&mut self, validation_time: Option<i64>) {
+        self.validation_time = validation_time;
+    }
+
+    /// Returns the caller-controlled evaluation instant, if any.
+    pub fn validation_time(&self) -> Option<i64> {
+        self.validation_time
+    }
+
+    /// Returns the instant (Unix seconds) that represents "now" for
+    /// evaluations that have no authenticated signing time.
+    pub fn evaluation_time(&self) -> Result<i64, CertificateTrustError> {
+        match self.validation_time {
+            Some(t) => Ok(t),
+            None => web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .map_err(|_| {
+                    CertificateTrustError::InternalError("system time invalid".to_string())
+                }),
+        }
+    }
+
     /// Evaluate a certificate against this trust policy for one trust purpose.
     ///
     /// Behaves like [`check_certificate_trust`](Self::check_certificate_trust),
@@ -212,6 +246,10 @@ impl CertificateTrustPolicy {
     /// are considered. Use [`TrustListKind::CAWG`] for CAWG X.509 identity
     /// credentials and [`TrustListKind::TSA`] for time-stamping authorities.
     /// TSA trust never accepts private end-entity credentials (C2PA 14.4.3).
+    ///
+    /// When no `signing_time_epoch` is supplied, the configured
+    /// [validation time](Self::set_validation_time) (or the wall clock) is
+    /// used as the chain check time.
     #[allow(unused)] // parameters may be unused in some cases
     #[async_generic]
     pub fn check_certificate_trust_for(
@@ -221,6 +259,7 @@ impl CertificateTrustPolicy {
         signing_time_epoch: Option<i64>,
         purpose: TrustListKind,
     ) -> Result<(TrustAnchorType, String), CertificateTrustError> {
+        let signing_time_epoch = signing_time_epoch.or(self.validation_time);
         if self.passthrough {
             return Ok((TrustAnchorType::NoCheck, String::new()));
         }
@@ -1851,5 +1890,74 @@ zGxQnM2hCA==
             other: vec![DOCUMENT_SIGNING_OID.clone()],
         };
         assert!(ctp.verify_mandatory_ekus(&eku));
+    }
+
+    const ROOT_BUNDLE: &[u8] =
+        include_bytes!("../../../tests/fixtures/crypto/raw_signature/test_cert_root_bundle.pem");
+
+    fn manifest_policy() -> CertificateTrustPolicy {
+        let mut ctp = CertificateTrustPolicy::new();
+        ctp.add_trust_anchors(ROOT_BUNDLE, "test", TrustAnchorType::Manifest, None)
+            .unwrap();
+        ctp
+    }
+
+    fn trusted_for(ctp: &CertificateTrustPolicy, purpose: TrustListKind, at: Option<i64>) -> bool {
+        let es256 = test_cert_chain(SigningAlg::Es256);
+        ctp.check_certificate_trust_for(&es256[1..], &es256[0], at, purpose)
+            .is_ok()
+    }
+
+    // es256 leaf: 2022-06-10T18:46:40Z .. 2030-08-26T18:46:40Z
+    const BEFORE: i64 = 1_600_000_000; // 2020-09-13
+    const INSIDE: i64 = 1_800_000_000; // 2027-01-15
+    const AFTER: i64 = 1_950_000_000; // 2031-10-17
+
+    #[test]
+    fn empty_policy_trusts_no_purpose() {
+        let ctp = CertificateTrustPolicy::new();
+        for purpose in [
+            TrustListKind::Manifest,
+            TrustListKind::TSA,
+            TrustListKind::CAWG,
+        ] {
+            assert!(!trusted_for(&ctp, purpose, None));
+        }
+    }
+
+    #[test]
+    fn validation_time_controls_chain_validity() {
+        let mut ctp = manifest_policy();
+        ctp.set_validation_time(Some(BEFORE));
+        assert!(!trusted_for(&ctp, TrustListKind::Manifest, None));
+        ctp.set_validation_time(Some(INSIDE));
+        assert!(trusted_for(&ctp, TrustListKind::Manifest, None));
+        assert_eq!(ctp.evaluation_time().unwrap(), INSIDE);
+        ctp.set_validation_time(Some(AFTER));
+        assert!(!trusted_for(&ctp, TrustListKind::Manifest, None));
+        // An authenticated signing time takes precedence over the evaluation instant.
+        assert!(trusted_for(&ctp, TrustListKind::Manifest, Some(INSIDE)));
+        // The evaluation instant never widens trust across purposes.
+        ctp.set_validation_time(Some(INSIDE));
+        assert!(!trusted_for(&ctp, TrustListKind::TSA, None));
+        assert!(!trusted_for(&ctp, TrustListKind::CAWG, None));
+    }
+
+    #[test]
+    fn validation_time_controls_end_entity_profile_without_timestamp() {
+        use crate::{
+            crypto::cose::check_end_entity_certificate_profile, status_tracker::StatusTracker,
+        };
+        let es256 = test_cert_chain(SigningAlg::Es256);
+        let mut ctp = CertificateTrustPolicy::default();
+        for (at, ok) in [(BEFORE, false), (INSIDE, true), (AFTER, false)] {
+            ctp.set_validation_time(Some(at));
+            let mut log = StatusTracker::default();
+            assert_eq!(
+                check_end_entity_certificate_profile(&es256[0], &ctp, &mut log, None).is_ok(),
+                ok,
+                "at {at}"
+            );
+        }
     }
 }
