@@ -439,7 +439,7 @@ mod tests {
                 &dir,
                 json!({"version": 1, "updates": [event(name, Path::new("b.mp4"))]}),
             );
-            assert!(references(&path, &selected).is_err(), "accepted {name:?}");
+            assert!(references(&path, &selected).is_err(), "accepted {:?}", name);
         }
         let update = event("seg-103.m4s", Path::new("b.mp4"));
         let path = schedule(
@@ -482,15 +482,15 @@ mod tests {
     }
 
     fn trusted_context() -> Arc<C2paContext> {
-        let settings = Settings::from_string(
-            include_str!("../tests/fixtures/trust/cawg_test_settings.toml"),
-            "toml",
-        )
-        .unwrap()
-        .with_value("verify.remote_manifest_fetch", false)
-        .unwrap()
-        .with_value("verify.ocsp_fetch", false)
-        .unwrap();
+        let settings = Settings::new()
+            .with_toml(include_str!(
+                "../tests/fixtures/trust/cawg_test_settings.toml"
+            ))
+            .unwrap()
+            .with_value("verify.remote_manifest_fetch", false)
+            .unwrap()
+            .with_value("verify.ocsp_fetch", false)
+            .unwrap();
         let signer = c2pa::create_signer::from_keys(
             include_bytes!("../../sdk/tests/fixtures/certs/es256.pub"),
             include_bytes!("../../sdk/tests/fixtures/certs/es256.pem"),
