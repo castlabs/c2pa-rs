@@ -489,8 +489,9 @@ impl LiveVideoVsiSigner {
     /// Signs a media segment at an explicit Unix timestamp.
     ///
     /// `signing_time_unix_seconds` is encoded as the mandatory protected COSE
-    /// `iat`, used for session-key validity checks, and included in the exact
-    /// Sig_structure passed to a callback-backed session signer.
+    /// `iat`, must lie within the session key's inclusive validity window (a sender-side
+    /// check; receivers validate key lifetime against their own validation time), and is
+    /// included in the exact Sig_structure passed to a callback-backed session signer.
     pub fn sign_media_segment_at(
         &mut self,
         segment_data: &[u8],
@@ -781,6 +782,9 @@ impl LiveVideoVsiSigner {
             &tbs,
         )
         .map_err(|e| Error::BadParam(format!("resumed VSI signature is invalid: {e}")))?;
+        // Recovery validates this signer's own previously published artifact against the
+        // time it claims to have signed it. This is a sender-side consistency check, not
+        // receiver validation: receivers use their own validation time.
         let resumed_iat = protected_iat(&parsed.sign1)?;
         ensure_key_valid_at(
             &restored.session_key.created_at,
@@ -1261,11 +1265,10 @@ pub(super) fn build_vsi_cose_sign1_unsigned(
     let payload = c2pa_cbor::to_vec(segment_info_map)
         .map_err(|e| Error::BadParam(format!("failed to encode SegmentInfoMap: {e}")))?;
 
-    // The live-video profile requires a protected `iat` field: a `NumericDate` (RFC 8392)
-    // giving the "claimed time of signing". It lets a validator check the segment
-    // against the session key's validity period using this claimed time rather than its own
-    // wall-clock time, which matters for any validation run after the fact (e.g. archival/VOD
-    // validation of a recording), since the key's validity window is anchored to createdAt.
+    // The signer always emits a protected `iat`: a `NumericDate` (RFC 8392) giving the
+    // "claimed time of signing". The signer itself requires it to lie within the key's
+    // validity window (a sender-side rule). Validators treat it as an advisory claim and
+    // evaluate key lifetime against their own validation time, never against `iat`.
     let protected = HeaderBuilder::new()
         .algorithm(cose_algorithm(algorithm)?)
         .text_value("iat".to_string(), coset::cbor::value::Value::from(iat))
@@ -1880,6 +1883,73 @@ mod tests {
         assert_eq!(signer.next_sequence_number(), 3);
         assert_eq!(signer.next_event_id, 3);
         assert_eq!(observations.lock().unwrap().len(), 2);
+    }
+
+    /// The sender-side rule (iat within the key window) and the receiver rule (validation
+    /// time within the key window) are independent: a segment the signer accepted with an
+    /// in-window `iat` still fails at a validation time past expiry, and passes at the
+    /// inclusive bounds.
+    #[test]
+    fn signed_segment_is_validated_at_validation_time_not_iat() {
+        let manifest_signer = make_test_signer();
+        let session_key = Arc::new(p256::ecdsa::SigningKey::from_slice(&[23u8; 32]).unwrap());
+        let mut config = es256_config(&session_key, b"validation-time", 1);
+        config.created_at = "2020-01-01T00:00:00Z".to_string();
+        config.validity_period_secs = 60;
+        let created_at = 1_577_836_800;
+        let expires_at = created_at + 60;
+        let callback_key = Arc::clone(&session_key);
+        let mut signer = LiveVideoVsiSigner::from_session_signer(
+            r#"{"assertions": []}"#,
+            &manifest_signer,
+            config,
+            move |_, tbs: &[u8]| Ok(es256_signature(&callback_key, tbs)),
+        )
+        .unwrap();
+        signer.ensure_signer_binding().unwrap();
+        initialize_test_signer(&mut signer);
+        let signed = signer
+            .sign_media_segment_at(&make_test_segment(1), created_at + 30)
+            .unwrap();
+        let session_keys = signer.build_session_keys_assertion().unwrap();
+        let ee_cert_der = manifest_signer.certs().unwrap().into_iter().next().unwrap();
+
+        let validate_at = |validation_time: i64| {
+            let mut validator = LiveVideoValidator::new();
+            initialize_test_validator(&mut validator);
+            validator.set_validation_time_unix_seconds(Some(validation_time));
+            let mut tracker = StatusTracker::default();
+            validator
+                .validate_session_keys(
+                    &session_keys,
+                    "urn:c2pa:test-manifest",
+                    Some(&ee_cert_der),
+                    &mut tracker,
+                )
+                .unwrap();
+            let _ = validator.validate_verifiable_segment_info(&signed, &mut tracker);
+            tracker
+        };
+
+        for passing_time in [created_at, created_at + 30, expires_at] {
+            let tracker = validate_at(passing_time);
+            assert!(
+                tracker.filter_errors().next().is_none(),
+                "validation time {passing_time}: {tracker:?}"
+            );
+        }
+        for failing_time in [created_at - 1, expires_at + 1, expires_at + 3600] {
+            let tracker = validate_at(failing_time);
+            assert!(
+                tracker.filter_errors().any(|item| {
+                    item.validation_status.as_deref()
+                        == Some(
+                            crate::validation_results::validation_codes::LIVEVIDEO_SEGMENT_INVALID,
+                        )
+                }),
+                "validation time {failing_time} must fail: {tracker:?}"
+            );
+        }
     }
 
     #[test]
@@ -2712,6 +2782,9 @@ mod tests {
         let session_keys = recovered.build_session_keys_assertion().unwrap();
         let ee_cert_der = manifest_signer.certs().unwrap().into_iter().next().unwrap();
         let mut validator = LiveVideoValidator::new();
+        // Validate inside the key's window instead of at the host clock, which would
+        // eventually pass the 2020 + 1e9 s expiry.
+        validator.set_validation_time_unix_seconds(Some(historical_signing_time + 2));
         let mut tracker = StatusTracker::default();
         validator
             .validate_init_segment(&signed_init, &mut tracker)

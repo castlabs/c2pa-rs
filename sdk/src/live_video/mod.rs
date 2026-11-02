@@ -233,6 +233,11 @@ pub struct LiveVideoValidator {
     seen_emsg_ids: std::collections::HashSet<u32>,
     sequence_coverage: SequenceCoverage,
     suppress_initial_continuity: bool,
+    /// Injected validation time (Unix seconds) for the VSI session key lifetime check.
+    /// `None` uses the current time. Never derived from segment content: a signer-supplied
+    /// `iat` must not set it. `update_vsi_context` replaces keys and init state on `self`
+    /// directly, so an injected time carries across updates.
+    validation_time_unix_seconds: Option<i64>,
 }
 
 impl LiveVideoValidator {
@@ -249,7 +254,17 @@ impl LiveVideoValidator {
             seen_emsg_ids: std::collections::HashSet::new(),
             sequence_coverage: SequenceCoverage::default(),
             suppress_initial_continuity: false,
+            validation_time_unix_seconds: None,
         }
+    }
+
+    /// Pins the validation time used for the VSI session key lifetime check.
+    ///
+    /// Test-only: deterministic tests must not depend on the host clock. Production
+    /// validation always uses the current time.
+    #[cfg(test)]
+    pub(crate) fn set_validation_time_unix_seconds(&mut self, unix_seconds: Option<i64>) {
+        self.validation_time_unix_seconds = unix_seconds;
     }
 
     /// Returns report-only coverage accumulated from authenticated segment observations.
@@ -688,6 +703,13 @@ impl LiveVideoValidator {
     }
 
     /// Validates a media segment using the Verifiable Segment Info method ([§19.4]).
+    ///
+    /// The session key's validity period (`createdAt` through `createdAt + validityPeriod`,
+    /// inclusive) is checked against the time at which this method is called, not against
+    /// any time the segment claims. A protected `iat` is an optional signer claim: it must
+    /// be well-formed when present, but it is ignored for the lifetime check. A segment
+    /// validated before `createdAt` or after expiry fails with `livevideo.segment.invalid`.
+    /// This method has no historical-time override for expired live media.
     ///
     /// [§19.4]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#verifiable_segment_info
     pub fn validate_verifiable_segment_info(

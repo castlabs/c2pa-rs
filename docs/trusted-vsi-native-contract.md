@@ -38,7 +38,8 @@ u32::MAX. Unknown fields are rejected. Nonce is exactly 32 lowercase hex chars
 (16 public random bytes, supplied/durably retained by the coordinator). Nonce
 domain-separates deterministic manifest/instance IDs and assertion salts for
 crash replay; it is NEVER a private-key seed. `signing_time_unix_seconds` is the
-pinned initialization iat, within the configured key validity interval.
+pinned initialization iat, within the configured key validity interval (a sender-side
+rule; see "Validation time" below).
 min_sequence_number must fit uint32 and be <= sequence_max.
 
 Trusted reservations alone derive 16-byte salts from SHA-256 over the public
@@ -223,7 +224,8 @@ The processor owns MFHD/VSI equality, ordering, replay IDs, and rollover.
 
 Composed mode requires supplied sequence == next_sequence (initially min).
 Events start at 1. Reserve pins sequence/event/iat/timescale/duration and signs
-nothing. Both timing integers must be positive; iat must be within key validity.
+nothing. Both timing integers must be positive; iat must be within key validity
+(sender-side; receivers do not use iat for key lifetime).
 Successful finalize advances counters, or exhausts at sequence_max/u32::MAX or
 event u32::MAX without wrapping. The terminal callback has exhaust_after_sign=true.
 SignerBinding callback has no sequence/event and exhaust_after_sign=false.
@@ -321,7 +323,7 @@ is NOT required to be deterministic: native serde struct serialization remains
 interoperable. Definite/minimal encoding and nesting/item bounds still apply.
 Session signing/preflight requires signed `sequenceNumber` to equal the supplied
 u32, signed `manifestId` to equal the pinned init, and protected `iat` to lie
-within the inclusive key validity interval. Static validation checks shape/types
+within the inclusive key validity interval (sender-side). Static validation checks shape/types
 but cannot check a session identity or validity interval. A detached signerBinding
 certificate bstr is not a VSI map and cannot be signed under purpose `Vsi`.
 Sign original input bytes unchanged; verify the returned raw 64-byte signature
@@ -359,3 +361,16 @@ blocking the session. Finalize then runs signerBinding, the Context signer/DAs i
 with refreshed hashes and self-exclusion, claim signing and verification. Actual
 reserved UUID/EMSG lengths must be unchanged. Capabilities become 63 only when
 all paths and persistence are genuinely wired and qualified; no fake enablement.
+
+## Validation Time
+
+The `iat` rules above are **sender-side**: a signer, preflight or expert check
+refuses a signing time outside the inclusive key validity interval. They do not
+describe receiver behavior. A receiver (`LiveVideoValidator`) checks the key
+against **the time at which the segment is validated**: earlier than
+`createdAt` or later than `createdAt + validityPeriod` fails with
+`livevideo.segment.invalid`, bounds inclusive. The protected `iat` is an
+optional signer claim; a malformed one (duplicate, non-integer, out of range)
+still fails the segment, but its value never selects or relaxes the lifetime
+clock. This receiver API does not provide a historical-time override for
+validating expired live media.

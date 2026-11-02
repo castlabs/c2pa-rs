@@ -238,6 +238,9 @@ fn validator_for(
     let certs = context.signer().unwrap().certs().unwrap();
 
     let mut validator = LiveVideoValidator::new();
+    // The test key's window is 2020-01-01 + 1e9 s; validating at the signing time keeps the
+    // tests independent of the host clock (which would eventually pass that expiry).
+    validator.set_validation_time_unix_seconds(Some(IAT));
     let mut tracker = StatusTracker::default();
     validator
         .validate_init_segment(signed_init, &mut tracker)
