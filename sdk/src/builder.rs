@@ -262,6 +262,7 @@ pub struct AssertionDefinition {
     /// The assertion data
     pub data: AssertionData,
     /// The kind of assertion data, either Cbor or Json (defaults to Cbor)
+    /// Soft bindings require Cbor; JSON input uses byte arrays for `blocks[].value`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<ManifestAssertionKind>,
     /// True if this assertion is attributed to the signer (defaults to false)
@@ -279,6 +280,8 @@ impl<'de> Deserialize<'de> for AssertionDefinition {
     where
         D: serde::Deserializer<'de>,
     {
+        use c2pa_cbor::Value as Cbor;
+
         #[derive(Deserialize)]
         struct Helper {
             label: String,
@@ -290,12 +293,53 @@ impl<'de> Deserialize<'de> for AssertionDefinition {
         }
 
         let helper = Helper::deserialize(deserializer)?;
+        let is_soft_binding = labels::base(&helper.label) == labels::SOFT_BINDING;
 
         let data = match helper.kind {
+            Some(ManifestAssertionKind::Json) if is_soft_binding => {
+                return Err(serde::de::Error::custom(
+                    "c2pa.soft-binding requires Cbor assertion kind",
+                ));
+            }
             Some(ManifestAssertionKind::Json) => AssertionData::Json(helper.data),
             Some(ManifestAssertionKind::Cbor) | None => {
-                let cbor_val =
+                let mut cbor_val =
                     c2pa_cbor::value::to_value(helper.data).map_err(serde::de::Error::custom)?;
+                if is_soft_binding {
+                    let invalid = || {
+                        <D::Error as serde::de::Error>::custom(
+                            "c2pa.soft-binding blocks[].value must be an array of integers in 0..=255",
+                        )
+                    };
+                    let Cbor::Map(assertion) = &mut cbor_val else {
+                        return Err(invalid());
+                    };
+                    let Some(Cbor::Array(blocks)) = assertion.get_mut(&Cbor::Text("blocks".into()))
+                    else {
+                        return Err(invalid());
+                    };
+                    for block in blocks {
+                        let Cbor::Map(block) = block else {
+                            return Err(invalid());
+                        };
+                        let value = block
+                            .get_mut(&Cbor::Text("value".into()))
+                            .ok_or_else(invalid)?;
+                        let Cbor::Array(values) = value else {
+                            return Err(invalid());
+                        };
+                        let bytes = values
+                            .iter()
+                            .map(|value| match value {
+                                Cbor::Integer(i) => u8::try_from(*i).ok(),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<u8>>>()
+                            .ok_or_else(invalid)?;
+                        // Only this schema field is a bstr; preserve extension data verbatim.
+                        *value = Cbor::Bytes(bytes);
+                    }
+                }
                 AssertionData::Cbor(cbor_val)
             }
             _ => {
@@ -4304,6 +4348,230 @@ mod tests {
         // convert back to json and compare to original
         let builder_json = serde_json::to_string(&builder.definition).unwrap();
         assert_eq!(builder_json, stripped_json);
+    }
+
+    #[test]
+    fn test_soft_binding_json_bytes_round_trip() {
+        use c2pa_cbor::Value as Cbor;
+
+        for label in [
+            "c2pa.soft-binding",
+            "c2pa.soft-binding__2",
+            "c2pa.soft-binding.v2",
+            "c2pa.soft-binding.v2__2",
+        ] {
+            for kind in [None, Some("Cbor")] {
+                let mut input = json!({
+                    "label": label,
+                    "created": true,
+                    "data": {
+                        "alg": "com.example.any-algorithm.v7",
+                        "blocks": [
+                            {"scope": {"extension": [0, 255]}, "value": [0, 128, 255]},
+                            {"scope": {}, "value": []}
+                        ],
+                        "bindingMetadata": {"value": [1, 2], "blocks": [{"value": "text"}]},
+                        "extension": [3, 4],
+                        "alg-params": "unchanged"
+                    }
+                });
+                if let Some(kind) = kind {
+                    input["kind"] = json!(kind);
+                }
+                let definition: AssertionDefinition =
+                    serde_json::from_value(input.clone()).unwrap();
+                let value: Cbor = definition.to_assertion().unwrap();
+                let root: HashMap<String, Cbor> =
+                    c2pa_cbor::value::from_value(value.clone()).unwrap();
+                let blocks: Vec<HashMap<String, Cbor>> =
+                    c2pa_cbor::value::from_value(root["blocks"].clone()).unwrap();
+                assert_eq!(blocks[0]["value"], Cbor::Bytes(vec![0, 128, 255]));
+                assert_eq!(blocks[1]["value"], Cbor::Bytes(vec![]));
+                assert_eq!(
+                    blocks[0]["scope"],
+                    c2pa_cbor::value::to_value(&input["data"]["blocks"][0]["scope"]).unwrap()
+                );
+                for field in ["bindingMetadata", "extension", "alg-params", "alg"] {
+                    assert_eq!(
+                        root[field],
+                        c2pa_cbor::value::to_value(&input["data"][field]).unwrap()
+                    );
+                }
+
+                // Builder JSON exports bytes as arrays and can be imported again losslessly.
+                let exported = serde_json::to_value(&definition).unwrap();
+                assert_eq!(exported, input);
+                let restored: AssertionDefinition = serde_json::from_value(exported).unwrap();
+                assert_eq!(restored.to_assertion::<Cbor>().unwrap(), value);
+            }
+        }
+    }
+
+    #[test]
+    fn test_soft_binding_json_bytes_reject_invalid_values() {
+        for value in [
+            json!([true]),
+            json!([false]),
+            json!([1.0]),
+            json!([1.5]),
+            json!([-1]),
+            json!([256]),
+            json!([0, 255, 256]),
+            json!([null]),
+            json!([[1]]),
+            json!([{}]),
+            json!(["1"]),
+            json!("legacy text"),
+            json!("AP8="),
+            json!("b64'AP8='"),
+            json!(null),
+            json!(1),
+            json!({}),
+        ] {
+            for kind in [None, Some("Cbor")] {
+                let mut assertion = json!({
+                    "label": "c2pa.soft-binding.v2__2",
+                    "data": {"alg": "any", "blocks": [{"scope": {}, "value": value}]}
+                });
+                if let Some(kind) = kind {
+                    assertion["kind"] = json!(kind);
+                }
+                let result = Builder::from_json(&json!({"assertions": [assertion]}).to_string());
+                assert!(result.is_err(), "accepted invalid value {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_soft_binding_json_bytes_reject_invalid_blocks() {
+        for data in [
+            json!([]),
+            json!({}),
+            json!({"blocks": null}),
+            json!({"blocks": {"value": [1]}}),
+            json!({"blocks": [null]}),
+            json!({"blocks": [{}]}),
+        ] {
+            let result = serde_json::from_value::<AssertionDefinition>(json!({
+                "label": "c2pa.soft-binding",
+                "data": data
+            }));
+            assert!(result.is_err(), "accepted invalid blocks {data}");
+        }
+    }
+
+    #[test]
+    fn test_soft_binding_json_bytes_kind_and_label_policy() {
+        let data = json!({"alg": "any", "blocks": [{"scope": {}, "value": [0, 255]}]});
+        for label in [
+            "c2pa.soft-binding",
+            "c2pa.soft-binding__2",
+            "c2pa.soft-binding.v2",
+            "c2pa.soft-binding.v2__2",
+        ] {
+            for kind in ["Json", "Binary", "Uri"] {
+                let result = serde_json::from_value::<AssertionDefinition>(json!({
+                    "label": label, "kind": kind, "data": data
+                }));
+                assert!(result.is_err(), "accepted {label} as {kind}");
+            }
+        }
+        for label in [
+            "com.example.custom",
+            "c2pa.soft-binding-extra",
+            "c2pa.soft-binding.extension",
+            "c2pa.soft-binding.vfake",
+        ] {
+            for kind in [None, Some("Cbor"), Some("Json")] {
+                let mut input = json!({"label": label, "data": data});
+                if let Some(kind) = kind {
+                    input["kind"] = json!(kind);
+                }
+                let definition: AssertionDefinition = serde_json::from_value(input).unwrap();
+                match definition.data {
+                    AssertionData::Cbor(value) => {
+                        assert_eq!(value, c2pa_cbor::value::to_value(&data).unwrap());
+                    }
+                    AssertionData::Json(value) => assert_eq!(value, data),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_soft_binding_json_bytes_signed_cbor_and_exports() -> Result<()> {
+        use c2pa_cbor::Value as Cbor;
+
+        let context = test_context().into_shared();
+        let mut builder = Builder::from_shared_context(&context).with_definition(
+            json!({"assertions": [{
+                "label": "c2pa.soft-binding",
+                "data": {
+                    "alg": "com.example.any-algorithm.v7",
+                    "blocks": [{"scope": {}, "value": [0, 128, 255]}],
+                    "bindingMetadata": {"extension": [1, 2]}
+                }
+            }]})
+            .to_string(),
+        )?;
+        builder.set_intent(BuilderIntent::Create(DigitalSourceType::Empty));
+        let signer = test_signer(SigningAlg::Ps256);
+        let mut output = Cursor::new(Vec::new());
+        builder.sign(
+            signer.as_ref(),
+            "image/jpeg",
+            &mut Cursor::new(TEST_IMAGE_CLEAN),
+            &mut output,
+        )?;
+        output.rewind()?;
+        let reader =
+            Reader::from_shared_context(&context).with_stream("image/jpeg", &mut output)?;
+        let claim = reader.store.provenance_claim().unwrap();
+        let assertion = claim
+            .claim_assertion_store()
+            .iter()
+            .find(|a| a.label_raw() == labels::SOFT_BINDING)
+            .unwrap()
+            .assertion();
+        assert_eq!(assertion.mime_type(), "application/cbor");
+        // Decode the signed assertion's raw CBOR, not its JSON report.
+        let root: HashMap<String, Cbor> = c2pa_cbor::from_slice(assertion.data())?;
+        let blocks: Vec<HashMap<String, Cbor>> =
+            c2pa_cbor::value::from_value(root["blocks"].clone())?;
+        assert_eq!(blocks[0]["value"], Cbor::Bytes(vec![0, 128, 255]));
+        assert_eq!(
+            root["bindingMetadata"],
+            c2pa_cbor::value::to_value(json!({"extension": [1, 2]}))?
+        );
+
+        let manifest = reader.active_manifest().unwrap();
+        let reported = manifest
+            .assertions()
+            .iter()
+            .find(|a| a.label() == labels::SOFT_BINDING)
+            .unwrap()
+            .value()?;
+        assert_eq!(reported["blocks"][0]["value"], "b64'AID/'");
+        let json: serde_json::Value = serde_json::from_str(&reader.json_checked()?)?;
+        let reported = json["manifests"][reader.active_label().unwrap()]["assertions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["label"] == labels::SOFT_BINDING)
+            .unwrap();
+        // Reader JSON unwraps bstr reports to plain standard base64; crJSON does not.
+        assert_eq!(reported["data"]["blocks"][0]["value"], "AID/");
+        assert_eq!(
+            crate::crypto::base64::decode(reported["data"]["blocks"][0]["value"].as_str().unwrap())
+                .unwrap(),
+            vec![0, 128, 255]
+        );
+        let crjson = reader.to_crjson_value()?;
+        assert_eq!(
+            crjson["manifests"][0]["assertions"][labels::SOFT_BINDING]["blocks"][0]["value"],
+            "b64'AID/'"
+        );
+        Ok(())
     }
 
     #[test]
