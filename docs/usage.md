@@ -77,6 +77,33 @@ The following features are no longer supported:
 * `v1_api`: The old API that this enabled has been removed.
 * `serialize_thumbnails`: Thumbnails can be serialized by accessing resources directly.
 
+## Soft-binding JSON input
+
+For `c2pa.soft-binding` assertions in a Builder JSON definition, each
+`data.blocks[].value` must be an array of integers from 0 through 255:
+
+```json
+{
+  "label": "c2pa.soft-binding",
+  "data": {
+    "alg": "com.example.algorithm.v1",
+    "blocks": [{"scope": {}, "value": [0, 128, 255]}]
+  }
+}
+```
+
+The SDK encodes only this field as a CBOR byte string, including empty arrays.
+Booleans, floats, out-of-range numbers, and strings (including base64 and
+`b64'...'` strings) are rejected; there is no legacy text-input compatibility.
+Omit `kind` or use `"Cbor"`; explicit `"Json"` is rejected for soft bindings.
+The same rule applies with version and instance suffixes under the SDK's label
+parsing rules. Algorithm identifiers are not restricted by this conversion.
+Unknown scope/metadata fields and unrelated arrays are preserved.
+
+Serializing the Builder definition to JSON produces byte arrays that can be
+imported again. Reader JSON and crJSON reports instead display CBOR byte strings
+as `b64'<base64>'` strings; those reports are not Builder input definitions.
+
 ## Resource references
 
 A resource reference is a superset of a `HashedUri`, which the C2PA specification refers to as both `hashed-uri-map` and `hashed-ext-uri-map`. In some cases either can be used.

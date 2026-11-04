@@ -9,6 +9,13 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ## [Unreleased]
 
+### Fixed
+
+* Builder JSON soft-binding assertions now encode `blocks[].value` integer arrays
+  (0..255) as CBOR byte strings, preserving unrelated arrays and extension data.
+  Text values, including base64 strings, are rejected without legacy compatibility;
+  soft bindings require the default or explicit `Cbor` kind, not `Json`.
+
 ### Castlabs 1.0.10 VSI Validation Time
 
 * Experimental live-video VSI validation (`unstable_live_video`) now checks a
