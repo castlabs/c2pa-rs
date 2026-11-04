@@ -4559,7 +4559,13 @@ mod tests {
             .iter()
             .find(|a| a["label"] == labels::SOFT_BINDING)
             .unwrap();
-        assert_eq!(reported["data"]["blocks"][0]["value"], "b64'AID/'");
+        // Reader JSON unwraps bstr reports to plain standard base64; crJSON does not.
+        assert_eq!(reported["data"]["blocks"][0]["value"], "AID/");
+        assert_eq!(
+            crate::crypto::base64::decode(reported["data"]["blocks"][0]["value"].as_str().unwrap())
+                .unwrap(),
+            vec![0, 128, 255]
+        );
         let crjson = reader.to_crjson_value()?;
         assert_eq!(
             crjson["manifests"][0]["assertions"][labels::SOFT_BINDING]["blocks"][0]["value"],

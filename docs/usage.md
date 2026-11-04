@@ -101,8 +101,14 @@ parsing rules. Algorithm identifiers are not restricted by this conversion.
 Unknown scope/metadata fields and unrelated arrays are preserved.
 
 Serializing the Builder definition to JSON produces byte arrays that can be
-imported again. Reader JSON and crJSON reports instead display CBOR byte strings
-as `b64'<base64>'` strings; those reports are not Builder input definitions.
+imported again. `Reader::json()` / `json_checked()` reports display soft-binding
+byte values as plain standard base64 (for example, `"AID/"` for `[0, 128, 255]`).
+Direct manifest assertion values and crJSON retain the `b64'<base64>'` wrapper
+(for example, `"b64'AID/'"`). Downstream decoders must use standard base64 for
+the Reader JSON field, or unwrap then base64-decode the crJSON field, according
+to the report API they consume, not interpret these values as hexadecimal.
+These reports are not Builder input definitions: Builder JSON input still
+requires integer byte arrays and accepts neither string form.
 
 ## Resource references
 
@@ -147,4 +153,3 @@ The default operation of C2PA signing is to embed a C2PA manifest store into an 
 - If you don't embed, then the original asset is unmodified and there is no need to write one out.
 - The remote URL can be set with `builder.remote_url`.
 - If embedding is not needed, set the `builder.no_embed` flag to `true`.
-
