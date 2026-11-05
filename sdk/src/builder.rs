@@ -236,6 +236,13 @@ impl TryFrom<serde_json::Value> for ManifestDefinition {
     }
 }
 
+/// Restores schema-defined byte strings after generic JSON-to-CBOR conversion.
+fn normalize_cbor_assertion(label: &str, value: &mut c2pa_cbor::Value) {
+    if labels::base(label) == labels::SOFT_BINDING {
+        crate::assertions::soft_binding_bytes_to_bstr(value);
+    }
+}
+
 fn default_vec<T>() -> Vec<T> {
     Vec::new()
 }
@@ -294,8 +301,9 @@ impl<'de> Deserialize<'de> for AssertionDefinition {
         let data = match helper.kind {
             Some(ManifestAssertionKind::Json) => AssertionData::Json(helper.data),
             Some(ManifestAssertionKind::Cbor) | None => {
-                let cbor_val =
+                let mut cbor_val =
                     c2pa_cbor::value::to_value(helper.data).map_err(serde::de::Error::custom)?;
+                normalize_cbor_assertion(&helper.label, &mut cbor_val);
                 AssertionData::Cbor(cbor_val)
             }
             _ => {
@@ -873,12 +881,17 @@ impl Builder {
         T: Serialize,
     {
         self.check_assertion_limit()?;
+        let label: String = label.into();
         let assertion_data = match kind {
             Some(ManifestAssertionKind::Json) => AssertionData::Json(serde_json::to_value(data)?),
-            _ => AssertionData::Cbor(c2pa_cbor::value::to_value(data)?),
+            _ => {
+                let mut value = c2pa_cbor::value::to_value(data)?;
+                normalize_cbor_assertion(&label, &mut value);
+                AssertionData::Cbor(value)
+            }
         };
         self.definition.assertions.push(AssertionDefinition {
-            label: label.into(),
+            label,
             data: assertion_data,
             kind,
             created,
@@ -4304,6 +4317,327 @@ mod tests {
         // convert back to json and compare to original
         let builder_json = serde_json::to_string(&builder.definition).unwrap();
         assert_eq!(builder_json, stripped_json);
+    }
+
+    mod soft_binding_tests {
+        #![allow(clippy::panic)]
+
+        use c2pa_cbor::Value as Cbor;
+
+        use super::*;
+        use crate::assertions::SoftBinding;
+
+        fn soft_binding_json() -> serde_json::Value {
+            json!({
+                "alg": "com.example.any-algorithm.v7",
+                "blocks": [
+                    {
+                        "scope": {"timespan": {"start": 0, "end": 10}, "extension": [0, 255]},
+                        "value": [0, 128, 255],
+                        "extension": [1, 2]
+                    },
+                    {"scope": {}, "value": []}
+                ],
+                "pad": [0],
+                "pad2": [0, 0],
+                "bindingMetadata": {"value": [1, 2], "blocks": [{"value": "text"}]},
+                "extension": [3, 4],
+                "alg-params": "unchanged"
+            })
+        }
+
+        fn cbor_field<'a>(value: &'a Cbor, key: &str) -> &'a Cbor {
+            let Cbor::Map(map) = value else {
+                panic!("expected CBOR map");
+            };
+            map.get(&Cbor::Text(key.to_owned())).expect("map field")
+        }
+
+        fn block_value(value: &Cbor, index: usize) -> &Cbor {
+            let Cbor::Array(blocks) = cbor_field(value, "blocks") else {
+                panic!("expected blocks array");
+            };
+            cbor_field(&blocks[index], "value")
+        }
+
+        #[test]
+        fn test_soft_binding_definition_normalizes_bytes() {
+            for label in [
+                "c2pa.soft-binding",
+                "c2pa.soft-binding__2",
+                "c2pa.soft-binding.v2",
+                "c2pa.soft-binding.v2__2",
+            ] {
+                for kind in [None, Some("Cbor")] {
+                    let mut input = json!({
+                        "label": label, "created": true, "data": soft_binding_json()
+                    });
+                    if let Some(kind) = kind {
+                        input["kind"] = json!(kind);
+                    }
+                    let definition: AssertionDefinition =
+                        serde_json::from_value(input.clone()).unwrap();
+                    let value: Cbor = definition.to_assertion().unwrap();
+                    assert_eq!(block_value(&value, 0), &Cbor::Bytes(vec![0, 128, 255]));
+                    assert_eq!(block_value(&value, 1), &Cbor::Bytes(vec![]));
+                    assert_eq!(cbor_field(&value, "pad"), &Cbor::Bytes(vec![0]));
+                    assert_eq!(cbor_field(&value, "pad2"), &Cbor::Bytes(vec![0, 0]));
+                    assert!(definition.created());
+                    assert!(definition.cbor_override.is_none());
+
+                    // Builder JSON exports bytes as arrays, unlike Reader/crJSON reports.
+                    // Comparing the entire export also protects scopes and extension fields.
+                    let exported = serde_json::to_value(&definition).unwrap();
+                    assert_eq!(exported, input);
+                    let restored: AssertionDefinition = serde_json::from_value(exported).unwrap();
+                    assert_eq!(restored.to_assertion::<Cbor>().unwrap(), value);
+                }
+            }
+
+            let definition: AssertionDefinition = serde_json::from_value(json!({
+                "label": "c2pa.soft-binding", "data": {"blocks": []}
+            }))
+            .unwrap();
+            assert_eq!(
+                definition.to_assertion::<Cbor>().unwrap(),
+                c2pa_cbor::value::to_value(json!({"blocks": []})).unwrap()
+            );
+        }
+
+        #[test]
+        fn test_soft_binding_wrapped_bytes_and_programmatic_json() {
+            let arrays = soft_binding_json();
+            let mut wrapped = arrays.clone();
+            wrapped["blocks"][0]["value"] = json!("b64'AID/'");
+            wrapped["blocks"][1]["value"] = json!("b64''");
+            wrapped["pad"] = json!("b64'AA=='");
+            wrapped["pad2"] = json!("b64'AAA='");
+            let definition: AssertionDefinition = serde_json::from_value(json!({
+                "label": "c2pa.soft-binding", "data": arrays
+            }))
+            .unwrap();
+            let expected: Cbor = definition.to_assertion().unwrap();
+            let definition: AssertionDefinition = serde_json::from_value(json!({
+                "label": "c2pa.soft-binding", "data": wrapped
+            }))
+            .unwrap();
+            assert_eq!(definition.to_assertion::<Cbor>().unwrap(), expected);
+
+            let mut builder = Builder::default();
+            for label in ["c2pa.soft-binding", "c2pa.soft-binding__1"] {
+                builder.add_assertion(label, &arrays).unwrap();
+                builder.add_assertion(label, &wrapped).unwrap();
+            }
+            for definition in &builder.definition.assertions {
+                assert_eq!(definition.to_assertion::<Cbor>().unwrap(), expected);
+                assert!(definition.kind.is_none());
+                assert!(!definition.created());
+                assert!(definition.cbor_override.is_none());
+            }
+            builder
+                .add_assertion_impl(
+                    "c2pa.soft-binding.v2__2",
+                    &arrays,
+                    Some(ManifestAssertionKind::Cbor),
+                    true,
+                )
+                .unwrap();
+            let definition = builder.definition.assertions.last().unwrap();
+            assert_eq!(definition.to_assertion::<Cbor>().unwrap(), expected);
+            assert_eq!(definition.kind, Some(ManifestAssertionKind::Cbor));
+            assert!(definition.created());
+        }
+
+        #[test]
+        fn test_soft_binding_typed_struct_unchanged() {
+            let typed: SoftBinding = serde_json::from_value(soft_binding_json()).unwrap();
+            let expected = c2pa_cbor::value::to_value(&typed).unwrap();
+            let mut builder = Builder::default();
+            builder.add_assertion(SoftBinding::LABEL, &typed).unwrap();
+            let definition = &builder.definition.assertions[0];
+            assert_eq!(definition.to_assertion::<Cbor>().unwrap(), expected);
+            assert_eq!(definition.to_assertion::<SoftBinding>().unwrap(), typed);
+        }
+
+        #[test]
+        fn test_soft_binding_non_byte_values_and_malformed_shapes_unchanged() {
+            for value in [
+                json!([true]),
+                json!([false]),
+                json!([1.0]),
+                json!([1.5]),
+                json!([-1]),
+                json!([256]),
+                json!([0, 255, 256]),
+                json!([null]),
+                json!([[1]]),
+                json!([{}]),
+                json!(["1"]),
+                json!("legacy text"),
+                json!("AP8="),
+                json!("b64'%%%'"),
+                json!("b64'AP8="),
+                json!("b64'AP8='suffix"),
+                json!(null),
+                json!(1),
+                json!({}),
+            ] {
+                let data = json!({
+                    "blocks": [{"scope": {}, "value": value}], "pad": value, "pad2": value
+                });
+                let definition: AssertionDefinition = serde_json::from_value(json!({
+                    "label": "c2pa.soft-binding", "data": data
+                }))
+                .unwrap();
+                assert_eq!(
+                    definition.to_assertion::<Cbor>().unwrap(),
+                    c2pa_cbor::value::to_value(&data).unwrap(),
+                    "changed non-byte value {value}"
+                );
+            }
+            for data in [
+                json!([]),
+                json!({}),
+                json!({"blocks": null}),
+                json!({"blocks": {"value": [1]}}),
+                json!({"blocks": [null, {}, {"scope": {}}]}),
+            ] {
+                let definition: AssertionDefinition = serde_json::from_value(json!({
+                    "label": "c2pa.soft-binding", "data": data
+                }))
+                .unwrap();
+                assert_eq!(
+                    definition.to_assertion::<Cbor>().unwrap(),
+                    c2pa_cbor::value::to_value(&data).unwrap()
+                );
+            }
+        }
+
+        #[test]
+        fn test_soft_binding_explicit_json_and_unrelated_assertions_unchanged() {
+            let mut data = soft_binding_json();
+            data["blocks"][1]["value"] = json!("b64''");
+            let definition: AssertionDefinition = serde_json::from_value(json!({
+                "label": "c2pa.soft-binding.v2__2", "kind": "Json", "data": data
+            }))
+            .unwrap();
+            assert!(matches!(&definition.data, AssertionData::Json(value) if value == &data));
+            let mut builder = Builder::default();
+            builder.add_assertion_json("c2pa.soft-binding", &data).unwrap();
+            assert!(matches!(
+                &builder.definition.assertions[0].data,
+                AssertionData::Json(value) if value == &data
+            ));
+
+            let expected = c2pa_cbor::value::to_value(&data).unwrap();
+            for label in [
+                "org.example.custom",
+                "c2pa.soft-binding-extra",
+                "c2pa.soft-binding.extension",
+                "c2pa.soft-binding.vfake",
+            ] {
+                let definition: AssertionDefinition = serde_json::from_value(json!({
+                    "label": label, "data": data
+                }))
+                .unwrap();
+                assert_eq!(definition.to_assertion::<Cbor>().unwrap(), expected);
+                builder.add_assertion(label, &data).unwrap();
+                assert_eq!(
+                    builder
+                        .definition
+                        .assertions
+                        .last()
+                        .unwrap()
+                        .to_assertion::<Cbor>()
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn test_soft_binding_archive_signed_cbor_and_reports() -> Result<()> {
+            let context = test_context().into_shared();
+            let data = soft_binding_json();
+            let expected_typed: SoftBinding = serde_json::from_value(data.clone())?;
+            let mut builder = Builder::from_shared_context(&context).with_definition(
+                json!({"assertions": [{"label": "c2pa.soft-binding", "data": data}]}).to_string(),
+            )?;
+            builder.set_intent(BuilderIntent::Create(DigitalSourceType::Empty));
+            let expected_cbor: Cbor = builder.definition.assertions[0].to_assertion()?;
+            let mut archive = Cursor::new(Vec::new());
+            builder.to_archive(&mut archive)?;
+            archive.rewind()?;
+            let mut builder = Builder::from_shared_context(&context).with_archive(&mut archive)?;
+            let signer = test_signer(SigningAlg::Ps256);
+            let mut output = Cursor::new(Vec::new());
+            builder.sign(
+                signer.as_ref(),
+                "image/jpeg",
+                &mut Cursor::new(TEST_IMAGE_CLEAN),
+                &mut output,
+            )?;
+            output.rewind()?;
+            let reader =
+                Reader::from_shared_context(&context).with_stream("image/jpeg", &mut output)?;
+            assert_eq!(reader.validation_status(), None);
+            let assertion = reader
+                .store
+                .provenance_claim()
+                .unwrap()
+                .claim_assertion_store()
+                .iter()
+                .find(|a| a.label_raw() == labels::SOFT_BINDING)
+                .unwrap()
+                .assertion();
+            assert_eq!(assertion.mime_type(), "application/cbor");
+            // Decode the signed assertion, not its JSON rendering or a byte-pattern search.
+            let raw: Cbor = c2pa_cbor::from_slice(assertion.data())?;
+            assert_eq!(block_value(&raw, 0), &Cbor::Bytes(vec![0, 128, 255]));
+            assert_eq!(block_value(&raw, 1), &Cbor::Bytes(vec![]));
+            assert_eq!(cbor_field(&raw, "pad"), &Cbor::Bytes(vec![0]));
+            assert_eq!(cbor_field(&raw, "pad2"), &Cbor::Bytes(vec![0, 0]));
+            assert_eq!(raw, expected_cbor); // Includes scopes and unknown extension fields.
+            let manifest = reader.active_manifest().unwrap();
+            let typed: SoftBinding = manifest.find_assertion(SoftBinding::LABEL)?;
+            assert_eq!(typed, expected_typed);
+
+            let mut wrapped = data;
+            wrapped["blocks"][0]["value"] = json!("b64'AID/'");
+            wrapped["blocks"][1]["value"] = json!("b64''");
+            wrapped["pad"] = json!("b64'AA=='");
+            wrapped["pad2"] = json!("b64'AAA='");
+            let reported = manifest
+                .assertions()
+                .iter()
+                .find(|a| a.label() == labels::SOFT_BINDING)
+                .unwrap();
+            assert_eq!(reported.value()?, &wrapped);
+            let crjson = reader.to_crjson_value()?;
+            assert_eq!(
+                crjson["manifests"][0]["assertions"][labels::SOFT_BINDING],
+                wrapped
+            );
+            let mut plain = wrapped;
+            plain["blocks"][0]["value"] = json!("AID/");
+            plain["blocks"][1]["value"] = json!("");
+            plain["pad"] = json!("AA==");
+            plain["pad2"] = json!("AAA=");
+            // Legacy Reader JSON also base64-encodes numeric extension arrays.
+            plain["blocks"][0]["scope"]["extension"] = json!("AP8=");
+            plain["blocks"][0]["extension"] = json!("AQI=");
+            plain["bindingMetadata"]["value"] = json!("AQI=");
+            plain["extension"] = json!("AwQ=");
+            let json: serde_json::Value = serde_json::from_str(&reader.json_checked()?)?;
+            let reported = json["manifests"][reader.active_label().unwrap()]["assertions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["label"] == labels::SOFT_BINDING)
+                .unwrap();
+            assert_eq!(reported["data"], plain);
+            Ok(())
+        }
     }
 
     #[test]
