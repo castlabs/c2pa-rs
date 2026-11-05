@@ -4361,6 +4361,10 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(
+            all(target_arch = "wasm32", not(target_os = "wasi")),
+            wasm_bindgen_test
+        )]
         fn test_soft_binding_definition_normalizes_bytes() {
             for label in [
                 "c2pa.soft-binding",
@@ -4405,6 +4409,10 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(
+            all(target_arch = "wasm32", not(target_os = "wasi")),
+            wasm_bindgen_test
+        )]
         fn test_soft_binding_wrapped_bytes_and_programmatic_json() {
             let arrays = soft_binding_json();
             let mut wrapped = arrays.clone();
@@ -4449,6 +4457,10 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(
+            all(target_arch = "wasm32", not(target_os = "wasi")),
+            wasm_bindgen_test
+        )]
         fn test_soft_binding_typed_struct_unchanged() {
             let typed: SoftBinding = serde_json::from_value(soft_binding_json()).unwrap();
             let expected = c2pa_cbor::value::to_value(&typed).unwrap();
@@ -4460,6 +4472,10 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(
+            all(target_arch = "wasm32", not(target_os = "wasi")),
+            wasm_bindgen_test
+        )]
         fn test_soft_binding_non_byte_values_and_malformed_shapes_unchanged() {
             for value in [
                 json!([true]),
@@ -4514,6 +4530,10 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(
+            all(target_arch = "wasm32", not(target_os = "wasi")),
+            wasm_bindgen_test
+        )]
         fn test_soft_binding_explicit_json_and_unrelated_assertions_unchanged() {
             let mut data = soft_binding_json();
             data["blocks"][1]["value"] = json!("b64''");
@@ -4523,7 +4543,9 @@ mod tests {
             .unwrap();
             assert!(matches!(&definition.data, AssertionData::Json(value) if value == &data));
             let mut builder = Builder::default();
-            builder.add_assertion_json("c2pa.soft-binding", &data).unwrap();
+            builder
+                .add_assertion_json("c2pa.soft-binding", &data)
+                .unwrap();
             assert!(matches!(
                 &builder.definition.assertions[0].data,
                 AssertionData::Json(value) if value == &data
