@@ -490,6 +490,60 @@ fn valid_multi_chunk_verifies() {
         .expect("multi-chunk asset should verify");
 }
 
+/// A keyless attacker physically swaps the two equal-size auxiliary Merkle
+/// proof `uuid` boxes for a two-chunk timed-media track, leaving each box's
+/// own `location` field untouched. Without a check tying `location` to
+/// physical box order, each chunk's root hash would still validate against
+/// its own untouched `location`, so the swap (and thus which physical chunk
+/// each root claims to describe) would go undetected.
+#[test]
+fn timed_media_rejects_uuid_box_reordering() {
+    let track = TrackSpec {
+        track_id: 1,
+        stsc: vec![StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: 1,
+            sample_description_index: 1,
+        }],
+        sample_sizes: SampleSizes::Variable(vec![5, 7]),
+        use_co64: false,
+    };
+    let samples: [&[u8]; 2] = [b"aaaaa", b"bbbbbbb"];
+    let (file, roots) = build_single_track_asset(track, &samples);
+    assert_eq!(roots.len(), 2, "expected two chunks, one per sample");
+
+    // The two merkle uuid boxes (location 0 and location 1) are the only
+    // `uuid` boxes in this asset and sit back-to-back right after `ftyp`.
+    // Their CBOR-encoded location fields (0 and 1) are both single-byte, so
+    // the boxes are equal length and can be swapped in place without
+    // disturbing any subsequent chunk offsets.
+    let uuid0 = build_merkle_uuid_box(0, 1, 0);
+    let uuid1 = build_merkle_uuid_box(0, 1, 1);
+    assert_eq!(
+        uuid0.len(),
+        uuid1.len(),
+        "fixture assumption: equal-size uuid boxes"
+    );
+
+    let uuid_start = file
+        .windows(4)
+        .position(|w| w == b"uuid")
+        .expect("uuid box present")
+        - 4; // back up over the 4-byte box-size prefix to the box start
+    let mut swapped = file.clone();
+    swapped[uuid_start..uuid_start + uuid1.len()].copy_from_slice(&uuid1);
+    swapped[uuid_start + uuid1.len()..uuid_start + uuid1.len() + uuid0.len()]
+        .copy_from_slice(&uuid0);
+
+    let bmff_hash = track_merkle_assertion(1, &roots);
+    let mut reader = Cursor::new(swapped);
+    let result = bmff_hash.verify_stream_hash(&mut reader, Some("sha256"));
+    assert!(
+        matches!(result, Err(c2pa::Error::HashMismatch(_))),
+        "uuid box reordering must be rejected, got {result:?}"
+    );
+}
+
 /// Several samples packed into a single chunk (`samples_per_chunk > 1`). The
 /// chunk root hashes the concatenation of every sample in the chunk, exercising
 /// the intra-chunk offset accumulation.
@@ -1236,7 +1290,7 @@ fn build_merkle_uuid_box_with_u32_location(
 
 /// A `location = u32::MAX` merkle box must be rejected with an error, not
 /// panic. (Before the checked conversion, this input panicked with an
-/// integer-overflow abort at `bmff_hash.rs:1508`.)
+/// integer-overflow abort.)
 #[test]
 fn location_u32_max_does_not_panic() {
     let track = TrackSpec {
@@ -1281,6 +1335,88 @@ fn location_u32_max_does_not_panic() {
         .expect_err("a location of u32::MAX must be rejected, not overflow");
     assert!(
         matches!(err, c2pa::Error::HashMismatch(_)),
-        "expected a clean rejection, got: {err:?}"
+        "expected HashMismatch from the sequential-location check, got: {err:?}"
+    );
+}
+
+/// Regression: a fragment matching a `MerkleMap` with no `initHash` must be
+/// rejected, not silently accepted as valid.
+#[test]
+fn fragment_with_no_init_hash_is_rejected() {
+    let ftyp = build_box(b"ftyp", b"isom\x00\x00\x00\x00isom");
+    let fragment = [
+        ftyp.clone(),
+        build_merkle_uuid_box(1, 1, 0),
+        build_box(b"mdat", b"arbitrary attacker-controlled frame bytes"),
+    ]
+    .concat();
+
+    // Matching map has init_hash = None and a proof hash that matches nothing.
+    let mut bmff_hash = BmffHash::new("test", "sha256", None);
+    bmff_hash.add_exclusions(&mut vec![ExclusionsMap::new("/uuid".to_owned())]);
+    bmff_hash.set_merkle(vec![MerkleMap {
+        unique_id: 1,
+        local_id: 1,
+        count: 1,
+        alg: Some("sha256".into()),
+        init_hash: None,
+        hashes: VecByteBuf(vec![ByteBuf::from(vec![0xaau8; 32])]),
+        fixed_block_size: None,
+        variable_block_sizes: Some(vec![41]),
+    }]);
+
+    let mut init_stream = Cursor::new(ftyp);
+    let mut fragment_stream = Cursor::new(fragment);
+    let err = bmff_hash
+        .verify_stream_segment(&mut init_stream, &mut fragment_stream, None)
+        .expect_err("a fragment matching an initHash-less MerkleMap must be rejected");
+    assert!(
+        matches!(err, c2pa::Error::C2PAValidation(_)),
+        "expected C2PAValidation (bmffHash malformed), got: {err:?}"
+    );
+}
+
+/// Same regression for the multi-file `verify_stream_segments` path (fragments
+/// supplied as file paths). Filesystem-based, so not run on wasm.
+#[cfg(all(feature = "file_io", not(target_arch = "wasm32")))]
+#[test]
+fn fragment_files_with_no_init_hash_is_rejected() {
+    use std::io::Write;
+
+    let ftyp = build_box(b"ftyp", b"isom\x00\x00\x00\x00isom");
+    let fragment = [
+        ftyp.clone(),
+        build_merkle_uuid_box(1, 1, 0),
+        build_box(b"mdat", b"arbitrary attacker-controlled frame bytes"),
+    ]
+    .concat();
+
+    let dir = tempfile::tempdir().unwrap();
+    let frag_path = dir.path().join("frag.m4s");
+    std::fs::File::create(&frag_path)
+        .unwrap()
+        .write_all(&fragment)
+        .unwrap();
+
+    let mut bmff_hash = BmffHash::new("test", "sha256", None);
+    bmff_hash.add_exclusions(&mut vec![ExclusionsMap::new("/uuid".to_owned())]);
+    bmff_hash.set_merkle(vec![MerkleMap {
+        unique_id: 1,
+        local_id: 1,
+        count: 1,
+        alg: Some("sha256".into()),
+        init_hash: None,
+        hashes: VecByteBuf(vec![ByteBuf::from(vec![0xaau8; 32])]),
+        fixed_block_size: None,
+        variable_block_sizes: Some(vec![41]),
+    }]);
+
+    let mut init_stream = Cursor::new(ftyp);
+    let err = bmff_hash
+        .verify_stream_segments(&mut init_stream, &vec![frag_path], None)
+        .expect_err("a fragment matching an initHash-less MerkleMap must be rejected");
+    assert!(
+        matches!(err, c2pa::Error::C2PAValidation(_)),
+        "expected C2PAValidation (bmffHash malformed), got: {err:?}"
     );
 }

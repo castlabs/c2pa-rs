@@ -25,7 +25,11 @@ use serde_json::Value;
 // direct sha functions
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
-use crate::{crypto::base64::encode, utils::io_utils::stream_len, Error, Result};
+use crate::{
+    crypto::base64::{decode_b64_wrapped, encode},
+    utils::io_utils::stream_len,
+    Error, Result,
+};
 
 const MAX_HASH_BUF: usize = 256 * 1024 * 1024; // cap memory usage to 256MB
 
@@ -154,6 +158,16 @@ impl Hasher {
     }
 }
 
+/// Output size in bytes of a digest produced by the given hash algorithm.
+pub fn hash_size_by_alg(alg: &str) -> Result<usize> {
+    match alg {
+        "sha256" => Ok(<Sha256 as Digest>::output_size()),
+        "sha384" => Ok(<Sha384 as Digest>::output_size()),
+        "sha512" => Ok(<Sha512 as Digest>::output_size()),
+        _ => Err(Error::UnsupportedType),
+    }
+}
+
 // Return hash bytes for desired hashing algorithm.
 pub fn hash_by_alg(alg: &str, data: &[u8], exclusions: Option<Vec<HashRange>>) -> Vec<u8> {
     let mut reader = Cursor::new(data);
@@ -241,6 +255,31 @@ where
     R: Read + Seek + ?Sized,
     F: FnMut(u32, u32) -> Result<()>,
 {
+    hash_stream_by_alg_at_offset_with_progress(alg, data, hash_range, is_exclusion, 0, progress)
+}
+
+/// Like [`hash_stream_by_alg_with_progress`], but every BMFF v2/v3 root-box
+/// offset marker contributes `bmff_base_offset + marker` to the hash instead
+/// of the marker alone.
+///
+/// The marker is the box's position within `data`. When `data` is a
+/// fragment cut out of a larger single-file fragmented BMFF asset, the
+/// specification requires the box's absolute offset in that asset, which is
+/// the fragment's own absolute offset plus the box's position inside the
+/// fragment. Passing `0` reproduces the plain behaviour, which is correct
+/// for whole assets and for fragments that are their own files.
+pub(crate) fn hash_stream_by_alg_at_offset_with_progress<R, F>(
+    alg: &str,
+    data: &mut R,
+    hash_range: Option<Vec<HashRange>>,
+    is_exclusion: bool,
+    bmff_base_offset: u64,
+    progress: &mut F,
+) -> Result<Vec<u8>>
+where
+    R: Read + Seek + ?Sized,
+    F: FnMut(u32, u32) -> Result<()>,
+{
     let max_hash_buf = NonZeroUsize::new(MAX_HASH_BUF)
         .ok_or(Error::BadParam("invalid max_hash_buf".to_string()))?;
     hash_stream_by_alg_with_progress_impl(
@@ -248,18 +287,20 @@ where
         data,
         hash_range,
         is_exclusion,
+        bmff_base_offset,
         progress,
         max_hash_buf,
     )
 }
 
-/// Make `hash_stream_by_alg_with_progress` configurable with `max_hash_buf`.
-/// e.g. makes it configurable in tests too.
+/// Make `hash_stream_by_alg_at_offset_with_progress` configurable with
+/// `max_hash_buf`, e.g. makes it configurable in tests too.
 fn hash_stream_by_alg_with_progress_impl<R, F>(
     alg: &str,
     data: &mut R,
     hash_range: Option<Vec<HashRange>>,
     is_exclusion: bool,
+    bmff_base_offset: u64,
     progress: &mut F,
     max_hash_buf: NonZeroUsize,
 ) -> Result<Vec<u8>>
@@ -448,7 +489,10 @@ where
 
             // check to see if this range is an BMFF V2 offset to include in the hash
             if bmff_v2_starts.contains(start) && end == start {
-                hasher_enum.update(&start.to_be_bytes());
+                let absolute = start.checked_add(bmff_base_offset).ok_or(Error::BadParam(
+                    "BMFF base offset overflows the root box offset".to_string(),
+                ))?;
+                hasher_enum.update(&absolute.to_be_bytes());
                 continue;
             }
 
@@ -485,7 +529,10 @@ where
 
             // check to see if this range is an BMFF V2 offset to include in the hash
             if bmff_v2_starts.contains(start) && end == start {
-                hasher_enum.update(&start.to_be_bytes());
+                let absolute = start.checked_add(bmff_base_offset).ok_or(Error::BadParam(
+                    "BMFF base offset overflows the root box offset".to_string(),
+                ))?;
+                hasher_enum.update(&absolute.to_be_bytes());
                 continue;
             }
 
@@ -548,6 +595,29 @@ where
     hash_stream_by_alg_with_progress(alg, data, hash_range, is_exclusion, &mut |_, _| Ok(()))
 }
 
+/// Hash a stream like [`hash_stream_by_alg`], treating `data` as if it
+/// started at byte `bmff_base_offset` of a larger BMFF asset: each root-box
+/// offset marker is hashed as `bmff_base_offset + marker`.
+pub fn hash_stream_by_alg_at_offset<R>(
+    alg: &str,
+    data: &mut R,
+    hash_range: Option<Vec<HashRange>>,
+    is_exclusion: bool,
+    bmff_base_offset: u64,
+) -> Result<Vec<u8>>
+where
+    R: Read + Seek + ?Sized,
+{
+    hash_stream_by_alg_at_offset_with_progress(
+        alg,
+        data,
+        hash_range,
+        is_exclusion,
+        bmff_base_offset,
+        &mut |_, _| Ok(()),
+    )
+}
+
 // verify the hash using the specified algorithm
 pub fn verify_by_alg(
     alg: &str,
@@ -604,6 +674,11 @@ pub fn concat_and_hash(alg: &str, left: &[u8], right: Option<&[u8]>) -> Vec<u8> 
 }
 
 /// replace byte arrays with base64 encoded strings
+///
+/// Also unwraps crJSON `b64'<base64>'` strings (as produced by
+/// [`crate::assertion::Assertion::as_json_object`] for CBOR byte strings) down to
+/// plain base64, since this is the legacy `Reader::json()` convention rather than
+/// the crJSON one.
 pub fn hash_to_b64(mut value: Value) -> Value {
     use std::collections::VecDeque;
 
@@ -614,8 +689,10 @@ pub fn hash_to_b64(mut value: Value) -> Value {
         match current {
             Value::Object(obj) => {
                 for (_, v) in obj.iter_mut() {
-                    if let Value::Array(hash_arr) = v {
-                        if !hash_arr.is_empty() && hash_arr.iter().all(|x| x.is_number()) {
+                    match v {
+                        Value::Array(hash_arr)
+                            if !hash_arr.is_empty() && hash_arr.iter().all(|x| x.is_number()) =>
+                        {
                             // Pre-allocate with capacity to avoid reallocations
                             let mut hash_bytes = Vec::with_capacity(hash_arr.len());
                             // Convert numbers to bytes safely
@@ -626,6 +703,12 @@ pub fn hash_to_b64(mut value: Value) -> Value {
                             }
                             *v = Value::String(encode(&hash_bytes));
                         }
+                        Value::String(s) => {
+                            if let Some(bytes) = decode_b64_wrapped(s) {
+                                *v = Value::String(encode(&bytes));
+                            }
+                        }
+                        _ => {}
                     }
                     queue.push_back(v);
                 }
@@ -738,6 +821,7 @@ mod tests {
             &mut reader,
             None,
             true,
+            0,
             &mut cb,
             test_hash_buf(),
         )
@@ -760,6 +844,7 @@ mod tests {
             &mut reader,
             None,
             true,
+            0,
             &mut |_, _| Ok(()),
             test_hash_buf(),
         )
@@ -786,6 +871,7 @@ mod tests {
             &mut reader,
             Some(hr),
             true,
+            0,
             &mut |_, _| Ok(()),
             test_hash_buf(),
         )
@@ -842,6 +928,7 @@ mod tests {
             &mut reader,
             None,
             true,
+            0,
             &mut |_, _| Ok(()),
             NonZeroUsize::new(1024 * 1024).unwrap(),
         )

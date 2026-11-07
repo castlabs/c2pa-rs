@@ -22,11 +22,14 @@ use anyhow::{bail, Context, Result};
 use c2pa::{
     assertions::{LiveVideoSegment, SessionKeys},
     format_from_path,
-    live_video::LiveVideoValidator,
+    live_video::{LiveVideoValidator, SequenceCoverage},
     status_tracker::StatusTracker,
     validation_results::validation_codes::{LIVEVIDEO_INIT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID},
     Context as C2paContext, Manifest, Reader,
 };
+
+#[path = "live_video_updates.rs"]
+mod updates;
 
 /// Which C2PA Live Video validation method the init segment advertises.
 enum ValidationMethod {
@@ -45,29 +48,68 @@ enum ValidationMethod {
 ///
 /// `segments_glob` is resolved relative to `init_path`'s directory and matched
 /// in natural (numeric-aware) filename order.
+/// `updates_path` opts into a trusted-operator VSI signed-init schedule.
 pub fn validate_live_video(
     context: &Arc<C2paContext>,
     init_path: &Path,
     segments_glob: &Path,
+    updates_path: Option<&Path>,
 ) -> Result<()> {
-    let init_data = fs::read(init_path)
-        .with_context(|| format!("Failed to read init segment: {init_path:?}"))?;
+    let scheduled = updates_path
+        .map(|path| -> Result<_> {
+            updates::require_verification(context)?;
+            let segments = collect_segments(init_path, segments_glob)?;
+            let plan = updates::load_plan(context, path, &segments)?;
+            Ok((segments, plan))
+        })
+        .transpose()?;
+
+    let init_data = if updates_path.is_some() {
+        updates::read_init(init_path)?
+    } else {
+        fs::read(init_path)
+            .with_context(|| format!("Failed to read init segment: {init_path:?}"))?
+    };
 
     let mut tracker = StatusTracker::default();
     let mut live_validator = LiveVideoValidator::new();
 
-    match live_validator.validate_init_segment(&init_data, &mut tracker) {
-        Ok(_) => println!("Init OK:   {init_path:?}"),
-        Err(e) => eprintln!("Init FAIL: {init_path:?}: {e}"),
+    if updates_path.is_some() {
+        live_validator
+            .validate_init_segment(&init_data, &mut tracker)
+            .context("Live video validation failed: initial init segment layout is invalid")?;
+        if tracker.filter_errors().next().is_some() {
+            bail!("Live video validation failed: initial init segment layout is invalid");
+        }
+    } else {
+        match live_validator.validate_init_segment(&init_data, &mut tracker) {
+            Ok(_) => println!("Init OK:   {init_path:?}"),
+            Err(e) => eprintln!("Init FAIL: {init_path:?}: {e}"),
+        }
     }
 
-    let method = detect_validation_method(
-        context,
-        init_path,
-        &init_data,
-        &mut live_validator,
-        &mut tracker,
-    );
+    let method = if updates_path.is_some() {
+        let verified = updates::read_context(context, init_path, &init_data)?;
+        let failures_before = tracker.filter_errors().count();
+        live_validator.validate_session_keys(
+            &verified.session_keys,
+            &verified.manifest_id,
+            Some(&verified.ee_cert_der),
+            &mut tracker,
+        )?;
+        if tracker.filter_errors().count() != failures_before {
+            bail!("Live video validation failed: initial VSI session keys are invalid");
+        }
+        ValidationMethod::VerifiableSegmentInfo
+    } else {
+        detect_validation_method(
+            context,
+            init_path,
+            &init_data,
+            &mut live_validator,
+            &mut tracker,
+        )
+    };
 
     // If the init segment's manifest failed trust/signature validation, don't proceed to
     // validate segments under a guessed fallback method — the segments' actual method (and
@@ -82,6 +124,10 @@ pub fn validate_live_video(
         bail!("Live video validation failed: init segment layout or manifest is invalid");
     }
 
+    if updates_path.is_some() {
+        println!("Init OK:   {init_path:?}");
+    }
+
     match &method {
         ValidationMethod::ManifestBox => {
             println!("Method:    19.3 (per-segment C2PA Manifest Box)")
@@ -91,7 +137,11 @@ pub fn validate_live_video(
         }
     }
 
-    let segment_paths = collect_segments(init_path, segments_glob)?;
+    let (segment_paths, plan) = match scheduled {
+        Some(scheduled) => scheduled,
+        None => (collect_segments(init_path, segments_glob)?, Vec::new()),
+    };
+    let mut plan = plan.into_iter().peekable();
 
     if segment_paths.is_empty() {
         let init_dir = init_path.parent().unwrap_or(Path::new("."));
@@ -104,7 +154,29 @@ pub fn validate_live_video(
 
     let mut failed_count = 0usize;
 
-    for segment_path in &segment_paths {
+    for (segment_index, segment_path) in segment_paths.iter().enumerate() {
+        if plan.peek().map(|update| update.segment_index) == Some(segment_index) {
+            if let Some(update) = plan.next() {
+                if let Err(error) = update.install(&mut live_validator, &mut tracker) {
+                    print!(
+                        "{}",
+                        format_sequence_coverage(live_validator.sequence_coverage())
+                    );
+                    let failures = collect_live_video_failures(&tracker);
+                    if !failures.is_empty() {
+                        eprintln!("\nLive video continuity failures:");
+                        for (code, description) in failures {
+                            eprintln!("  [{code}] {description}");
+                        }
+                    }
+                    bail!("VSI update FAIL before {segment_path:?}: {error:#}");
+                }
+                println!(
+                    "VSI update installed: {:?} before {segment_path:?}",
+                    update.init_path
+                );
+            }
+        }
         let ok = match method {
             ValidationMethod::ManifestBox => validate_segment_manifest_box(
                 context,
@@ -120,6 +192,11 @@ pub fn validate_live_video(
             failed_count += 1;
         }
     }
+
+    print!(
+        "{}",
+        format_sequence_coverage(live_validator.sequence_coverage())
+    );
 
     let live_video_failures = collect_live_video_failures(&tracker);
 
@@ -141,6 +218,33 @@ pub fn validate_live_video(
             live_video_failures.len()
         )
     }
+}
+
+fn format_sequence_coverage(coverage: &SequenceCoverage) -> String {
+    if coverage.total_missing == 0 {
+        return String::new();
+    }
+
+    let ranges = coverage
+        .missing_ranges
+        .iter()
+        .map(|range| format!("{}..={}", range.start(), range.end()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let truncation = if coverage.ranges_truncated {
+        "\n  Range list truncated; additional unobserved ranges are not shown."
+    } else {
+        ""
+    };
+
+    format!(
+        "\nCoverage gaps (informational):\n  \
+         Retained unobserved sequence ranges (inclusive): {ranges}\n  \
+         Total unobserved sequence numbers: {}{truncation}\n  \
+         Unobserved ranges do not prove malicious removal or that segments with those \
+         sequence numbers were produced.\n",
+        coverage.total_missing
+    )
 }
 
 /// Returns a description of the first non-passed signature, trust, or hard-binding status on
@@ -504,6 +608,138 @@ mod tests {
     }
 
     #[test]
+    fn sequence_coverage_summary_is_empty_without_gaps() {
+        let coverage = SequenceCoverage {
+            missing_ranges: vec![],
+            total_missing: 0,
+            ranges_truncated: false,
+        };
+
+        assert_eq!(format_sequence_coverage(&coverage), "");
+    }
+
+    #[test]
+    #[allow(deprecated)] // The current VSI signing bridge snapshots thread-local settings.
+    fn trusted_vsi_gap_succeeds_but_tampered_surviving_media_still_fails() {
+        let settings = c2pa::settings::Settings::from_string(
+            include_str!("../tests/fixtures/trust/cawg_test_settings.toml"),
+            "toml",
+        )
+        .unwrap();
+        let context = Arc::new(C2paContext::new().with_settings(settings).unwrap());
+        let signer = c2pa::create_signer::from_keys(
+            include_bytes!("../../sdk/tests/fixtures/certs/es256.pub"),
+            include_bytes!("../../sdk/tests/fixtures/certs/es256.pem"),
+            c2pa::SigningAlg::Es256,
+            None,
+        )
+        .unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../sdk/tests/fixtures/bunny/bunny_595491bps");
+        let dir = tempfile::tempdir().unwrap();
+        let signed = dir.path().join("signed");
+        let seed = dir.path().join("session-key.bin");
+        fs::write(&seed, [0x42; 32]).unwrap();
+        crate::live_video_sign::sign_live_video_vsi(
+            &fixtures,
+            Path::new("BigBuckBunny_2s27[7-9].m4s"),
+            &fixtures.join("BigBuckBunny_2s_init.mp4"),
+            None,
+            r#"{"assertions":[{"label":"c2pa.actions","data":{"actions":[{"action":"c2pa.created","digitalSourceType":"http://c2pa.org/digitalsourcetype/empty"}]}}]}"#,
+            &signed,
+            &seed,
+            signer.as_ref(),
+            None,
+        )
+        .unwrap();
+        let init = signed.join("BigBuckBunny_2s_init.mp4");
+        validate_live_video(
+            &context,
+            &init,
+            Path::new("BigBuckBunny_2s27[7-9].m4s"),
+            None,
+        )
+        .unwrap();
+        // Select only 277 and 279: omission must be visible, but not invalidate either segment.
+        let gap_glob = Path::new("BigBuckBunny_2s27[79].m4s");
+        validate_live_video(&context, &init, gap_glob, None).unwrap();
+        let last_path = signed.join("BigBuckBunny_2s279.m4s");
+        let mut tampered = fs::read(&last_path).unwrap();
+        *tampered.last_mut().unwrap() ^= 1;
+        fs::write(&last_path, tampered).unwrap();
+        assert!(validate_live_video(&context, &init, gap_glob, None).is_err());
+    }
+
+    #[test]
+    fn sequence_coverage_summary_reports_inclusive_ranges_and_total() {
+        for (missing_ranges, total_missing, expected_ranges) in [
+            (vec![2..=4], 3, "2..=4"),
+            (vec![1..=1, 5..=7], 4, "1..=1, 5..=7"),
+        ] {
+            let coverage = SequenceCoverage {
+                missing_ranges,
+                total_missing,
+                ranges_truncated: false,
+            };
+            let summary = format_sequence_coverage(&coverage);
+
+            assert_eq!(
+                summary,
+                format!(
+                    "\nCoverage gaps (informational):\n  \
+                     Retained unobserved sequence ranges (inclusive): {expected_ranges}\n  \
+                     Total unobserved sequence numbers: {total_missing}\n  \
+                     Unobserved ranges do not prove malicious removal or that segments with \
+                     those sequence numbers were produced.\n"
+                )
+            );
+            assert!(!summary.contains("FAIL"));
+        }
+    }
+
+    #[test]
+    fn sequence_coverage_summary_reports_truncation_and_full_total() {
+        let coverage = SequenceCoverage {
+            missing_ranges: vec![1..=u64::MAX],
+            total_missing: u128::from(u64::MAX) + 1,
+            ranges_truncated: true,
+        };
+        let summary = format_sequence_coverage(&coverage);
+
+        assert!(summary.contains("1..=18446744073709551615"));
+        assert!(summary.contains("Total unobserved sequence numbers: 18446744073709551616"));
+        assert!(
+            summary.contains("Range list truncated; additional unobserved ranges are not shown.")
+        );
+        assert!(!summary.contains("FAIL"));
+    }
+
+    #[test]
+    fn vendor_informational_gap_statuses_are_not_live_video_failures() {
+        use c2pa::{
+            live_video::{LIVEVIDEO_SEGMENT_GAP, LIVEVIDEO_SEGMENT_LEADING_GAP},
+            log_item,
+        };
+
+        let mut tracker = StatusTracker::default();
+        for code in [LIVEVIDEO_SEGMENT_GAP, LIVEVIDEO_SEGMENT_LEADING_GAP] {
+            log_item!("seg", "coverage gap", "func")
+                .validation_status(code)
+                .informational(&mut tracker);
+        }
+        assert!(collect_live_video_failures(&tracker).is_empty());
+
+        log_item!("seg", "invalid segment", "func")
+            .validation_status("livevideo.segment.invalid")
+            .failure(&mut tracker, c2pa::Error::NotFound)
+            .unwrap();
+        assert_eq!(
+            collect_live_video_failures(&tracker),
+            vec![("livevideo.segment.invalid".into(), "invalid segment".into())]
+        );
+    }
+
+    #[test]
     fn collect_live_video_failures_filters_by_prefix() {
         use c2pa::log_item;
 
@@ -556,8 +792,12 @@ mod tests {
         init_data.extend(make_bmff_box(b"mdat"));
         let init = write_temp_file(&dir, "init.mp4", &init_data);
 
-        let result =
-            validate_live_video(&Arc::new(C2paContext::new()), &init, Path::new("seg_*.m4s"));
+        let result = validate_live_video(
+            &Arc::new(C2paContext::new()),
+            &init,
+            Path::new("seg_*.m4s"),
+            None,
+        );
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("init segment"));
@@ -574,8 +814,12 @@ mod tests {
         let seg_data = make_bmff_box(b"mdat");
         write_temp_file(&dir, "seg_001.m4s", &seg_data);
 
-        let result =
-            validate_live_video(&Arc::new(C2paContext::new()), &init, Path::new("seg_*.m4s"));
+        let result = validate_live_video(
+            &Arc::new(C2paContext::new()),
+            &init,
+            Path::new("seg_*.m4s"),
+            None,
+        );
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
