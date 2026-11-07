@@ -15,8 +15,11 @@ targets = [
 [advisories]
 yanked = "deny"
 ignore = [
-  "RUSTSEC-2023-0071", # rsa Marvin Attack: (https://jira.corp.adobe.com/browse/CAI-5104)
-  "RUSTSEC-2024-0370", # proc-macro-error
+  # Review 2026-12-04 UTC; scope and residual local-key exposure are documented in
+  # docs/security/native-1.0.10-audit-exceptions.md. This is not remediation.
+  { id = "RUSTSEC-2026-0387", reason = "Time-boxed 1.0.10 exception for crypto-bigint 0.5.5; callback signing and public-key verification do not exercise secret EC arithmetic, but local EC PEM signing remains exposed. Review 2026-12-04 UTC; enforced by the audit job. See docs/security/native-1.0.10-audit-exceptions.md." },
+  { id = "RUSTSEC-2023-0071", reason = "Existing rsa 0.9.10 Marvin exception: private RSA signing remains exposed; the selected ES256 callback/public-verification profile does not use it. No fixed rsa release in the reviewed graph. Review 2026-12-04 UTC; see docs/security/native-1.0.10-audit-exceptions.md." },
+  { id = "RUSTSEC-2024-0370", reason = "Existing proc-macro-error 1.0.4 unmaintained exception: build-time macro dependency, not runtime signing code. Reassess on toolchain/dependency changes; see docs/security/native-1.0.10-audit-exceptions.md." },
 ]
 
 [bans]
