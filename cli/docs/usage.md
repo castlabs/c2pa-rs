@@ -73,6 +73,21 @@ or malicious removal. Without `--updates`, existing validation behavior and text
 are unchanged. These update controls are experimental Castlabs behavior, not additional
 adopted C2PA requirements.
 
+### VSI session key lifetime
+
+For VSI (section 19.4), `live-video` checks each segment against its session key's
+validity period (`createdAt` through `createdAt + validityPeriod`, inclusive) using the
+time at which the command runs, not any time claimed by the signer. The optional
+protected `iat` must be a well-formed integer when present but is ignored for this check.
+Validating live media after its session key expired therefore fails with
+`livevideo.segment.invalid`. An old `iat` does not enable validation of expired media.
+
+The `live-video-sign` subcommand has no option for the session key's `validityPeriod`: it
+is fixed at 3600 seconds from the key's `createdAt` (signing time). Streams signed by the
+CLI therefore stop validating one hour after signing, which is the intended consequence
+of validating at the time of validation. Use the SDK directly to configure a longer
+key validity period before signing when needed.
+
 ## Options
 
 The following options are available with any (or no) subcommand.  Additional options are available with each subcommand.

@@ -9,6 +9,24 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ## [Unreleased]
 
+### Castlabs 1.0.10 VSI Validation Time
+
+* Experimental live-video VSI validation (`unstable_live_video`) now checks a
+  session key's validity period against the time at which the segment is
+  validated. A segment validated
+  earlier than `createdAt` or later than `createdAt + validityPeriod` (both
+  bounds inclusive) fails with `livevideo.segment.invalid`.
+* The protected `iat` is an optional signer claim and no longer selects the
+  clock: it must still be a well-formed integer when present, but a valid key no
+  longer fails because of an out-of-window `iat`, and an expired key no longer
+  passes because of an in-window `iat`. **Behavior change:** validation of live
+  media after its key expired now fails. An old `iat` is not an archival-validation
+  override.
+* The signer is unchanged: it still emits `iat` and refuses to sign when the
+  signing time lies outside the key window (a sender-side rule).
+* `c2patool live-video-sign` fixes the session key `validityPeriod` at 3600 s with
+  no option, so streams it signs stop validating one hour after signing.
+
 ### Castlabs 1.0.8 BMFF Exclusions
 
 * Add `builder.bmff_hash_extra_exclusions` for SDK-generated BMFF hard bindings,
