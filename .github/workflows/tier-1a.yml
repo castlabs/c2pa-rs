@@ -501,6 +501,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Enforce temporary crypto-bigint exception deadline
+        run: |
+          python3 - <<'PY'
+          from datetime import datetime, timezone
+          import tomllib
+
+          with open("deny.toml", "rb") as stream:
+              ignored = tomllib.load(stream)["advisories"]["ignore"]
+          active = any(
+              (entry if isinstance(entry, str) else entry.get("id")) == "RUSTSEC-2026-0387"
+              for entry in ignored
+          )
+          if active and datetime.now(timezone.utc).date() >= datetime(2026, 12, 4).date():
+              raise SystemExit(
+                  "RUSTSEC-2026-0387 exception expired: remove it or record a new reviewed disposition."
+              )
+          PY
+
       - name: Audit crate dependencies
         uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
         with:
