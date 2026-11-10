@@ -9,6 +9,15 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ## [Unreleased]
 
+### Castlabs Soft-Binding Input Normalization
+
+* Adopt upstream soft-binding normalization at both Builder CBOR entry points:
+  byte-integer arrays and explicit `b64'...'` values in `blocks[].value`, `pad`
+  and `pad2` become CBOR byte strings. Other values and extension fields remain
+  unchanged; this is not complete assertion-schema validation.
+* Keep explicit JSON assertions and existing Reader/crJSON report conventions
+  unchanged. No dependency, C ABI, algorithm-registration or release-pin change.
+
 ### Castlabs 1.0.10 VSI Validation Time
 
 * Experimental live-video VSI validation (`unstable_live_video`) now checks a

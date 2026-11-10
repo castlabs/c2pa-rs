@@ -19,7 +19,7 @@ mod integration_v2 {
     use std::io::{Cursor, Seek};
 
     use anyhow::Result;
-    use c2pa::{Builder, CallbackSigner, Reader, SigningAlg};
+    use c2pa::{assertions::SoftBinding, Builder, CallbackSigner, Reader, SigningAlg};
     use serde_json::json;
 
     use super::common::test_context;
@@ -129,7 +129,7 @@ mod integration_v2 {
                                     "start": 0,
                                 }
                             },
-                            "value": "dmFsdWUxCg=="
+                            "value": [100, 109, 70, 115, 100, 87, 85, 120, 67, 103, 61, 61]
                         },
                         {
                             "scope": {
@@ -138,7 +138,7 @@ mod integration_v2 {
                                     "start": 133017,
                                 }
                             },
-                            "value": "ZG1Gc2RXVXlDZz09=="
+                            "value": [90, 71, 49, 71, 99, 50, 82, 88, 86, 88, 108, 68, 90, 122, 48, 57, 61, 61]
                         }
                     ]
                 }
@@ -154,6 +154,13 @@ mod integration_v2 {
         let mut source = Cursor::new(TEST_IMAGE);
 
         let json = get_manifest_def(title, format);
+        let definition: serde_json::Value = serde_json::from_str(&json)?;
+        let expected_soft_binding: SoftBinding =
+            serde_json::from_value(definition["assertions"][2]["data"].clone())?;
+        // Preserve the former serde_bytes strings as literal ASCII, not decoded base64.
+        assert_eq!(expected_soft_binding.blocks.len(), 2);
+        assert_eq!(expected_soft_binding.blocks[0].value, b"dmFsdWUxCg==");
+        assert_eq!(expected_soft_binding.blocks[1].value, b"ZG1Gc2RXVXlDZz09==");
 
         // don't try to verify on wasm since it doesn't support ed25519 yet
 
@@ -214,6 +221,11 @@ mod integration_v2 {
         println!("{}", reader.json());
         assert_eq!(reader.validation_status(), None);
         assert_eq!(reader.active_manifest().unwrap().title().unwrap(), title);
+        let soft_binding: SoftBinding = reader
+            .active_manifest()
+            .unwrap()
+            .find_assertion(SoftBinding::LABEL)?;
+        assert_eq!(soft_binding, expected_soft_binding);
 
         Ok(())
     }

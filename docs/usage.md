@@ -77,6 +77,53 @@ The following features are no longer supported:
 * `v1_api`: The old API that this enabled has been removed.
 * `serialize_thumbnails`: Thumbnails can be serialized by accessing resources directly.
 
+## Soft-binding JSON input
+
+For CBOR `c2pa.soft-binding` assertions supplied through a Builder definition
+or `Builder::add_assertion`, byte fields can use integer arrays or explicit
+wrapped-base64 notation:
+
+```json
+{
+  "label": "c2pa.soft-binding",
+  "data": {
+    "alg": "com.example.algorithm.v1",
+    "blocks": [{"scope": {}, "value": [0, 128, 255]}]
+  }
+}
+```
+
+The SDK normalizes `blocks[].value`, `pad`, and `pad2` to CBOR byte strings
+when every array element is an integer in `0..=255`, or when the value is valid
+`b64'...'` text. Empty arrays and `b64''` represent empty byte strings. For the
+example above, `"b64'AID/'"` is the equivalent input. Already-typed CBOR byte
+strings are unchanged. Label instances and versions follow the SDK's existing
+label parsing rules; algorithm identifiers are not restricted by this conversion.
+
+This follows upstream's normalization boundary, not an arrays-only admission
+policy. Ordinary text (including unwrapped base64), malformed wrappers, non-byte
+arrays, malformed shapes and unrelated assertions are left unchanged. Explicit
+`"kind": "Json"` assertions remain JSON. Pass-through does not establish that
+malformed data is a conformant soft-binding assertion. Scope and extension data
+are preserved rather than round-tripped through a narrower typed schema.
+
+Serializing an assertion definition with Serde exports bytes as integer arrays,
+which can be imported again. Builder archive round trips can carry the wrapped
+form. This narrow backport does not adopt the newer generic byte-marker/report
+migration: this fork's `Reader::json()` / `json_checked()` still use plain
+standard base64 for byte values (`"AID/"`), while direct manifest assertion
+values and crJSON use `"b64'AID/'"`. Report consumers must follow their selected
+API's representation; do not treat unwrapped input text as implicitly encoded bytes.
+
+Adapted from upstream
+[contentauth/c2pa-rs#2757 [fix: encode soft binding block values as CBOR bstr when supplied as JSON (#2689)]](https://github.com/contentauth/c2pa-rs/pull/2757),
+merge `eb260c3b8bd9a4300a12580be6d29ea7c523efbd`, also backported by upstream as
+[contentauth/c2pa-rs#2948 [fix: encode soft binding block values as CBOR bstr when supplied as JSON (#2689) (backport #2757)]](https://github.com/contentauth/c2pa-rs/pull/2948).
+The normalizer retains the upstream implementation. The selected fork base
+already contains its wrapped-base64 support; no full upstream advance is needed.
+Adoption tracking:
+[mstattma/c2pa-rs#43 [Adopt upstream soft-binding CBOR normalization in the Castlabs fork]](https://github.com/mstattma/c2pa-rs/issues/43).
+
 ## Resource references
 
 A resource reference is a superset of a `HashedUri`, which the C2PA specification refers to as both `hashed-uri-map` and `hashed-ext-uri-map`. In some cases either can be used.
@@ -120,4 +167,3 @@ The default operation of C2PA signing is to embed a C2PA manifest store into an 
 - If you don't embed, then the original asset is unmodified and there is no need to write one out.
 - The remote URL can be set with `builder.remote_url`.
 - If embedding is not needed, set the `builder.no_embed` flag to `true`.
-
