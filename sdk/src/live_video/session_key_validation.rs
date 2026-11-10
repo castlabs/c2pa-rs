@@ -26,7 +26,7 @@ use crate::{
     error::{Error, Result},
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
-        LIVEVIDEO_ASSERTION_INVALID, LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
+        LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
     },
 };
 
@@ -150,13 +150,33 @@ impl LiveVideoValidator {
         sign1: &coset::CoseSign1,
         tracker: &mut StatusTracker,
     ) -> Result<()> {
-        // Per §19.7.3, "the segment's presentation time is outside the key's validity period"
-        // is a segment-info-map parsing error, coded livevideo.segment.invalid (not
-        // livevideo.sessionkey.invalid, which is reserved for signerBinding/shape failures).
-        if let Err(msg) = self.check_key_validity_period(session_key, sign1) {
+        // The protected `iat` is an optional, signer-supplied claim. Its shape is still
+        // validated (a duplicate, non-integer or out-of-range `iat` is a malformed segment),
+        // but its value is discarded here: it must never select or relax the clock used for
+        // the key lifetime check below.
+        if let Err(msg) = validate_iat_shape(sign1) {
+            return fail_validation(msg, LIVEVIDEO_SEGMENT_INVALID, tracker);
+        }
+
+        // The key's validity period is checked against the
+        // time at which the segment is validated, not a time the signer claims. A segment
+        // validated before createdAt or after createdAt + validityPeriod fails with
+        // livevideo.segment.invalid (not livevideo.sessionkey.invalid, which is reserved for
+        // signerBinding/shape failures).
+        if let Err(msg) = self.check_key_validity_period(session_key, self.validation_now()) {
             return fail_validation(msg, LIVEVIDEO_SEGMENT_INVALID, tracker);
         }
         Ok(())
+    }
+
+    /// The validator clock, in Unix seconds, used for the session key lifetime check.
+    ///
+    /// This is the current time unless a validation time was injected (see
+    /// `LiveVideoValidator::set_validation_time_unix_seconds`). It uses the SDK's
+    /// WASM-safe clock.
+    fn validation_now(&self) -> i64 {
+        self.validation_time_unix_seconds
+            .unwrap_or_else(|| crate::crypto::internal::time::utc_now().timestamp())
     }
 
     pub(super) fn validate_vsi_signature(
@@ -177,11 +197,10 @@ impl LiveVideoValidator {
         tracker: &mut StatusTracker,
     ) -> Result<()> {
         if let Some(previous) = &self.previous_segment {
-            let expected = previous.sequence_number.checked_add(1);
-            if expected != Some(seq_num) {
+            if seq_num <= previous.sequence_number {
                 return fail_validation(
-                    "VSI sequenceNumber must advance exactly by one from the previous segment",
-                    LIVEVIDEO_ASSERTION_INVALID,
+                    "VSI sequenceNumber must be strictly greater than the previous segment's",
+                    LIVEVIDEO_SEGMENT_INVALID,
                     tracker,
                 );
             }
@@ -280,12 +299,14 @@ impl LiveVideoValidator {
             .cloned()
     }
 
+    /// Checks that `now_secs` (the validation time, Unix seconds) lies within the key's
+    /// inclusive validity interval `[createdAt, createdAt + validityPeriod]`.
     fn check_key_validity_period(
         &self,
         key: &SessionKey,
-        sign1: &coset::CoseSign1,
+        now_secs: i64,
     ) -> std::result::Result<(), String> {
-        use chrono::{DateTime, TimeZone, Utc};
+        use chrono::{DateTime, Utc};
 
         let created_at: DateTime<Utc> =
             key.created_at.0.parse().map_err(|_| {
@@ -300,33 +321,18 @@ impl LiveVideoValidator {
             .checked_add(validity_seconds)
             .ok_or_else(|| "session key validity period overflows its createdAt".to_string())?;
 
-        // Per §19.4.1, the protected header's `iat` claims the segment's actual time of
-        // signing. Prefer it over wall-clock time so validation done after the fact (e.g.
-        // archival/VOD validation of a recorded live stream) checks the segment against the
-        // time it was actually produced, not the time it happens to be validated.
-        let claimed_time = extract_iat(sign1)?
-            .map(|secs| {
-                Utc.timestamp_opt(secs, 0)
-                    .single()
-                    .ok_or_else(|| "session VSI iat is outside the supported range".to_string())
-            })
-            .transpose()?;
-        let uses_iat = claimed_time.is_some();
-        let now = claimed_time.unwrap_or_else(Utc::now);
-
-        if now.timestamp() < created_at_seconds {
+        if now_secs < created_at_seconds {
             return Err(format!(
-                "session key is not yet valid: createdAt={}, {}={now}",
+                "session key is not yet valid at validation time: createdAt={}, \
+                 validation time={now_secs} (Unix seconds)",
                 key.created_at.0,
-                if uses_iat { "iat" } else { "now" },
             ));
         }
-        if now.timestamp() > expires_at_seconds {
+        if now_secs > expires_at_seconds {
             return Err(format!(
-                "session key expired: createdAt={}, validityPeriod={}s, {}={now}",
-                key.created_at.0,
-                key.validity_period,
-                if uses_iat { "iat" } else { "now" },
+                "session key expired at validation time: createdAt={}, validityPeriod={}s, \
+                 validation time={now_secs} (Unix seconds)",
+                key.created_at.0, key.validity_period,
             ));
         }
 
@@ -466,6 +472,23 @@ fn reject_signer_binding(msg: impl Into<String>, tracker: &mut StatusTracker) ->
     Ok(false)
 }
 
+/// Rejects a malformed protected `iat` (duplicate, non-integer or out-of-range) while
+/// discarding its value.
+///
+/// `iat` is an optional claim by the signer of the time of signing (§19.4.1/RFC 8392). It is
+/// advisory only: validators evaluate key lifetime against their own validation time, so the
+/// claimed value must not influence that check.
+fn validate_iat_shape(sign1: &coset::CoseSign1) -> std::result::Result<(), String> {
+    use chrono::{TimeZone, Utc};
+
+    if let Some(seconds) = extract_iat(sign1)? {
+        Utc.timestamp_opt(seconds, 0)
+            .single()
+            .ok_or_else(|| "session VSI iat is outside the supported range".to_string())?;
+    }
+    Ok(())
+}
+
 /// Extracts the `iat` ("claimed time of signing", §19.4.1/RFC 8392) protected header field, if
 /// present, as a Unix timestamp in seconds.
 fn extract_iat(sign1: &coset::CoseSign1) -> std::result::Result<Option<i64>, String> {
@@ -478,6 +501,8 @@ fn extract_iat(sign1: &coset::CoseSign1) -> std::result::Result<Option<i64>, Str
     let Some((_, value)) = values.next() else {
         return Ok(None);
     };
+    // coset rejects duplicate header labels while parsing, so this is unreachable for a
+    // parsed segment; kept as a defense for a caller-built `CoseSign1`.
     if values.next().is_some() {
         return Err("COSE_Sign1 protected header contains duplicate iat values".to_string());
     }
@@ -492,12 +517,27 @@ fn extract_iat(sign1: &coset::CoseSign1) -> std::result::Result<Option<i64>, Str
 /// Extracts raw COSE_Sign1_Tagged bytes from a `signerBinding` CBOR value.
 ///
 /// The value may appear in different forms depending on the serialization roundtrip:
+/// - `Value::Tag(18, ..)` — at most one COSE_Sign1_Tagged wrapper around one of the
+///   untagged forms below. A nested tag (for example `Tag(18, Tag(18, ..))`) is
+///   rejected, matching the `signerBinding` serializer.
 /// - `Value::Array` with 4 elements — COSE_Sign1 inner content, possibly from JSON roundtrip
 ///   where byte strings become integer arrays. Re-serialized with tag 18.
 /// - `Value::Array` of integers — legacy: flat byte representation of tagged COSE_Sign1 bytes
 /// - `Value::Bytes` — direct CBOR byte string (ideal CBOR-only case)
 /// - `Value::Text` — base64-encoded string (serde_json with base64 for bytes)
 pub(super) fn extract_signer_binding_bytes(value: &c2pa_cbor::Value) -> Option<Vec<u8>> {
+    match value {
+        // A `SessionKey` normally stores the untagged inner value (its
+        // deserializer strips one tag 18), but a caller-constructed value may
+        // still carry the single COSE_Sign1_Tagged wrapper. Unwrap exactly one
+        // tag; the untagged extractor rejects any further tag.
+        c2pa_cbor::Value::Tag(18, inner) => extract_untagged_signer_binding_bytes(inner),
+        value => extract_untagged_signer_binding_bytes(value),
+    }
+}
+
+/// Extracts signer-binding bytes from a value that must not carry a CBOR tag.
+fn extract_untagged_signer_binding_bytes(value: &c2pa_cbor::Value) -> Option<Vec<u8>> {
     match value {
         c2pa_cbor::Value::Array(items) if is_cose_sign1_array(items) => {
             // COSE_Sign1 inner array [protected, unprotected, payload, signature].
@@ -563,7 +603,14 @@ mod tests {
 
     use coset::TaggedCborSerializable;
 
-    use super::super::{test_helpers::*, LiveVideoValidator};
+    #[cfg(feature = "rust_native_crypto")]
+    use super::super::{LIVEVIDEO_SEGMENT_GAP, LIVEVIDEO_SEGMENT_LEADING_GAP};
+    use super::{
+        super::{test_helpers::*, LiveVideoValidator},
+        extract_signer_binding_bytes,
+    };
+    #[cfg(feature = "rust_native_crypto")]
+    use crate::status_tracker::{ErrorBehavior, LogKind, StatusTracker};
     use crate::{
         assertions::{SessionKey, SessionKeys},
         cbor_types::DateT,
@@ -650,7 +697,7 @@ mod tests {
         }
 
         pub fn generate_test_key_pair() -> (p256::ecdsa::SigningKey, c2pa_cbor::Value) {
-            let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+            let signing_key = p256::ecdsa::SigningKey::random(&mut rand_core_06::OsRng);
             let verifying_key = signing_key.verifying_key();
             let point = verifying_key.to_encoded_point(false);
 
@@ -712,20 +759,26 @@ mod tests {
             }
         }
 
-        pub fn make_signed_cose_sign1_bytes(
+        /// `iat_claims` become protected `iat` entries, one per value, so tests can emit no
+        /// claim (empty), a well-formed claim, or malformed/duplicate claims.
+        fn make_signed_cose_sign1_with_kid(
             segment_info_map: &SegmentInfoMap,
             signing_key: &p256::ecdsa::SigningKey,
+            kid: &[u8],
+            iat_claims: &[coset::cbor::value::Value],
         ) -> Vec<u8> {
             use coset::{iana, HeaderBuilder, TaggedCborSerializable};
             use p256::ecdsa::{signature::Signer, Signature};
 
             let payload = c2pa_cbor::to_vec(segment_info_map).unwrap();
 
-            let protected = HeaderBuilder::new()
-                .algorithm(iana::Algorithm::ES256)
-                .build();
+            let mut protected = HeaderBuilder::new().algorithm(iana::Algorithm::ES256);
+            for claim in iat_claims {
+                protected = protected.text_value("iat".to_string(), claim.clone());
+            }
+            let protected = protected.build();
 
-            let unprotected = HeaderBuilder::new().key_id(TEST_KID.to_vec()).build();
+            let unprotected = HeaderBuilder::new().key_id(kid.to_vec()).build();
 
             let mut sign1 = coset::CoseSign1Builder::new()
                 .protected(protected)
@@ -748,6 +801,60 @@ mod tests {
             sequence_number: u64,
             manifest_id: &str,
             signing_key: &p256::ecdsa::SigningKey,
+        ) -> Vec<u8> {
+            make_signed_vsi_segment_with_ids(
+                sequence_number,
+                manifest_id,
+                signing_key,
+                TEST_KID,
+                u32::try_from(sequence_number).unwrap(),
+            )
+        }
+
+        pub fn make_signed_vsi_segment_with_ids(
+            sequence_number: u64,
+            manifest_id: &str,
+            signing_key: &p256::ecdsa::SigningKey,
+            kid: &[u8],
+            event_id: u32,
+        ) -> Vec<u8> {
+            make_signed_vsi_segment_with_claims(
+                sequence_number,
+                manifest_id,
+                signing_key,
+                kid,
+                event_id,
+                &[],
+            )
+        }
+
+        /// Like [`make_signed_vsi_segment`], additionally carrying a well-formed protected
+        /// `iat` claim of `iat` Unix seconds.
+        pub fn make_signed_vsi_segment_with_iat(
+            sequence_number: u64,
+            manifest_id: &str,
+            signing_key: &p256::ecdsa::SigningKey,
+            iat: i64,
+        ) -> Vec<u8> {
+            make_signed_vsi_segment_with_claims(
+                sequence_number,
+                manifest_id,
+                signing_key,
+                TEST_KID,
+                u32::try_from(sequence_number).unwrap(),
+                &[coset::cbor::value::Value::from(iat)],
+            )
+        }
+
+        /// Builds a VSI segment whose protected header carries one `iat` entry per element
+        /// of `iat_claims` (none for an empty slice).
+        pub fn make_signed_vsi_segment_with_claims(
+            sequence_number: u64,
+            manifest_id: &str,
+            signing_key: &p256::ecdsa::SigningKey,
+            kid: &[u8],
+            event_id: u32,
+            iat_claims: &[coset::cbor::value::Value],
         ) -> Vec<u8> {
             fn bmff_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
                 let mut data = Vec::new();
@@ -780,10 +887,10 @@ mod tests {
                     manifest_uri: None,
                 };
                 let mut seg = super::make_vsi_emsg_box_with_timing(
-                    &make_signed_cose_sign1_bytes(&map, signing_key),
+                    &make_signed_cose_sign1_with_kid(&map, signing_key, kid, iat_claims),
                     1000,
                     1000,
-                    sequence_number_u32,
+                    event_id,
                 );
                 seg.extend_from_slice(&trailer);
                 seg
@@ -804,6 +911,14 @@ mod tests {
         }
 
         pub fn setup_vsi_validator() -> (LiveVideoValidator, p256::ecdsa::SigningKey) {
+            setup_vsi_validator_with_window(None)
+        }
+
+        /// Like [`setup_vsi_validator`], optionally replacing the session key's
+        /// `(createdAt, validityPeriod)` window.
+        pub fn setup_vsi_validator_with_window(
+            window: Option<(&str, u64)>,
+        ) -> (LiveVideoValidator, p256::ecdsa::SigningKey) {
             let (signing_key, cose_key) = generate_test_key_pair();
             let ee_cert_der = test_ee_cert_der();
             let mut validator = LiveVideoValidator::new();
@@ -811,12 +926,403 @@ mod tests {
             validator.init_timescale = Some(1000);
             validator.init_default_sample_duration = Some(1000);
             let mut tracker = StatusTracker::default();
-            let keys = session_keys_with_cose_key(cose_key, &signing_key, &ee_cert_der);
+            let mut keys = session_keys_with_cose_key(cose_key, &signing_key, &ee_cert_der);
+            if let Some((created_at, validity_period)) = window {
+                keys.keys[0].created_at = DateT(created_at.to_string());
+                keys.keys[0].validity_period = validity_period;
+            }
             validator
                 .validate_session_keys(&keys, TEST_MANIFEST_ID, Some(&ee_cert_der), &mut tracker)
                 .unwrap();
             (validator, signing_key)
         }
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    fn update_init(track: u32, timescale: u32, duration: u32) -> Vec<u8> {
+        fn boxed(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            [
+                u32::try_from(data.len() + 8)
+                    .unwrap()
+                    .to_be_bytes()
+                    .as_slice(),
+                kind,
+                data,
+            ]
+            .concat()
+        }
+        let tkhd = boxed(
+            b"tkhd",
+            &[vec![0; 12], track.to_be_bytes().to_vec()].concat(),
+        );
+        let mdhd = boxed(
+            b"mdhd",
+            &[vec![0; 12], timescale.to_be_bytes().to_vec(), vec![0; 8]].concat(),
+        );
+        let trak = boxed(b"trak", &[tkhd, boxed(b"mdia", &mdhd)].concat());
+        let trex = boxed(
+            b"trex",
+            &[
+                vec![0; 4],
+                track.to_be_bytes().to_vec(),
+                1u32.to_be_bytes().to_vec(),
+                duration.to_be_bytes().to_vec(),
+                vec![0; 8],
+            ]
+            .concat(),
+        );
+        boxed(b"moov", &[trak, boxed(b"mvex", &trex)].concat())
+    }
+
+    #[test]
+    #[cfg(feature = "rust_native_crypto")]
+    fn vsi_update_preserves_sequence_replay_coverage_and_rotates_all_keys() {
+        use vsi_crypto_helpers::*;
+        for stop in [false, true] {
+            let new_tracker = || {
+                StatusTracker::with_error_behavior(if stop {
+                    ErrorBehavior::StopOnFirstError
+                } else {
+                    ErrorBehavior::ContinueWhenPossible
+                })
+            };
+            let (mut validator, old_key) = setup_vsi_validator();
+            let mut tracker = new_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(5, TEST_MANIFEST_ID, &old_key),
+                    &mut tracker,
+                )
+                .unwrap();
+            let cert = test_ee_cert_der();
+            let (key, cose) = generate_test_key_pair();
+            let mut keys = session_keys_with_cose_key(cose, &key, &cert);
+            let (second_key, mut second_cose) = generate_test_key_pair();
+            if let c2pa_cbor::Value::Map(map) = &mut second_cose {
+                map.insert(cbor_int(2), c2pa_cbor::Value::Bytes(b"second".to_vec()));
+            }
+            keys.keys
+                .extend(session_keys_with_cose_key(second_cose, &second_key, &cert).keys);
+            let init = update_init(1, 1000, 1000);
+            for candidate_init in [Some(init.as_slice()), None, Some(init.as_slice())] {
+                validator
+                    .update_vsi_context(
+                        candidate_init,
+                        &keys,
+                        "urn:c2pa:rotated",
+                        Some(&cert),
+                        &mut tracker,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    validator.previous_segment.as_ref().unwrap().sequence_number,
+                    5
+                );
+                assert!(validator.seen_emsg_ids.contains(&5));
+                assert_eq!(validator.sequence_coverage().missing_ranges, vec![0..=4]);
+                assert_eq!(validator.session_keys.len(), 2);
+            }
+            for (seq, manifest, signing_key, event_id) in [
+                (5, "urn:c2pa:rotated", &key, 50),
+                (4, "urn:c2pa:rotated", &key, 40),
+                (6, "urn:c2pa:rotated", &key, 5),
+                (6, TEST_MANIFEST_ID, &key, 6),
+                (6, TEST_MANIFEST_ID, &old_key, 6),
+            ] {
+                let mut rejected = new_tracker();
+                let _ = validator.validate_verifiable_segment_info(
+                    &make_signed_vsi_segment_with_ids(
+                        seq,
+                        manifest,
+                        signing_key,
+                        TEST_KID,
+                        event_id,
+                    ),
+                    &mut rejected,
+                );
+                assert!(rejected.filter_errors().count() > 0);
+                assert_eq!(
+                    validator.previous_segment.as_ref().unwrap().sequence_number,
+                    5
+                );
+            }
+            let mut rejected = new_tracker();
+            let _ = validator.validate_verifiable_segment_info(
+                &make_signed_vsi_segment(6, "urn:c2pa:rotated", &old_key),
+                &mut rejected,
+            );
+            let failures: Vec<_> = rejected.filter_errors().collect();
+            assert_eq!(failures.len(), 1);
+            assert!(failures[0]
+                .description
+                .contains("signature verification failed"));
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                5
+            );
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(8, "urn:c2pa:rotated", &key),
+                    &mut tracker,
+                )
+                .unwrap();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment_with_ids(
+                        9,
+                        "urn:c2pa:rotated",
+                        &second_key,
+                        b"second",
+                        9,
+                    ),
+                    &mut tracker,
+                )
+                .unwrap();
+            assert_eq!(
+                validator.sequence_coverage().missing_ranges,
+                vec![0..=4, 6..=7]
+            );
+            let (replacement_key, replacement_cose) = generate_test_key_pair();
+            let mut replacement =
+                session_keys_with_cose_key(replacement_cose, &replacement_key, &cert);
+            replacement.keys[0].min_sequence_number = 12;
+            validator
+                .update_vsi_context(
+                    None,
+                    &replacement,
+                    "urn:c2pa:key-only",
+                    Some(&cert),
+                    &mut tracker,
+                )
+                .unwrap();
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                9
+            );
+            assert!(validator.seen_emsg_ids.contains(&5));
+            for (seq, signing_key, kid, expected_failure) in [
+                (
+                    10,
+                    &replacement_key,
+                    TEST_KID,
+                    "below the session key's minSequenceNumber",
+                ),
+                (
+                    12,
+                    &second_key,
+                    b"second".as_slice(),
+                    "no session key matches the kid",
+                ),
+            ] {
+                let mut rejected = new_tracker();
+                let _ = validator.validate_verifiable_segment_info(
+                    &make_signed_vsi_segment_with_ids(
+                        seq,
+                        "urn:c2pa:key-only",
+                        signing_key,
+                        kid,
+                        seq as u32,
+                    ),
+                    &mut rejected,
+                );
+                let failures: Vec<_> = rejected.filter_errors().collect();
+                assert_eq!(failures.len(), 1);
+                assert!(failures[0].description.contains(expected_failure));
+                assert_eq!(
+                    validator.previous_segment.as_ref().unwrap().sequence_number,
+                    9
+                );
+                assert!(!validator.seen_emsg_ids.contains(&(seq as u32)));
+                assert_eq!(
+                    validator.sequence_coverage().missing_ranges,
+                    vec![0..=4, 6..=7]
+                );
+            }
+            let mut after_rotation = new_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(12, "urn:c2pa:key-only", &replacement_key),
+                    &mut after_rotation,
+                )
+                .unwrap();
+            assert_eq!(
+                validator.sequence_coverage().missing_ranges,
+                vec![0..=4, 6..=7, 10..=11]
+            );
+            assert!(after_rotation.has_status(LIVEVIDEO_SEGMENT_GAP));
+            assert!(!after_rotation.has_status(LIVEVIDEO_SEGMENT_LEADING_GAP));
+            assert_eq!(after_rotation.filter_errors().count(), 0);
+            assert_eq!(tracker.filter_errors().count(), 0);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "rust_native_crypto")]
+    fn vsi_update_rejects_candidates_atomically_in_both_tracker_modes() {
+        use vsi_crypto_helpers::*;
+        for stop in [false, true] {
+            let new_tracker = || {
+                StatusTracker::with_error_behavior(if stop {
+                    ErrorBehavior::StopOnFirstError
+                } else {
+                    ErrorBehavior::ContinueWhenPossible
+                })
+            };
+            let (mut validator, old_key) = setup_vsi_validator();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(5, TEST_MANIFEST_ID, &old_key),
+                    &mut StatusTracker::default(),
+                )
+                .unwrap();
+            let cert = test_ee_cert_der();
+            let (key, cose) = generate_test_key_pair();
+            let keys = session_keys_with_cose_key(cose, &key, &cert);
+            let mut mixed = keys.clone();
+            let mut bad = keys.keys[0].clone();
+            if let c2pa_cbor::Value::Map(map) = &mut bad.key {
+                map.insert(
+                    cbor_int(2),
+                    c2pa_cbor::Value::Bytes(b"bad-binding".to_vec()),
+                );
+            }
+            bad.signer_binding = c2pa_cbor::Value::Bytes(vec![]);
+            mixed.keys.push(bad);
+            let mut duplicate = keys.clone();
+            duplicate.keys.push(keys.keys[0].clone());
+            let empty = SessionKeys { keys: vec![] };
+            let invalid_inits = [
+                vec![],
+                update_init(2, 1000, 1000),
+                update_init(1, 2000, 1000),
+                update_init(1, 1000, 2000),
+                update_init(1, 1000, 0),
+                [update_init(1, 1000, 1000), make_mdat_box()].concat(),
+            ];
+            for init in &invalid_inits {
+                assert!(validator
+                    .update_vsi_context(
+                        Some(init),
+                        &keys,
+                        "urn:c2pa:new",
+                        Some(&cert),
+                        &mut new_tracker()
+                    )
+                    .is_err());
+            }
+            for (assertion, manifest, certificate) in [
+                (&mixed, "urn:c2pa:new", Some(cert.as_slice())),
+                (&duplicate, "urn:c2pa:new", Some(cert.as_slice())),
+                (&empty, "urn:c2pa:new", Some(cert.as_slice())),
+                (&keys, "invalid", Some(cert.as_slice())),
+                (&keys, "urn:c2pa:new", None),
+                (&keys, "urn:c2pa:new", Some(b"invalid-cert".as_slice())),
+            ] {
+                assert!(validator
+                    .update_vsi_context(None, assertion, manifest, certificate, &mut new_tracker())
+                    .is_err());
+            }
+            assert_eq!(
+                validator.expected_manifest_id.as_deref(),
+                Some(TEST_MANIFEST_ID)
+            );
+            assert_eq!(validator.session_keys.len(), 1);
+            assert_eq!(validator.init_track_id, Some(1));
+            assert_eq!(validator.init_timescale, Some(1000));
+            assert_eq!(validator.init_default_sample_duration, Some(1000));
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                5
+            );
+            assert_eq!(validator.seen_emsg_ids, [5].into_iter().collect());
+            assert_eq!(validator.sequence_coverage().missing_ranges, vec![0..=4]);
+            let mut tracker = new_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(6, TEST_MANIFEST_ID, &old_key),
+                    &mut tracker,
+                )
+                .unwrap();
+            assert_eq!(tracker.filter_errors().count(), 0);
+
+            let mut fresh = LiveVideoValidator::new();
+            assert!(fresh
+                .update_vsi_context(
+                    Some(&update_init(1, 1000, 1000)),
+                    &keys,
+                    TEST_MANIFEST_ID,
+                    Some(&cert),
+                    &mut tracker
+                )
+                .is_err());
+            validator
+                .register_manifest_box_init(TEST_MANIFEST_ID, &mut tracker)
+                .unwrap();
+            validator.reset_continuity();
+            assert!(validator
+                .update_vsi_context(None, &keys, TEST_MANIFEST_ID, Some(&cert), &mut tracker)
+                .is_err());
+
+            // A manifest-method observation without registered init is also a method
+            // commitment, even with an empty stream ID and after playback reset.
+            let (mut manifest_validator, _) = setup_vsi_validator();
+            manifest_validator
+                .validate_media_segment(
+                    &make_uuid_box(true),
+                    TEST_MANIFEST_ID,
+                    &make_segment(1, ""),
+                    &mut new_tracker(),
+                )
+                .unwrap();
+            manifest_validator.reset_continuity();
+            assert!(manifest_validator
+                .update_vsi_context(
+                    None,
+                    &keys,
+                    TEST_MANIFEST_ID,
+                    Some(&cert),
+                    &mut new_tracker()
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "rust_native_crypto")]
+    fn vsi_update_preserves_reset_suppression_and_ignores_prior_tracker_failures() {
+        use vsi_crypto_helpers::*;
+        let (mut validator, _) = setup_vsi_validator();
+        validator.reset_continuity();
+        let cert = test_ee_cert_der();
+        let (key, cose) = generate_test_key_pair();
+        let keys = session_keys_with_cose_key(cose, &key, &cert);
+        let mut tracker = StatusTracker::default();
+        validator
+            .fail_session_keys("earlier unrelated failure", &mut tracker)
+            .unwrap();
+        assert!(validator
+            .update_vsi_context(
+                Some(&[]),
+                &keys,
+                TEST_MANIFEST_ID,
+                Some(&cert),
+                &mut tracker
+            )
+            .is_err());
+        assert!(validator.suppress_initial_continuity);
+        let prior_failures = tracker.filter_errors().count();
+        validator
+            .update_vsi_context(None, &keys, TEST_MANIFEST_ID, Some(&cert), &mut tracker)
+            .unwrap();
+        assert!(validator.suppress_initial_continuity);
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(8, TEST_MANIFEST_ID, &key),
+                &mut tracker,
+            )
+            .unwrap();
+        assert!(validator.sequence_coverage().missing_ranges.is_empty());
+        assert_eq!(tracker.filter_errors().count(), prior_failures);
     }
 
     // ── validate_session_keys ─────────────────────────────────────────────────
@@ -959,6 +1465,7 @@ mod tests {
     fn vsi_valid_sequence_advances_state() {
         use vsi_crypto_helpers::*;
         let (mut validator, signing_key) = setup_vsi_validator();
+        validator.session_keys[0].min_sequence_number = 1;
         let mut tracker = aggregate_tracker();
 
         validator
@@ -985,10 +1492,251 @@ mod tests {
 
     #[cfg(feature = "rust_native_crypto")]
     #[test]
+    fn vsi_gap_and_following_segment_succeed_with_informational_coverage() {
+        use vsi_crypto_helpers::*;
+
+        let (mut validator, signing_key) = setup_vsi_validator();
+        validator.session_keys[0].min_sequence_number = 1;
+        let mut tracker = StatusTracker::with_error_behavior(ErrorBehavior::StopOnFirstError);
+
+        for sequence_number in [1, 3, 4] {
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(sequence_number, TEST_MANIFEST_ID, &signing_key),
+                    &mut tracker,
+                )
+                .unwrap();
+        }
+
+        let coverage = validator.sequence_coverage();
+        assert_eq!(coverage.missing_ranges, vec![2..=2]);
+        assert_eq!(coverage.total_missing, 1);
+        assert!(!coverage.ranges_truncated);
+        assert_eq!(tracker.filter_errors().count(), 0);
+        assert_eq!(tracker.logged_items().len(), 1);
+        let gap = &tracker.logged_items()[0];
+        assert_eq!(
+            gap.validation_status.as_deref(),
+            Some(LIVEVIDEO_SEGMENT_GAP)
+        );
+        assert_eq!(gap.kind, LogKind::Informational);
+        assert!(gap.err_val.is_none());
+        assert_eq!(
+            validator.previous_segment.as_ref().unwrap().sequence_number,
+            4
+        );
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_equal_sequence_number_with_fresh_emsg_id_fails() {
+        use vsi_crypto_helpers::*;
+
+        let (mut validator, signing_key) = setup_vsi_validator();
+        validator.session_keys[0].min_sequence_number = 1;
+        let mut tracker = aggregate_tracker();
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(1, TEST_MANIFEST_ID, &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+
+        let mut duplicate = make_signed_vsi_segment(1, TEST_MANIFEST_ID, &signing_key);
+        // The VSI emsg is hash-excluded; a fresh event ID isolates sequence equality
+        // from replay detection without changing the authenticated payload or media.
+        let id_offset = 12 + b"urn:c2pa:verifiable-segment-info\0".len() + b"fseg\0".len() + 12;
+        duplicate[id_offset..id_offset + 4].copy_from_slice(&2u32.to_be_bytes());
+        validator
+            .validate_verifiable_segment_info(&duplicate, &mut tracker)
+            .unwrap();
+
+        let failures: Vec<_> = tracker.filter_errors().collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].validation_status.as_deref(),
+            Some(LIVEVIDEO_SEGMENT_INVALID)
+        );
+        assert!(failures[0].description.contains("strictly greater"));
+        assert_eq!(validator.sequence_coverage().total_missing, 0);
+        assert_eq!(
+            validator.previous_segment.as_ref().unwrap().sequence_number,
+            1
+        );
+
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(2, TEST_MANIFEST_ID, &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+        assert_eq!(tracker.filter_errors().count(), 1);
+        assert_eq!(validator.sequence_coverage().total_missing, 0);
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_leading_gap_uses_literal_session_key_minimum() {
+        use vsi_crypto_helpers::*;
+
+        for (minimum, first, expected_range, expected_total) in
+            [(10, 12, 10..=11, 2u128), (0, 1, 0..=0, 1u128)]
+        {
+            let (mut validator, signing_key) = setup_vsi_validator();
+            validator.session_keys[0].min_sequence_number = minimum;
+            let mut tracker = aggregate_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(first, TEST_MANIFEST_ID, &signing_key),
+                    &mut tracker,
+                )
+                .unwrap();
+
+            let coverage = validator.sequence_coverage();
+            assert_eq!(coverage.missing_ranges, vec![expected_range]);
+            assert_eq!(coverage.total_missing, expected_total);
+            assert!(!coverage.ranges_truncated);
+            assert_eq!(tracker.filter_errors().count(), 0);
+            assert_eq!(tracker.logged_items().len(), 1);
+            let gap = &tracker.logged_items()[0];
+            assert_eq!(
+                gap.validation_status.as_deref(),
+                Some(LIVEVIDEO_SEGMENT_LEADING_GAP)
+            );
+            assert_eq!(gap.kind, LogKind::Informational);
+            assert!(gap.err_val.is_none());
+        }
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_rejected_media_or_signature_does_not_record_gap_or_advance() {
+        use vsi_crypto_helpers::*;
+
+        for tamper_media in [true, false] {
+            let (mut validator, signing_key) = setup_vsi_validator();
+            validator.session_keys[0].min_sequence_number = 1;
+            let mut tracker = aggregate_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(1, TEST_MANIFEST_ID, &signing_key),
+                    &mut tracker,
+                )
+                .unwrap();
+
+            let mut invalid = if tamper_media {
+                make_signed_vsi_segment(4, TEST_MANIFEST_ID, &signing_key)
+            } else {
+                let (other_key, _) = generate_test_key_pair();
+                make_signed_vsi_segment(4, TEST_MANIFEST_ID, &other_key)
+            };
+            if tamper_media {
+                // The fixture ends in an empty mdat; add a byte while keeping its box valid.
+                let mdat_offset = invalid.len() - 8;
+                invalid[mdat_offset..mdat_offset + 4].copy_from_slice(&9u32.to_be_bytes());
+                invalid.push(1);
+            }
+            validator
+                .validate_verifiable_segment_info(&invalid, &mut tracker)
+                .unwrap();
+
+            let failures: Vec<_> = tracker.filter_errors().collect();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(
+                failures[0].validation_status.as_deref(),
+                Some(LIVEVIDEO_SEGMENT_INVALID)
+            );
+            assert!(failures[0].description.contains(if tamper_media {
+                "bmffHash verification failed"
+            } else {
+                "signature verification failed"
+            }));
+            assert!(validator.sequence_coverage().missing_ranges.is_empty());
+            assert_eq!(validator.sequence_coverage().total_missing, 0);
+            assert!(!tracker.has_status(LIVEVIDEO_SEGMENT_GAP));
+            assert!(!tracker.has_status(LIVEVIDEO_SEGMENT_LEADING_GAP));
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                1
+            );
+
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(4, TEST_MANIFEST_ID, &signing_key),
+                    &mut tracker,
+                )
+                .unwrap();
+            assert_eq!(tracker.filter_errors().count(), 1);
+            assert_eq!(validator.sequence_coverage().missing_ranges, vec![2..=3]);
+            assert_eq!(validator.sequence_coverage().total_missing, 2);
+            assert!(!validator.sequence_coverage().ranges_truncated);
+            assert!(tracker.has_status(LIVEVIDEO_SEGMENT_GAP));
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                4
+            );
+        }
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_reset_allows_replay_retains_coverage_and_suppresses_only_leading_gap() {
+        use vsi_crypto_helpers::*;
+
+        let (mut validator, signing_key) = setup_vsi_validator();
+        validator.session_keys[0].min_sequence_number = 1;
+        let mut tracker = aggregate_tracker();
+        let first = make_signed_vsi_segment(1, TEST_MANIFEST_ID, &signing_key);
+        let third = make_signed_vsi_segment(3, TEST_MANIFEST_ID, &signing_key);
+        validator
+            .validate_verifiable_segment_info(&first, &mut tracker)
+            .unwrap();
+        validator
+            .validate_verifiable_segment_info(&third, &mut tracker)
+            .unwrap();
+        let recorded = validator.sequence_coverage().clone();
+        assert_eq!(recorded.missing_ranges, vec![2..=2]);
+
+        validator.reset_continuity();
+        assert!(validator.previous_segment.is_none());
+        assert!(validator.seen_emsg_ids.is_empty());
+        assert_eq!(validator.session_keys.len(), 1);
+        assert_eq!(validator.session_keys[0].min_sequence_number, 1);
+        assert_eq!(
+            validator.expected_manifest_id.as_deref(),
+            Some(TEST_MANIFEST_ID)
+        );
+        assert_eq!(validator.sequence_coverage(), &recorded);
+        validator
+            .validate_verifiable_segment_info(&third, &mut tracker)
+            .unwrap();
+        assert_eq!(validator.sequence_coverage(), &recorded);
+        assert!(!tracker.has_status(LIVEVIDEO_SEGMENT_LEADING_GAP));
+
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(5, TEST_MANIFEST_ID, &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+        let coverage = validator.sequence_coverage();
+        assert_eq!(coverage.missing_ranges, vec![2..=2, 4..=4]);
+        assert_eq!(coverage.total_missing, 2);
+        assert!(!coverage.ranges_truncated);
+        assert_eq!(tracker.filter_errors().count(), 0);
+        assert_eq!(tracker.logged_items().len(), 2);
+        assert!(tracker.logged_items().iter().all(|item| {
+            item.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_GAP)
+                && item.kind == LogKind::Informational
+        }));
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
     fn vsi_regressed_sequence_number_fails() {
         use vsi_crypto_helpers::*;
 
-        use crate::validation_results::validation_codes::LIVEVIDEO_ASSERTION_INVALID;
+        use crate::validation_results::validation_codes::LIVEVIDEO_SEGMENT_INVALID;
         let (mut validator, signing_key) = setup_vsi_validator();
         let mut tracker = aggregate_tracker();
 
@@ -1004,7 +1752,7 @@ mod tests {
         assert!(tracker
             .logged_items()
             .iter()
-            .any(|i| { i.validation_status.as_deref() == Some(LIVEVIDEO_ASSERTION_INVALID) }));
+            .any(|i| { i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID) }));
     }
 
     #[cfg(feature = "rust_native_crypto")]
@@ -1039,39 +1787,211 @@ mod tests {
             .any(|i| { i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID) }));
     }
 
+    // ── key lifetime is judged at validation time, never at the claimed `iat` ──────
+    //
+    // `iat` in the protected header is an optional claim by the signer. The sender-side
+    // rule (a signer only signs with an `iat` inside the key window) lives in
+    // `vsi_signing.rs`; a validator checks the key against ITS OWN validation time
+    // inclusive at both ends of [createdAt, createdAt + validityPeriod].
+
+    /// `2020-01-01T00:00:00Z`
     #[cfg(feature = "rust_native_crypto")]
-    #[test]
-    fn vsi_expired_key_fails() {
+    const WINDOW_CREATED_AT: &str = "2020-01-01T00:00:00Z";
+    #[cfg(feature = "rust_native_crypto")]
+    const WINDOW_CREATED_AT_SECS: i64 = 1_577_836_800;
+
+    /// Validates `segment` (sequence 1) against a fresh validator whose key window is
+    /// `(createdAt, validity_period)` and, when `validation_time` is set, an injected
+    /// validation time. Returns the tracker.
+    #[cfg(feature = "rust_native_crypto")]
+    fn validate_segment_in_window(
+        window: (&str, u64),
+        validation_time: Option<i64>,
+        make_segment: impl FnOnce(&p256::ecdsa::SigningKey) -> Vec<u8>,
+    ) -> StatusTracker {
         use vsi_crypto_helpers::*;
-        let (signing_key, cose_key) = generate_test_key_pair();
-        let ee_cert_der = test_ee_cert_der();
-        let mut validator = LiveVideoValidator::new();
+        let (mut validator, signing_key) = setup_vsi_validator_with_window(Some(window));
+        validator.session_keys[0].min_sequence_number = 1;
+        validator.set_validation_time_unix_seconds(validation_time);
         let mut tracker = aggregate_tracker();
+        let _ =
+            validator.validate_verifiable_segment_info(&make_segment(&signing_key), &mut tracker);
+        tracker
+    }
 
-        let keys = SessionKeys {
-            keys: vec![SessionKey {
-                created_at: DateT("2020-01-01T00:00:00Z".to_string()),
-                validity_period: 1,
-                ..session_keys_with_cose_key(cose_key, &signing_key, &ee_cert_der)
-                    .keys
-                    .remove(0)
-            }],
-        };
-        validator
-            .validate_session_keys(&keys, TEST_MANIFEST_ID, Some(&ee_cert_der), &mut tracker)
-            .unwrap();
-
-        let _ = validator.validate_verifiable_segment_info(
-            &make_signed_vsi_segment(1, TEST_MANIFEST_ID, &signing_key),
-            &mut tracker,
-        );
-
-        // Per §19.7.3, "the segment's presentation time is outside the key's validity
-        // period" is coded livevideo.segment.invalid.
-        assert!(tracker
+    #[cfg(feature = "rust_native_crypto")]
+    fn has_segment_invalid(tracker: &StatusTracker) -> bool {
+        tracker
             .logged_items()
             .iter()
-            .any(|i| { i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID) }));
+            .any(|i| i.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID))
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_expired_key_with_in_window_iat_fails() {
+        use vsi_crypto_helpers::*;
+        // Key window 2020-01-01 + 60 s; the claimed iat is inside it, but the real
+        // validation time (now) is not.
+        let tracker = validate_segment_in_window((WINDOW_CREATED_AT, 60), None, |key| {
+            make_signed_vsi_segment_with_iat(1, TEST_MANIFEST_ID, key, WINDOW_CREATED_AT_SECS + 30)
+        });
+        assert!(has_segment_invalid(&tracker));
+        assert!(
+            tracker
+                .filter_errors()
+                .any(|i| i.description.contains("expired at validation time")),
+            "{tracker:?}"
+        );
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_valid_key_ignores_out_of_window_iat() {
+        use vsi_crypto_helpers::*;
+        let created_at = chrono::Utc::now().timestamp();
+        for iat in [created_at - 100_000, created_at + 100_000] {
+            let (mut validator, signing_key) = setup_vsi_validator();
+            validator.session_keys[0].min_sequence_number = 1;
+            let mut tracker = aggregate_tracker();
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment_with_iat(1, TEST_MANIFEST_ID, &signing_key, iat),
+                    &mut tracker,
+                )
+                .unwrap();
+            assert_eq!(tracker.filter_errors().count(), 0, "iat={iat}: {tracker:?}");
+        }
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_key_validity_bounds_are_inclusive_at_validation_time() {
+        use vsi_crypto_helpers::*;
+        const VALIDITY: u64 = 60;
+        let created = WINDOW_CREATED_AT_SECS;
+        let expires = created + i64::try_from(VALIDITY).unwrap();
+
+        // (validation time, expected pass)
+        let table = [
+            (created - 1, false),
+            (created, true),
+            (created + 30, true),
+            (expires, true),
+            (expires + 1, false),
+        ];
+        for (validation_time, expected_pass) in table {
+            // Give every case a claim with the opposite verdict, plus the no-claim case:
+            // the verdict must follow the validation time alone.
+            let opposite_iat = if expected_pass {
+                created - 1_000
+            } else {
+                created + 30
+            };
+            for iat in [Some(opposite_iat), None] {
+                let tracker = validate_segment_in_window(
+                    (WINDOW_CREATED_AT, VALIDITY),
+                    Some(validation_time),
+                    |key| match iat {
+                        Some(iat) => {
+                            make_signed_vsi_segment_with_iat(1, TEST_MANIFEST_ID, key, iat)
+                        }
+                        None => make_signed_vsi_segment(1, TEST_MANIFEST_ID, key),
+                    },
+                );
+                assert_eq!(
+                    tracker.filter_errors().count() == 0,
+                    expected_pass,
+                    "validation_time={validation_time} (created{:+}) iat={iat:?}: {tracker:?}",
+                    validation_time - created
+                );
+                if !expected_pass {
+                    assert!(has_segment_invalid(&tracker), "{tracker:?}");
+                }
+            }
+        }
+    }
+
+    /// The validation time is inside the key window in these tests, so a failure can only
+    /// come from the `iat` shape check, which the message proves.
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_malformed_iat_still_fails_the_segment() {
+        use coset::cbor::value::Value;
+        use vsi_crypto_helpers::*;
+
+        let in_window = Some(WINDOW_CREATED_AT_SECS + 10);
+        let cases: [(&str, Value, &str); 3] = [
+            (
+                "text iat",
+                Value::Text("2020-01-01".to_string()),
+                "protected iat must be an integer NumericDate",
+            ),
+            (
+                "float iat",
+                Value::Float(1_577_836_810.0),
+                "protected iat must be an integer NumericDate",
+            ),
+            (
+                "out-of-range iat",
+                Value::from(i64::MAX),
+                "iat is outside the supported range",
+            ),
+        ];
+        for (name, claim, expected_message) in cases {
+            let tracker = validate_segment_in_window((WINDOW_CREATED_AT, 60), in_window, |key| {
+                make_signed_vsi_segment_with_claims(
+                    1,
+                    TEST_MANIFEST_ID,
+                    key,
+                    TEST_KID,
+                    1,
+                    &[claim.clone()],
+                )
+            });
+            assert!(has_segment_invalid(&tracker), "{name}: {tracker:?}");
+            assert!(
+                tracker
+                    .filter_errors()
+                    .any(|i| i.description.contains(expected_message)),
+                "{name} must fail the iat shape check: {tracker:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "rust_native_crypto")]
+    #[test]
+    fn vsi_update_context_keeps_injected_validation_time() {
+        use vsi_crypto_helpers::*;
+        let (mut validator, _) = setup_vsi_validator();
+        validator.set_validation_time_unix_seconds(Some(WINDOW_CREATED_AT_SECS));
+        let (signing_key, cose_key) = generate_test_key_pair();
+        let ee_cert_der = test_ee_cert_der();
+        let mut keys = session_keys_with_cose_key(cose_key, &signing_key, &ee_cert_der);
+        keys.keys[0].created_at = DateT(WINDOW_CREATED_AT.to_string());
+        keys.keys[0].validity_period = 60;
+        keys.keys[0].min_sequence_number = 1;
+        let mut tracker = aggregate_tracker();
+        validator
+            .update_vsi_context(
+                None,
+                &keys,
+                TEST_MANIFEST_ID,
+                Some(&ee_cert_der),
+                &mut tracker,
+            )
+            .unwrap();
+        assert_eq!(
+            validator.validation_time_unix_seconds,
+            Some(WINDOW_CREATED_AT_SECS)
+        );
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(1, TEST_MANIFEST_ID, &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+        assert_eq!(tracker.filter_errors().count(), 0, "{tracker:?}");
     }
 
     #[cfg(feature = "rust_native_crypto")]
@@ -1307,6 +2227,69 @@ mod tests {
             validator.session_keys.is_empty(),
             "a key with a failed signerBinding must not be retained for segment validation"
         );
+    }
+
+    /// The `signerBinding` serializer permits at most one COSE_Sign1 tag (18).
+    /// Validation must agree: untagged and single-tagged forms verify, while a
+    /// nested `Tag(18, Tag(18, COSE_Sign1))` is rejected and the key dropped.
+    #[test]
+    fn signer_binding_accepts_at_most_one_cose_tag() {
+        use c2pa_cbor::Value;
+
+        let signer =
+            crate::utils::ephemeral_signer::EphemeralSigner::new("test-binding.local").unwrap();
+        let ee_cert_der = signer.cert_chain_der[0].clone();
+        let session_key = generate_ed25519_session_key();
+        let cose_key = build_ed25519_cose_key_value(&session_key.verifying_key(), b"k");
+        let tagged_bytes = make_signer_binding_for_ee_cert(&session_key, &ee_cert_der);
+        let Value::Tag(18, inner) = c2pa_cbor::from_slice::<Value>(&tagged_bytes).unwrap() else {
+            panic!("signer binding must decode as COSE_Sign1_Tagged");
+        };
+        assert!(matches!(*inner, Value::Array(_)));
+
+        let untagged = (*inner).clone();
+        let single = Value::Tag(18, inner.clone());
+        let nested = Value::Tag(18, Box::new(Value::Tag(18, inner)));
+
+        assert!(extract_signer_binding_bytes(&untagged).is_some());
+        assert!(extract_signer_binding_bytes(&single).is_some());
+        assert_eq!(
+            extract_signer_binding_bytes(&untagged),
+            extract_signer_binding_bytes(&single)
+        );
+        assert!(extract_signer_binding_bytes(&nested).is_none());
+        assert!(extract_signer_binding_bytes(&Value::Tag(
+            18,
+            Box::new(Value::Bytes(tagged_bytes.clone()))
+        ))
+        .is_some());
+        assert!(extract_signer_binding_bytes(&Value::Tag(
+            18,
+            Box::new(Value::Tag(18, Box::new(Value::Bytes(tagged_bytes))))
+        ))
+        .is_none());
+
+        let validate = |binding: Value| {
+            let mut keys = session_key_with_ed25519_binding(cose_key.clone(), Vec::new());
+            keys.keys[0].signer_binding = binding;
+            let mut validator = LiveVideoValidator::new();
+            let mut tracker = aggregate_tracker();
+            let _ = validator.validate_session_keys(
+                &keys,
+                "urn:c2pa:test-manifest",
+                Some(&ee_cert_der),
+                &mut tracker,
+            );
+            let invalid = tracker
+                .logged_items()
+                .iter()
+                .any(|i| i.validation_status.as_deref() == Some(LIVEVIDEO_SESSIONKEY_INVALID));
+            (invalid, validator.session_keys.len())
+        };
+
+        assert_eq!(validate(untagged), (false, 1));
+        assert_eq!(validate(single), (false, 1));
+        assert_eq!(validate(nested), (true, 0));
     }
 
     // ── COSE_Sign1 wire format tests (§18.25.2) ─────────────────────────────────

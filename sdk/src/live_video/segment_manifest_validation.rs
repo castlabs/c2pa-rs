@@ -15,12 +15,12 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use super::{fail_validation, LiveVideoValidator, SegmentState, C2PA_UUID, UUID_BOX_TYPE};
 use crate::{
-    assertions::{ContinuityMethod, LiveVideoSegment},
+    assertions::LiveVideoSegment,
     error::{Error, Result},
     live_video::verifiable_segment_info::extract_vsi_payload_from_segment,
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
-        LIVEVIDEO_ASSERTION_INVALID, LIVEVIDEO_CONTINUITY_METHOD_INVALID, LIVEVIDEO_SEGMENT_INVALID,
+        LIVEVIDEO_ASSERTION_INVALID, LIVEVIDEO_SEGMENT_INVALID,
     },
 };
 
@@ -52,9 +52,9 @@ impl LiveVideoValidator {
         previous: &SegmentState,
         tracker: &mut StatusTracker,
     ) -> Result<()> {
-        if previous.sequence_number.checked_add(1) != Some(assertion.sequence_number) {
+        if assertion.sequence_number <= previous.sequence_number {
             fail_validation(
-                "sequenceNumber must advance exactly by one from the previous segment",
+                "sequenceNumber must be strictly greater than the previous segment's",
                 LIVEVIDEO_ASSERTION_INVALID,
                 tracker,
             )?;
@@ -72,58 +72,6 @@ impl LiveVideoValidator {
             fail_validation(
                 "streamId must match the previous segment's streamId",
                 LIVEVIDEO_ASSERTION_INVALID,
-                tracker,
-            )?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_continuity_rules(
-        &self,
-        assertion: &LiveVideoSegment,
-        manifest_id: &str,
-        tracker: &mut StatusTracker,
-    ) -> Result<()> {
-        match &assertion.continuity_method {
-            ContinuityMethod::ManifestId => {
-                self.validate_manifest_id_continuity(assertion, manifest_id, tracker)
-            }
-            // Per §19.7.2, a missing `continuityMethod` field (deserialized to the empty-string
-            // sentinel, see `ContinuityMethod::missing`) and an unrecognized value both fail
-            // with the same code, so no separate branch is needed for the missing case.
-            ContinuityMethod::Unknown(method) => fail_validation(
-                format!("unsupported continuity method: {method}"),
-                LIVEVIDEO_CONTINUITY_METHOD_INVALID,
-                tracker,
-            ),
-        }
-    }
-
-    fn validate_manifest_id_continuity(
-        &self,
-        assertion: &LiveVideoSegment,
-        _current_manifest_id: &str,
-        tracker: &mut StatusTracker,
-    ) -> Result<()> {
-        let Some(previous) = &self.previous_segment else {
-            return Ok(());
-        };
-
-        let previous_manifest_id = match &assertion.previous_manifest_id {
-            Some(id) => id,
-            None => {
-                return fail_validation(
-                    "previousManifestId is required when continuityMethod is c2pa.manifestId",
-                    LIVEVIDEO_CONTINUITY_METHOD_INVALID,
-                    tracker,
-                );
-            }
-        };
-
-        if previous_manifest_id != &previous.manifest_id {
-            fail_validation(
-                "previousManifestId does not match the previous segment's manifest identifier",
-                LIVEVIDEO_SEGMENT_INVALID,
                 tracker,
             )?;
         }
@@ -237,9 +185,11 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use super::super::{test_helpers::*, LiveVideoValidator};
+    use super::super::{test_helpers::*, LiveVideoValidator, LIVEVIDEO_SEGMENT_GAP};
     use crate::{
         assertions::{ContinuityMethod, LiveVideoSegment},
+        error::Error,
+        status_tracker::{ErrorBehavior, LogKind, StatusTracker},
         validation_results::validation_codes::{
             LIVEVIDEO_ASSERTION_INVALID, LIVEVIDEO_CONTINUITY_METHOD_INVALID,
             LIVEVIDEO_INIT_INVALID, LIVEVIDEO_MANIFEST_INVALID, LIVEVIDEO_SEGMENT_INVALID,
@@ -362,6 +312,373 @@ mod tests {
             })
             .collect();
         assert!(live_failures.is_empty());
+    }
+
+    // These fixtures isolate continuity; the caller must authenticate the manifest first.
+    #[test]
+    fn gap_with_correct_predecessor_is_informational() {
+        let mut validator = LiveVideoValidator::new();
+        let segment_data = make_uuid_box(true);
+        let mut tracker = aggregate_tracker();
+        let first = make_segment(1, "stream-1");
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-1", &first, &mut tracker)
+            .unwrap();
+
+        let mut third = make_segment(3, "stream-1");
+        third.previous_manifest_id = Some("urn:c2pa:manifest-1".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-3", &third, &mut tracker)
+            .unwrap();
+        let mut fourth = make_segment(4, "stream-1");
+        fourth.previous_manifest_id = Some("urn:c2pa:manifest-3".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-4", &fourth, &mut tracker)
+            .unwrap();
+
+        let coverage = validator.sequence_coverage();
+        assert_eq!(coverage.missing_ranges, vec![2..=2]);
+        assert_eq!(coverage.total_missing, 1);
+        assert!(!coverage.ranges_truncated);
+        assert_eq!(tracker.filter_errors().count(), 0);
+        assert_eq!(tracker.logged_items().len(), 1);
+        let gap = &tracker.logged_items()[0];
+        assert_eq!(
+            gap.validation_status.as_deref(),
+            Some(LIVEVIDEO_SEGMENT_GAP)
+        );
+        assert_eq!(gap.kind, LogKind::Informational);
+        assert!(gap.err_val.is_none());
+    }
+
+    #[test]
+    fn predecessor_mismatch_fails_once_then_recovers_with_both_error_behaviors() {
+        for behavior in [
+            ErrorBehavior::ContinueWhenPossible,
+            ErrorBehavior::StopOnFirstError,
+        ] {
+            let stop_on_error = behavior == ErrorBehavior::StopOnFirstError;
+            let mut tracker = StatusTracker::with_error_behavior(behavior);
+            let mut validator = LiveVideoValidator::new();
+            let segment_data = make_uuid_box(true);
+            validator
+                .validate_media_segment(
+                    &segment_data,
+                    "urn:c2pa:manifest-1",
+                    &make_segment(1, "stream-1"),
+                    &mut tracker,
+                )
+                .unwrap();
+
+            let mut third = make_segment(3, "stream-1");
+            third.previous_manifest_id = Some("urn:c2pa:manifest-2".to_string());
+            let result = validator.validate_media_segment(
+                &segment_data,
+                "urn:c2pa:manifest-3",
+                &third,
+                &mut tracker,
+            );
+            if stop_on_error {
+                assert!(
+                    matches!(result, Err(Error::BadParam(code)) if code == LIVEVIDEO_SEGMENT_INVALID)
+                );
+            } else {
+                result.unwrap();
+            }
+            let failures: Vec<_> = tracker.filter_errors().collect();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(
+                failures[0].validation_status.as_deref(),
+                Some(LIVEVIDEO_SEGMENT_INVALID)
+            );
+            assert_eq!(failures[0].kind, LogKind::Failure);
+            assert_eq!(validator.sequence_coverage().missing_ranges, vec![2..=2]);
+            assert_eq!(validator.sequence_coverage().total_missing, 1);
+            let previous = validator.previous_segment.as_ref().unwrap();
+            assert_eq!(previous.sequence_number, 3);
+            assert_eq!(previous.manifest_id, "urn:c2pa:manifest-3");
+
+            let mut fourth = make_segment(4, "stream-1");
+            fourth.previous_manifest_id = Some("urn:c2pa:manifest-3".to_string());
+            validator
+                .validate_media_segment(&segment_data, "urn:c2pa:manifest-4", &fourth, &mut tracker)
+                .unwrap();
+            assert_eq!(tracker.filter_errors().count(), 1);
+            assert_eq!(tracker.logged_items().len(), 2);
+            assert_eq!(validator.sequence_coverage().missing_ranges, vec![2..=2]);
+            assert!(!validator.sequence_coverage().ranges_truncated);
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn chain_break_with_other_failure_never_advances_or_records_gap() {
+        for (stream_id, method, predecessor, invalid_data, expected_status) in [
+            (
+                "stream-2",
+                ContinuityMethod::ManifestId,
+                Some("urn:c2pa:manifest-2"),
+                make_uuid_box(true),
+                LIVEVIDEO_ASSERTION_INVALID,
+            ),
+            (
+                "stream-1",
+                ContinuityMethod::ManifestId,
+                Some("urn:c2pa:manifest-2"),
+                make_mdat_box(),
+                LIVEVIDEO_SEGMENT_INVALID,
+            ),
+            (
+                "stream-1",
+                ContinuityMethod::Unknown("vendor.custom".to_string()),
+                Some("urn:c2pa:manifest-2"),
+                make_uuid_box(true),
+                LIVEVIDEO_CONTINUITY_METHOD_INVALID,
+            ),
+            (
+                "stream-1",
+                ContinuityMethod::Unknown(String::new()),
+                Some("urn:c2pa:manifest-2"),
+                make_uuid_box(true),
+                LIVEVIDEO_CONTINUITY_METHOD_INVALID,
+            ),
+            (
+                "stream-1",
+                ContinuityMethod::ManifestId,
+                None,
+                make_uuid_box(true),
+                LIVEVIDEO_CONTINUITY_METHOD_INVALID,
+            ),
+        ] {
+            let mut validator = LiveVideoValidator::new();
+            let segment_data = make_uuid_box(true);
+            let mut tracker = aggregate_tracker();
+            validator
+                .validate_media_segment(
+                    &segment_data,
+                    "urn:c2pa:manifest-1",
+                    &make_segment(1, "stream-1"),
+                    &mut tracker,
+                )
+                .unwrap();
+            let mut invalid = make_segment(3, stream_id);
+            invalid.continuity_method = method;
+            invalid.previous_manifest_id = predecessor.map(str::to_string);
+            validator
+                .validate_media_segment(
+                    &invalid_data,
+                    "urn:c2pa:manifest-3",
+                    &invalid,
+                    &mut tracker,
+                )
+                .unwrap();
+
+            assert!(tracker.has_status(expected_status));
+            let failure_count = tracker.filter_errors().count();
+            assert!(failure_count > 0);
+            assert!(!tracker.has_status(LIVEVIDEO_SEGMENT_GAP));
+            assert!(validator.sequence_coverage().missing_ranges.is_empty());
+            assert_eq!(validator.sequence_coverage().total_missing, 0);
+            let previous = validator.previous_segment.as_ref().unwrap();
+            assert_eq!(previous.sequence_number, 1);
+            assert_eq!(previous.manifest_id, "urn:c2pa:manifest-1");
+            assert_eq!(previous.stream_id, "stream-1");
+
+            let mut second = make_segment(2, "stream-1");
+            second.previous_manifest_id = Some("urn:c2pa:manifest-1".to_string());
+            validator
+                .validate_media_segment(&segment_data, "urn:c2pa:manifest-2", &second, &mut tracker)
+                .unwrap();
+            assert_eq!(tracker.filter_errors().count(), failure_count);
+            assert_eq!(validator.sequence_coverage().total_missing, 0);
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn equal_sequence_number_fails_without_advancing() {
+        let mut validator = LiveVideoValidator::new();
+        let segment_data = make_uuid_box(true);
+        let mut tracker = aggregate_tracker();
+        validator
+            .validate_media_segment(
+                &segment_data,
+                "urn:c2pa:manifest-1",
+                &make_segment(1, "stream-1"),
+                &mut tracker,
+            )
+            .unwrap();
+        let mut duplicate = make_segment(1, "stream-1");
+        duplicate.previous_manifest_id = Some("urn:c2pa:manifest-1".to_string());
+        validator
+            .validate_media_segment(
+                &segment_data,
+                "urn:c2pa:duplicate",
+                &duplicate,
+                &mut tracker,
+            )
+            .unwrap();
+
+        assert!(tracker.has_status(LIVEVIDEO_ASSERTION_INVALID));
+        assert_eq!(tracker.filter_errors().count(), 1);
+        assert_eq!(validator.sequence_coverage().total_missing, 0);
+        assert_eq!(
+            validator.previous_segment.as_ref().unwrap().manifest_id,
+            "urn:c2pa:manifest-1"
+        );
+        let mut second = make_segment(2, "stream-1");
+        second.previous_manifest_id = Some("urn:c2pa:manifest-1".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-2", &second, &mut tracker)
+            .unwrap();
+        assert_eq!(tracker.filter_errors().count(), 1);
+    }
+
+    #[test]
+    fn explicit_reset_skips_init_predecessor_after_seek_but_reports_next_gap() {
+        let mut validator = LiveVideoValidator::new();
+        let segment_data = make_uuid_box(true);
+        let mut tracker = aggregate_tracker();
+        validator
+            .register_manifest_box_init("urn:c2pa:init", &mut tracker)
+            .unwrap();
+        let mut first = make_segment(1, "stream-1");
+        first.previous_manifest_id = Some("urn:c2pa:init".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-1", &first, &mut tracker)
+            .unwrap();
+
+        validator.reset_continuity();
+        assert_eq!(
+            validator.manifest_box_init_id.as_deref(),
+            Some("urn:c2pa:init")
+        );
+        let mut seek = make_segment(42, "stream-1");
+        seek.previous_manifest_id = Some("urn:c2pa:manifest-41".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-42", &seek, &mut tracker)
+            .unwrap();
+        assert!(tracker.logged_items().is_empty());
+        assert_eq!(validator.sequence_coverage().total_missing, 0);
+
+        let mut next = make_segment(44, "stream-1");
+        next.previous_manifest_id = Some("urn:c2pa:manifest-42".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-44", &next, &mut tracker)
+            .unwrap();
+        assert_eq!(tracker.filter_errors().count(), 0);
+        assert_eq!(validator.sequence_coverage().missing_ranges, vec![43..=43]);
+        assert_eq!(validator.sequence_coverage().total_missing, 1);
+        assert!(tracker.has_status(LIVEVIDEO_SEGMENT_GAP));
+    }
+
+    #[test]
+    fn reset_suppresses_comparison_not_predecessor_presence_until_valid_observation() {
+        let mut validator = LiveVideoValidator::new();
+        let segment_data = make_uuid_box(true);
+        let mut tracker = aggregate_tracker();
+        validator.reset_continuity();
+        let mut missing_predecessor = make_segment(42, "stream-1");
+        missing_predecessor.previous_manifest_id = None;
+        validator
+            .validate_media_segment(
+                &segment_data,
+                "urn:c2pa:manifest-42",
+                &missing_predecessor,
+                &mut tracker,
+            )
+            .unwrap();
+        assert!(tracker.has_status(LIVEVIDEO_CONTINUITY_METHOD_INVALID));
+        assert!(validator.previous_segment.is_none());
+        assert!(validator.suppress_initial_continuity);
+        assert_eq!(validator.sequence_coverage().total_missing, 0);
+
+        let mut valid = make_segment(42, "stream-1");
+        valid.previous_manifest_id = Some("urn:c2pa:manifest-41".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-42", &valid, &mut tracker)
+            .unwrap();
+        assert_eq!(tracker.filter_errors().count(), 1);
+        assert!(!validator.suppress_initial_continuity);
+        assert_eq!(validator.sequence_coverage().total_missing, 0);
+    }
+
+    #[test]
+    fn replay_ahead_preserves_failure_and_requires_explicit_reset_for_earlier_media() {
+        let mut validator = LiveVideoValidator::new();
+        let segment_data = make_uuid_box(true);
+        let mut tracker = aggregate_tracker();
+        validator
+            .validate_media_segment(
+                &segment_data,
+                "urn:c2pa:manifest-1",
+                &make_segment(1, "stream-1"),
+                &mut tracker,
+            )
+            .unwrap();
+        let mut later = make_segment(100, "stream-1");
+        later.previous_manifest_id = Some("urn:c2pa:manifest-99".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-100", &later, &mut tracker)
+            .unwrap();
+        assert!(tracker.has_status(LIVEVIDEO_SEGMENT_INVALID));
+        assert_eq!(validator.sequence_coverage().total_missing, 98);
+
+        let mut earlier = make_segment(2, "stream-1");
+        earlier.previous_manifest_id = Some("urn:c2pa:manifest-1".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-2", &earlier, &mut tracker)
+            .unwrap();
+        assert!(tracker.has_status(LIVEVIDEO_ASSERTION_INVALID));
+        assert_eq!(
+            validator.previous_segment.as_ref().unwrap().sequence_number,
+            100
+        );
+        let failure_count = tracker.filter_errors().count();
+        validator.reset_continuity();
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-2", &earlier, &mut tracker)
+            .unwrap();
+        assert_eq!(tracker.filter_errors().count(), failure_count);
+        assert_eq!(
+            validator.previous_segment.as_ref().unwrap().sequence_number,
+            2
+        );
+        assert_eq!(validator.sequence_coverage().total_missing, 98);
+    }
+
+    #[test]
+    fn first_media_init_predecessor_mismatch_returns_error_then_recovers() {
+        let mut validator = LiveVideoValidator::new();
+        let segment_data = make_uuid_box(true);
+        let mut tracker = StatusTracker::with_error_behavior(ErrorBehavior::StopOnFirstError);
+        validator
+            .register_manifest_box_init("urn:c2pa:init", &mut tracker)
+            .unwrap();
+        let mut third = make_segment(3, "stream-1");
+        third.previous_manifest_id = Some("urn:c2pa:manifest-2".to_string());
+        let error = validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-3", &third, &mut tracker)
+            .unwrap_err();
+        assert!(matches!(error, Error::BadParam(code) if code == LIVEVIDEO_SEGMENT_INVALID));
+        assert!(tracker.has_status(LIVEVIDEO_SEGMENT_INVALID));
+        assert_eq!(tracker.filter_errors().count(), 1);
+        assert_eq!(validator.sequence_coverage().total_missing, 0);
+
+        let mut fourth = make_segment(4, "stream-1");
+        fourth.previous_manifest_id = Some("urn:c2pa:manifest-3".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:manifest-4", &fourth, &mut tracker)
+            .unwrap();
+        assert_eq!(tracker.filter_errors().count(), 1);
+        assert_eq!(tracker.logged_items().len(), 1);
+        assert_eq!(validator.sequence_coverage().total_missing, 0);
     }
 
     #[test]

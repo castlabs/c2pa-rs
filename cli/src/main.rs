@@ -29,9 +29,11 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use c2pa::{
-    create_signer, format_from_path, settings::Settings, BoxedSigner, Builder, BuilderIntent,
-    CallbackSigner, ClaimGeneratorInfo, Context as C2paContext, DigitalSourceType, Error,
-    Ingredient, ManifestDefinition, Reader, Signer, SigningAlg,
+    create_signer, format_from_path,
+    settings::{Settings, TrustAnchor, TrustListKind},
+    BoxedSigner, Builder, BuilderIntent, CallbackSigner, ClaimGeneratorInfo,
+    Context as C2paContext, DigitalSourceType, Error, Ingredient, ManifestDefinition, Reader,
+    Signer, SigningAlg,
 };
 use clap::{Parser, Subcommand};
 use env_logger::Env;
@@ -59,10 +61,12 @@ mod signer;
 /// Official C2PA conformance trust list (PEM bundle).
 const TRUST_LIST_OFFICIAL_URL: &str =
     "https://raw.githubusercontent.com/c2pa-org/conformance-public/refs/heads/main/trust-list/C2PA-TRUST-LIST.pem";
+const TRUST_LIST_OFFICIAL_URI: &str = "https://c2pa.org/trustlist";
 /// Legacy interim trust anchors (PEM), fetched only with `init trust --legacy`.
 const TRUST_LIST_LEGACY_ANCHORS_URL: &str = "https://contentcredentials.org/trust/anchors.pem";
 const TRUST_LEGACY_STORE_CFG_URL: &str = "https://contentcredentials.org/trust/store.cfg";
 const TRUST_LEGACY_ALLOWED_URL: &str = "https://contentcredentials.org/trust/allowed.sha256.txt";
+const TRUST_LIST_LEGACY_ANCHORS_URI: &str = "https://contentcredentials.org/trustlist";
 
 /// Sidecar trust files stored next to the settings file (`--settings` parent directory).
 const SIDECAR_TRUST_LIST_PEM: &str = "c2pa-trust-list.pem";
@@ -253,6 +257,10 @@ enum Commands {
         /// URL or path to file containing configured EKUs in Oid dot notation
         #[arg(long = "trust_config", env="C2PATOOL_TRUST_CONFIG", value_parser = parse_resource_string)]
         trust_config: Option<TrustResource>,
+
+        /// URI used to identify the trust list
+        #[arg(long = "trust_list_uri", env = "C2PATOOL_TRUST_LIST_URI")]
+        trust_list_uri: Option<String>,
     },
     /// Sub-command to add manifest to fragmented BMFF content
     ///
@@ -309,6 +317,10 @@ enum Commands {
         /// The pattern should match only file names, not full paths (e.g. "segment_*[0-9].m4s").
         #[arg(long = "segments_glob", verbatim_doc_comment)]
         segments_glob: Option<PathBuf>,
+
+        /// Local JSON schedule of same-stream signed init updates (VSI only).
+        #[arg(long)]
+        updates: Option<PathBuf>,
     },
 
     /// Sign a live video stream using the per-segment C2PA Manifest Box method (C2PA section 19.3).
@@ -769,8 +781,10 @@ fn apply_trust_sidecars(settings: &mut Settings, settings_path: &Path) -> Result
             .with_context(|| format!("read trust sidecar {}", official.display()))?;
         settings.update_from_str(
             &toml::toml! {
-                [trust]
+                [[trust.anchors]]
                 trust_anchors = data
+                trust_kind = "manifest"
+                trust_uri = TRUST_LIST_OFFICIAL_URI
             }
             .to_string(),
             "toml",
@@ -784,8 +798,10 @@ fn apply_trust_sidecars(settings: &mut Settings, settings_path: &Path) -> Result
             .with_context(|| format!("read legacy trust sidecar {}", legacy_pem.display()))?;
         settings.update_from_str(
             &toml::toml! {
-                [trust]
-                user_anchors = data
+                [[trust.anchors]]
+                trust_anchors = data
+                trust_kind = "manifest"
+                trust_uri = TRUST_LIST_LEGACY_ANCHORS_URI
             }
             .to_string(),
             "toml",
@@ -889,20 +905,37 @@ fn configure_sdk(args: &CliArgs) -> Result<Settings> {
         trust_anchors,
         allowed_list,
         trust_config,
+        trust_list_uri,
     }) = &args.command
     {
         if let Some(trust_list) = &trust_anchors {
             debug!("Using trust anchors from {trust_list:?}");
 
             let data = load_trust_resource(trust_list)?;
-            settings.update_from_str(
-                &toml::toml! {
-                    [trust]
-                    trust_anchors = data
+
+            // Manually replace or append trust list until we have a way to merge Arrays in Settings
+            if let Some(anchor) = settings.trust.anchors.as_mut().and_then(|a| {
+                a.iter_mut().find(|a| {
+                    a.trust_uri
+                        .clone()
+                        .is_some_and(|t| Some(t) == *trust_list_uri)
+                })
+            }) {
+                anchor.trust_anchors = data;
+            } else {
+                let ta = TrustAnchor {
+                    trust_anchors: data,
+                    trust_uri: trust_list_uri.clone(),
+                    trust_kind: TrustListKind::Manifest,
+                    ..Default::default()
+                };
+
+                if let Some(anchors) = &mut settings.trust.anchors {
+                    anchors.push(ta);
+                } else {
+                    settings.trust.anchors = Some(vec![ta]);
                 }
-                .to_string(),
-                "toml",
-            )?;
+            }
 
             enable_trust_checks = true;
         }
@@ -1162,13 +1195,15 @@ fn main() -> Result<()> {
     {
         if let Some(Commands::LiveVideo {
             segments_glob: Some(sg),
+            updates,
         }) = &args.command
         {
-            return live_video::validate_live_video(&context, path, sg);
+            return live_video::validate_live_video(&context, path, sg, updates.as_deref());
         } else if matches!(
             &args.command,
             Some(Commands::LiveVideo {
-                segments_glob: None
+                segments_glob: None,
+                ..
             })
         ) {
             bail!("segments_glob must be set for the live-video subcommand");
@@ -1736,11 +1771,12 @@ pub mod tests {
         .unwrap();
         let mut settings = Settings::default();
         assert!(apply_trust_sidecars(&mut settings, &settings_path).unwrap());
-        let ta = settings
-            .trust
-            .trust_anchors
-            .as_deref()
-            .expect("trust_anchors");
-        assert!(ta.contains("BEGIN CERTIFICATE"));
+        // Legacy `trust_anchors` settings migrate into `trust.anchors`
+        // (c2pa-rs 36bda4df), so the sidecar must land there as a manifest list.
+        let anchors = settings.trust.anchors.as_deref().expect("trust.anchors");
+        assert!(anchors.iter().any(|a| {
+            a.trust_kind == c2pa::settings::TrustListKind::Manifest
+                && a.trust_anchors.contains("BEGIN CERTIFICATE")
+        }));
     }
 }
